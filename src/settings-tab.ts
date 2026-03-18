@@ -17,11 +17,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Vault Sync Settings" });
 
     new Setting(containerEl)
-      .setName("CouchDB URL")
-      .setDesc("Full URL to CouchDB server (e.g., https://couch.example.com)")
+      .setName("Server URL")
+      .setDesc("Vault Sync server address")
       .addText((text) =>
         text
-          .setPlaceholder("https://couch.example.com")
+          .setPlaceholder("https://mcp.fly-agile.com:5984")
           .setValue(this.plugin.settings.couchDbUrl)
           .onChange(async (value) => {
             this.plugin.settings.couchDbUrl = value.trim();
@@ -31,10 +31,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Database name")
-      .setDesc("Name of the CouchDB database for this vault")
+      .setDesc("Name of the database for this vault")
       .addText((text) =>
         text
-          .setPlaceholder("my-vault")
+          .setPlaceholder("obsidian")
           .setValue(this.plugin.settings.couchDbName)
           .onChange(async (value) => {
             this.plugin.settings.couchDbName = value.trim();
@@ -44,7 +44,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Username")
-      .setDesc("CouchDB username (leave empty for no auth)")
+      .setDesc("Vault Sync username")
       .addText((text) =>
         text
           .setValue(this.plugin.settings.couchDbUser)
@@ -56,7 +56,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Password")
-      .setDesc("CouchDB password")
+      .setDesc("Vault Sync password")
       .addText((text) => {
         text.inputEl.type = "password";
         text
@@ -101,7 +101,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Test connection")
-      .setDesc("Verify CouchDB is reachable with current settings")
+      .setDesc("Verify the sync server is reachable")
       .addButton((btn) =>
         btn.setButtonText("Test").onClick(async () => {
           btn.setButtonText("Testing...");
