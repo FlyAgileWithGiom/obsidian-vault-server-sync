@@ -1,7 +1,7 @@
 {
   "id": "vault-sync",
   "name": "Vault Sync",
-  "version": "0.1.2",
+  "version": "0.3.0",
   "minAppVersion": "1.4.0",
   "description": "Sync your vault to CouchDB for access by vault-server (Claude MCP)",
   "author": "Guillaume Duquesnay",
