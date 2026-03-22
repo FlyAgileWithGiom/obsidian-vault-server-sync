@@ -21,7 +21,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       .setDesc("Vault Sync server address")
       .addText((text) =>
         text
-          .setPlaceholder("https://mcp.fly-agile.com:5984")
+          .setPlaceholder("https://sync.fly-agile.com")
           .setValue(this.plugin.settings.couchDbUrl)
           .onChange(async (value) => {
             this.plugin.settings.couchDbUrl = value.trim();
@@ -34,7 +34,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       .setDesc("Name of the database for this vault")
       .addText((text) =>
         text
-          .setPlaceholder("obsidian")
+          .setPlaceholder("vault-v2-prod")
           .setValue(this.plugin.settings.couchDbName)
           .onChange(async (value) => {
             this.plugin.settings.couchDbName = value.trim();

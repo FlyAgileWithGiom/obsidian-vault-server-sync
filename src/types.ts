@@ -8,8 +8,8 @@ export interface VaultSyncSettings {
 }
 
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
-  couchDbUrl: "https://mcp.fly-agile.com:5984",
-  couchDbName: "obsidian",
+  couchDbUrl: "https://sync.fly-agile.com",
+  couchDbName: "vault-v2-prod",
   couchDbUser: "",
   couchDbPassword: "",
   syncDebounceMs: 500,
