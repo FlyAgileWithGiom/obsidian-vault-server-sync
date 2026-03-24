@@ -75,6 +75,8 @@ export interface SyncDiagnostics {
   revMapSize: number;
   lastSeq: string | number;
   pullProgress: { fetched: number; total: number } | null;
+  pullSkipped: number;
+  pullApplied: number;
   pendingPushCount: number;
   lastError: string | null;
 }

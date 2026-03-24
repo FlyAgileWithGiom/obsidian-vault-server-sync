@@ -173,6 +173,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     ];
     if (d.pullProgress) {
       lines.push(`Pull progress: ${d.pullProgress.fetched} / ${d.pullProgress.total}`);
+      lines.push(`Pull applied: ${d.pullApplied}, skipped: ${d.pullSkipped}`);
     }
     if (d.lastError) {
       lines.push(`Last error: ${d.lastError}`);

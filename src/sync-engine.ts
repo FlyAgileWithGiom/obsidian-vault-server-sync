@@ -48,6 +48,8 @@ export class SyncEngine {
   private pullCount = 0;
   private pullTotal = 0;
   private pullFetched = 0;
+  private pullSkipped = 0;
+  private pullApplied = 0;
   private lastError: string | null = null;
   private currentState: SyncState = "idle";
 
@@ -85,6 +87,8 @@ export class SyncEngine {
       pullProgress: this.pullTotal > 0
         ? { fetched: this.pullFetched, total: this.pullTotal }
         : null,
+      pullSkipped: this.pullSkipped,
+      pullApplied: this.pullApplied,
       pendingPushCount: this.pendingWrites.size,
       lastError: this.lastError,
     };
@@ -297,6 +301,8 @@ export class SyncEngine {
       this.pullCount = toPull.length;
       this.pullTotal = toPull.length;
       this.pullFetched = 0;
+      this.pullSkipped = 0;
+      this.pullApplied = 0;
       this.emitCounts();
       let failCount = 0;
       try {
@@ -308,18 +314,19 @@ export class SyncEngine {
             const result = await this.client.allDocsByKeys(batch);
             for (const row of result.rows) {
               if (row.error || !row.doc) {
+                this.pullSkipped++;
                 failCount++;
-                console.warn(`[vault-sync] Pull skip: ${row.key} (${row.error ?? "no doc"})`);
                 continue;
               }
               try {
                 await this.applyRemoteDoc(row.doc);
                 if (row.doc._rev) {
                   this.revMap[row.doc._id] = row.doc._rev;
+                  this.pullApplied++;
                 }
               } catch (applyErr) {
                 failCount++;
-                console.warn(`[vault-sync] Pull apply failed: ${row.doc._id}: ${(applyErr as Error).message}`);
+                this.pullSkipped++;
               }
               this.pullFetched++;
               this.pullCount--;
