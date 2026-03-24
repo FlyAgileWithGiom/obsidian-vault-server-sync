@@ -218,15 +218,9 @@ export class SyncEngine {
       if (fi % 100 === 99) await this.yield();
 
       if (remoteRev) {
-        // Doc exists remotely
-        if (!knownRev) {
-          // First sync for this doc - trust remote, just record rev
-          this.revMap[docId] = remoteRev;
-          continue;
-        }
-        if (knownRev === remoteRev) continue; // Unchanged
-        // Rev changed by another device - let pull handle it
-        continue;
+        // Doc exists remotely - let pull handle content comparison
+        if (knownRev === remoteRev) continue; // Already synced
+        continue; // Rev unknown or changed - pull will handle
       } else {
         // New file, not on remote
         const content = await this.vault.cachedRead(file);
