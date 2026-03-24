@@ -41,6 +41,7 @@ export class SyncEngine {
   private changesPollTimer: ReturnType<typeof setTimeout> | null = null;
   private pendingWrites: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private applyingRemote = false;
+  private recentRemotePaths: Set<string> = new Set();
   private running = false;
   private pullCount = 0;
 
@@ -386,6 +387,10 @@ export class SyncEngine {
     const normalized = normalizePath(path);
     const existing = this.vault.getAbstractFileByPath(normalized);
 
+    // Track path to suppress echo events from async vault notifications
+    this.recentRemotePaths.add(normalized);
+    setTimeout(() => this.recentRemotePaths.delete(normalized), 2000);
+
     if (existing instanceof TFile) {
       // Compare mtime: only overwrite if remote is newer
       if (doc.mtime > existing.stat.mtime) {
@@ -446,7 +451,7 @@ export class SyncEngine {
     if (!(file instanceof TFile)) return;
     if (this.isExcluded(file.path)) return;
     if (file.stat.size > MAX_FILE_SIZE) return; // TODO: chunk large files
-    console.log(`[vault-sync] Local change: ${file.path}`);
+    if (this.recentRemotePaths.has(file.path)) return; // Suppress echo from remote apply
 
     // Cancel any pending debounce for this file
     const existing = this.pendingWrites.get(file.path);
