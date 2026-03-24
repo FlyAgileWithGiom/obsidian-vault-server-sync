@@ -148,14 +148,8 @@ export class SyncEngine {
         remoteRevs.set(row.id, row.value.rev);
       }
 
-      const localFiles = this.vault.getFiles().filter((f) => !this.isExcluded(f.path));
-      const emptyRevMap = Object.keys(this.revMap).length === 0;
-      // Skip pull content only if we have a populated vault AND empty revMap
-      // (= desktop with existing files, first time running new plugin version)
-      // On an empty vault (mobile first sync), we must pull content.
-      const skipPullContent = emptyRevMap && localFiles.length > 100;
       await this.pushAllLocal(remoteRevs);
-      await this.pullAllRemote(remoteRevs, skipPullContent);
+      await this.pullAllRemote(remoteRevs);
       this.persistState();
       this.onStateChange("ok");
     } catch (e) {
@@ -249,54 +243,44 @@ export class SyncEngine {
 
   /**
    * Pull remote docs that are new or changed since last sync.
-   * Only fetches content for docs whose rev differs from local revMap.
-   * On first sync (empty revMap), trusts the index and skips content pull
-   * since pushAllLocal already pushed everything local.
+   * Fetches content individually for docs whose rev differs from local revMap.
    */
-  private async pullAllRemote(remoteRevs: Map<string, string>, firstSync: boolean): Promise<void> {
-    if (firstSync) {
-      // First sync: just populate revMap from remote index, skip content pull.
-      // Local files were already pushed. Remote-only files will arrive via changes feed.
-      for (const [docId, rev] of remoteRevs) {
-        if (!docId.startsWith("_design/")) {
-          this.revMap[docId] = rev;
-        }
-      }
-    } else {
-      // Incremental: pull docs whose rev changed since last sync
-      const toPull: string[] = [];
-      for (const [docId, rev] of remoteRevs) {
-        if (docId.startsWith("_design/")) continue;
-        if (this.revMap[docId] === rev) continue;
-        toPull.push(docId);
-      }
+  private async pullAllRemote(remoteRevs: Map<string, string>): Promise<void> {
+    const toPull: string[] = [];
+    for (const [docId, rev] of remoteRevs) {
+      if (docId.startsWith("_design/")) continue;
+      if (this.revMap[docId] === rev) continue;
+      toPull.push(docId);
+    }
 
-      if (toPull.length > 0) {
-        this.applyingRemote = true;
-        this.pullCount = toPull.length;
-        this.emitCounts();
-        try {
-          for (let i = 0; i < toPull.length; i++) {
-            const docId = toPull[i];
-            try {
-              const doc = await this.client.get(docId);
-              await this.applyRemoteDoc(doc);
-              if (doc._rev) {
-                this.revMap[docId] = doc._rev;
-              }
-            } catch {
-              // Skip docs that fail to fetch
+    console.log(`[vault-sync] Pull: ${toPull.length} docs to fetch`);
+
+    if (toPull.length > 0) {
+      this.applyingRemote = true;
+      this.pullCount = toPull.length;
+      this.emitCounts();
+      try {
+        for (let i = 0; i < toPull.length; i++) {
+          const docId = toPull[i];
+          try {
+            const doc = await this.client.get(docId);
+            await this.applyRemoteDoc(doc);
+            if (doc._rev) {
+              this.revMap[docId] = doc._rev;
             }
-            this.pullCount--;
-            this.emitCounts();
-            // Yield every 10 docs to keep UI responsive
-            if (i % 10 === 9) await this.yield();
+          } catch {
+            // Skip docs that fail to fetch
           }
-        } finally {
-          this.pullCount = 0;
-          this.applyingRemote = false;
+          this.pullCount--;
           this.emitCounts();
+          if (i % 10 === 9) await this.yield();
+          // Persist every 100 docs to survive interruptions
+          if (i % 100 === 99) this.persistState();
         }
+      } finally {
+        this.pullCount = 0;
+        this.applyingRemote = false;
+        this.emitCounts();
       }
     }
 

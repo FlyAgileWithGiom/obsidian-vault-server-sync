@@ -226,12 +226,7 @@ describe("SyncEngine", () => {
   });
 
   describe("fullSync - pull", () => {
-    it("skips pull content on populated vault with empty revMap", async () => {
-      // Simulate desktop with many local files but no revMap (first run of new plugin)
-      for (let i = 0; i < 150; i++) {
-        vault._addFile(`notes/file-${i}.md`, `content-${i}`, 1000);
-      }
-
+    it("pulls remote docs on first sync with empty vault", async () => {
       const client = getClient(engine);
       client.allDocs.mockResolvedValue({
         total_rows: 1,
@@ -241,16 +236,12 @@ describe("SyncEngine", () => {
           value: { rev: "1-r" },
         }],
       });
+      client.get.mockResolvedValue({ _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
       await engine.start();
 
-      // Content not pulled (>100 local files) - just revMap populated
-      expect(vault._getContent("notes/remote.md")).toBeUndefined();
-      expect(localStorage.setItem).toHaveBeenCalledWith(
-        "vault-sync-revmap",
-        expect.stringContaining("file/notes/remote.md")
-      );
+      expect(vault._getContent("notes/remote.md")).toBe("from remote");
     });
 
     it("overwrites local file when remote is newer", async () => {
