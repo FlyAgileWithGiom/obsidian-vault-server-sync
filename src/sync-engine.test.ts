@@ -136,8 +136,8 @@ describe("SyncEngine", () => {
       // get() throws to simulate docs don't exist remotely
       client.get.mockRejectedValue(new Error("not found"));
       client.bulkDocs.mockResolvedValue([
-        { ok: true, id: "notes/hello.md", rev: "1-aaa" },
-        { ok: true, id: "notes/readme.md", rev: "1-bbb" },
+        { ok: true, id: "file/notes/hello.md", rev: "1-aaa" },
+        { ok: true, id: "file/notes/readme.md", rev: "1-bbb" },
       ]);
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       client.changes.mockResolvedValue({ last_seq: "2", results: [] });
@@ -146,8 +146,8 @@ describe("SyncEngine", () => {
 
       expect(client.bulkDocs).toHaveBeenCalledWith(
         expect.arrayContaining([
-          expect.objectContaining({ _id: "notes/hello.md", content: "hello world" }),
-          expect.objectContaining({ _id: "notes/readme.md", content: "readme content" }),
+          expect.objectContaining({ _id: "file/notes/hello.md", content: "hello world" }),
+          expect.objectContaining({ _id: "file/notes/readme.md", content: "readme content" }),
         ])
       );
     });
@@ -159,7 +159,7 @@ describe("SyncEngine", () => {
 
       const client = getClient(engine);
       client.get.mockRejectedValue(new Error("not found"));
-      client.bulkDocs.mockResolvedValue([{ ok: true, id: "notes/keep.md", rev: "1-a" }]);
+      client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/keep.md", rev: "1-a" }]);
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
@@ -169,9 +169,9 @@ describe("SyncEngine", () => {
       if (client.bulkDocs.mock.calls.length > 0) {
         const pushedDocs = client.bulkDocs.mock.calls[0][0] as CouchDoc[];
         const pushedIds = pushedDocs.map((d: CouchDoc) => d._id);
-        expect(pushedIds).not.toContain(".obsidian/config.json");
-        expect(pushedIds).not.toContain(".trash/deleted.md");
-        expect(pushedIds).toContain("notes/keep.md");
+        expect(pushedIds).not.toContain("file/.obsidian/config.json");
+        expect(pushedIds).not.toContain("file/.trash/deleted.md");
+        expect(pushedIds).toContain("file/notes/keep.md");
       }
     });
 
@@ -180,7 +180,7 @@ describe("SyncEngine", () => {
 
       const client = getClient(engine);
       // Remote doc is newer
-      client.get.mockResolvedValue({ _id: "notes/old.md", _rev: "1-r", content: "remote", mtime: 2000 });
+      client.get.mockResolvedValue({ _id: "file/notes/old.md", _rev: "1-r", content: "remote", mtime: 2000 });
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
@@ -194,8 +194,8 @@ describe("SyncEngine", () => {
       vault._addFile("notes/newer.md", "updated", 3000);
 
       const client = getClient(engine);
-      client.get.mockResolvedValue({ _id: "notes/newer.md", _rev: "1-old", content: "old", mtime: 1000 });
-      client.bulkDocs.mockResolvedValue([{ ok: true, id: "notes/newer.md", rev: "2-new" }]);
+      client.get.mockResolvedValue({ _id: "file/notes/newer.md", _rev: "1-old", content: "old", mtime: 1000 });
+      client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/newer.md", rev: "2-new" }]);
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
@@ -203,7 +203,7 @@ describe("SyncEngine", () => {
 
       expect(client.bulkDocs).toHaveBeenCalledWith(
         expect.arrayContaining([
-          expect.objectContaining({ _id: "notes/newer.md", _rev: "1-old" }),
+          expect.objectContaining({ _id: "file/notes/newer.md", _rev: "1-old" }),
         ])
       );
     });
@@ -216,10 +216,10 @@ describe("SyncEngine", () => {
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{
-          id: "notes/remote.md",
-          key: "notes/remote.md",
+          id: "file/notes/remote.md",
+          key: "file/notes/remote.md",
           value: { rev: "1-r" },
-          doc: { _id: "notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 },
+          doc: { _id: "file/notes/remote.md", _rev: "1-r", content: "from remote", mtime: 5000 },
         }],
       });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
@@ -233,15 +233,15 @@ describe("SyncEngine", () => {
       vault._addFile("notes/shared.md", "old local", 1000);
 
       const client = getClient(engine);
-      client.get.mockResolvedValue({ _id: "notes/shared.md", _rev: "1-r", content: "old remote", mtime: 2000 });
+      client.get.mockResolvedValue({ _id: "file/notes/shared.md", _rev: "1-r", content: "old remote", mtime: 2000 });
       // Remote is even newer during pull
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{
-          id: "notes/shared.md",
-          key: "notes/shared.md",
+          id: "file/notes/shared.md",
+          key: "file/notes/shared.md",
           value: { rev: "2-r" },
-          doc: { _id: "notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 },
+          doc: { _id: "file/notes/shared.md", _rev: "2-r", content: "newer remote", mtime: 5000 },
         }],
       });
       client.changes.mockResolvedValue({ last_seq: "2", results: [] });
@@ -296,7 +296,7 @@ describe("SyncEngine", () => {
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       client.changes.mockResolvedValue({ last_seq: "0", results: [] });
       client.get.mockRejectedValue(new Error("not found"));
-      client.put.mockResolvedValue({ ok: true, id: "notes/typing.md", rev: "1-a" });
+      client.put.mockResolvedValue({ ok: true, id: "file/notes/typing.md", rev: "1-a" });
 
       await engine.start();
 
@@ -320,14 +320,14 @@ describe("SyncEngine", () => {
       const client = getClient(engine);
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       client.changes.mockResolvedValue({ last_seq: "0", results: [] });
-      client.delete.mockResolvedValue({ ok: true, id: "notes/gone.md", rev: "2-del" });
+      client.delete.mockResolvedValue({ ok: true, id: "file/notes/gone.md", rev: "2-del" });
 
       await engine.start();
 
       // Manually set a rev in the engine's revMap via a push first
       const file = vault._addFile("notes/gone.md", "content", 1000);
       client.get.mockRejectedValue(new Error("not found"));
-      client.put.mockResolvedValue({ ok: true, id: "notes/gone.md", rev: "1-a" });
+      client.put.mockResolvedValue({ ok: true, id: "file/notes/gone.md", rev: "1-a" });
 
       engine.handleLocalChange(file as any);
       await new Promise((r) => setTimeout(r, 100));
@@ -335,7 +335,7 @@ describe("SyncEngine", () => {
       // Now delete
       await engine.handleLocalDelete(file as any);
 
-      expect(client.delete).toHaveBeenCalledWith("notes/gone.md", "1-a");
+      expect(client.delete).toHaveBeenCalledWith("file/notes/gone.md", "1-a");
     });
 
     it("handles rename as delete old + push new", async () => {
@@ -343,26 +343,26 @@ describe("SyncEngine", () => {
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       client.changes.mockResolvedValue({ last_seq: "0", results: [] });
       client.get.mockRejectedValue(new Error("not found"));
-      client.put.mockResolvedValue({ ok: true, id: "notes/renamed.md", rev: "1-new" });
-      client.delete.mockResolvedValue({ ok: true, id: "notes/original.md", rev: "2-del" });
+      client.put.mockResolvedValue({ ok: true, id: "file/notes/renamed.md", rev: "1-new" });
+      client.delete.mockResolvedValue({ ok: true, id: "file/notes/original.md", rev: "2-del" });
 
       await engine.start();
 
       // Simulate: engine knows about the old path
       const file = vault._addFile("notes/renamed.md", "content", 1000);
       // Manually push old file first so revMap has it
-      client.put.mockResolvedValue({ ok: true, id: "notes/original.md", rev: "1-old" });
+      client.put.mockResolvedValue({ ok: true, id: "file/notes/original.md", rev: "1-old" });
       const oldFile = vault._addFile("notes/original.md", "content", 1000);
       engine.handleLocalChange(oldFile as any);
       await new Promise((r) => setTimeout(r, 100));
 
       // Now rename
-      client.put.mockResolvedValue({ ok: true, id: "notes/renamed.md", rev: "1-new" });
+      client.put.mockResolvedValue({ ok: true, id: "file/notes/renamed.md", rev: "1-new" });
       await engine.handleLocalRename(file as any, "notes/original.md");
 
-      expect(client.delete).toHaveBeenCalledWith("notes/original.md", "1-old");
+      expect(client.delete).toHaveBeenCalledWith("file/notes/original.md", "1-old");
       expect(client.put).toHaveBeenCalledWith(
-        expect.objectContaining({ _id: "notes/renamed.md" })
+        expect.objectContaining({ _id: "file/notes/renamed.md" })
       );
     });
   });
@@ -373,10 +373,10 @@ describe("SyncEngine", () => {
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{
-          id: "notes/remote.md",
-          key: "notes/remote.md",
+          id: "file/notes/remote.md",
+          key: "file/notes/remote.md",
           value: { rev: "1-r" },
-          doc: { _id: "notes/remote.md", _rev: "1-r", content: "remote content", mtime: 5000 },
+          doc: { _id: "file/notes/remote.md", _rev: "1-r", content: "remote content", mtime: 5000 },
         }],
       });
       // changes() returns a doc during incremental polling
@@ -386,9 +386,9 @@ describe("SyncEngine", () => {
           last_seq: "2",
           results: [{
             seq: "2",
-            id: "notes/remote.md",
+            id: "file/notes/remote.md",
             changes: [{ rev: "2-r" }],
-            doc: { _id: "notes/remote.md", _rev: "2-r", content: "updated remote", mtime: 6000 },
+            doc: { _id: "file/notes/remote.md", _rev: "2-r", content: "updated remote", mtime: 6000 },
           }],
         });
 
@@ -417,7 +417,7 @@ describe("SyncEngine", () => {
     it("persists revMap and lastSeq to localStorage", async () => {
       const client = getClient(engine);
       client.get.mockRejectedValue(new Error("not found"));
-      client.bulkDocs.mockResolvedValue([{ ok: true, id: "a.md", rev: "1-x" }]);
+      client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/a.md", rev: "1-x" }]);
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       client.changes.mockResolvedValue({ last_seq: "5", results: [] });
 
@@ -472,10 +472,10 @@ describe("SyncEngine", () => {
       const { CouchError } = await import("./couch-client");
       client.put
         .mockRejectedValueOnce(new CouchError(409, "conflict"))
-        .mockResolvedValueOnce({ ok: true, id: "notes/conflict.md", rev: "3-winner" });
+        .mockResolvedValueOnce({ ok: true, id: "file/notes/conflict.md", rev: "3-winner" });
       // get() returns remote with older mtime
       client.get.mockResolvedValue({
-        _id: "notes/conflict.md",
+        _id: "file/notes/conflict.md",
         _rev: "2-remote",
         content: "remote version",
         mtime: 2000,
@@ -487,7 +487,7 @@ describe("SyncEngine", () => {
       // Should have re-pushed local content with remote's _rev
       expect(client.put).toHaveBeenCalledWith(
         expect.objectContaining({
-          _id: "notes/conflict.md",
+          _id: "file/notes/conflict.md",
           _rev: "2-remote",
           content: "local version",
           mtime: 3000,
@@ -507,7 +507,7 @@ describe("SyncEngine", () => {
       client.put.mockRejectedValueOnce(new CouchError(409, "conflict"));
       // Remote is newer
       client.get.mockResolvedValue({
-        _id: "notes/conflict.md",
+        _id: "file/notes/conflict.md",
         _rev: "2-remote",
         content: "newer remote",
         mtime: 5000,
@@ -531,7 +531,7 @@ describe("SyncEngine", () => {
       const { CouchError } = await import("./couch-client");
       client.put.mockRejectedValueOnce(new CouchError(409, "conflict"));
       client.get.mockResolvedValue({
-        _id: "notes/conflict.md",
+        _id: "file/notes/conflict.md",
         _rev: "2-remote",
         content: "remote",
         mtime: 5000,
@@ -558,7 +558,7 @@ describe("SyncEngine", () => {
       client.put.mockRejectedValueOnce(new CouchError(409, "conflict"));
       // Remote has identical content
       client.get.mockResolvedValue({
-        _id: "notes/same.md",
+        _id: "file/notes/same.md",
         _rev: "2-remote",
         content: "same content",
         mtime: 1000,

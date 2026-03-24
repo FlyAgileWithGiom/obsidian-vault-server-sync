@@ -11,6 +11,17 @@ import type {
 
 const REVMAP_KEY = "vault-sync-revmap";
 const SEQ_KEY = "vault-sync-last-seq";
+const DOC_PREFIX = "file/";
+
+/** Convert a vault file path to a CouchDB doc ID */
+function pathToDocId(path: string): string {
+  return `${DOC_PREFIX}${path}`;
+}
+
+/** Convert a CouchDB doc ID back to a vault file path */
+function docIdToPath(docId: string): string {
+  return docId.startsWith(DOC_PREFIX) ? docId.slice(DOC_PREFIX.length) : docId;
+}
 
 /**
  * Bidirectional sync engine between Obsidian vault and CouchDB.
@@ -139,7 +150,7 @@ export class SyncEngine {
     const batch: CouchDoc[] = [];
 
     for (const file of files) {
-      const docId = file.path;
+      const docId = pathToDocId(file.path);
       const content = await this.vault.cachedRead(file);
       const mtime = file.stat.mtime;
 
@@ -290,14 +301,15 @@ export class SyncEngine {
   }
 
   private async applyRemoteDoc(doc: CouchDoc): Promise<void> {
-    if (this.isExcluded(doc._id)) return;
+    const path = docIdToPath(doc._id);
+    if (this.isExcluded(path)) return;
     if (doc.deleted) {
       await this.handleRemoteDelete(doc._id);
       return;
     }
 
-    const path = normalizePath(doc._id);
-    const existing = this.vault.getAbstractFileByPath(path);
+    const normalized = normalizePath(path);
+    const existing = this.vault.getAbstractFileByPath(normalized);
 
     if (existing instanceof TFile) {
       // Compare mtime: only overwrite if remote is newer
@@ -306,15 +318,16 @@ export class SyncEngine {
       }
     } else if (!existing) {
       // New file from remote - ensure parent directories exist
-      await this.ensureParentDirs(path);
-      await this.vault.create(path, doc.content);
+      await this.ensureParentDirs(normalized);
+      await this.vault.create(normalized, doc.content);
     }
   }
 
   private async handleRemoteDelete(docId: string): Promise<void> {
-    if (this.isExcluded(docId)) return;
-    const path = normalizePath(docId);
-    const file = this.vault.getAbstractFileByPath(path);
+    const path = docIdToPath(docId);
+    if (this.isExcluded(path)) return;
+    const normalized = normalizePath(path);
+    const file = this.vault.getAbstractFileByPath(normalized);
     if (file instanceof TFile) {
       await this.vault.delete(file);
     }
@@ -366,13 +379,14 @@ export class SyncEngine {
     if (!(file instanceof TFile)) return;
     if (this.isExcluded(file.path)) return;
 
-    const rev = this.revMap[file.path];
+    const docId = pathToDocId(file.path);
+    const rev = this.revMap[docId];
     if (!rev) return; // Never synced, nothing to do
 
     try {
-      const result = await this.client.delete(file.path, rev);
+      const result = await this.client.delete(docId, rev);
       if (result.ok) {
-        delete this.revMap[file.path];
+        delete this.revMap[docId];
         this.persistState();
       }
     } catch (e) {
@@ -386,11 +400,12 @@ export class SyncEngine {
     if (!(file instanceof TFile)) return;
 
     // Delete old doc
-    const oldRev = this.revMap[oldPath];
+    const oldDocId = pathToDocId(oldPath);
+    const oldRev = this.revMap[oldDocId];
     if (oldRev) {
       try {
-        await this.client.delete(oldPath, oldRev);
-        delete this.revMap[oldPath];
+        await this.client.delete(oldDocId, oldRev);
+        delete this.revMap[oldDocId];
       } catch {
         // Best effort delete of old path
       }
@@ -408,19 +423,20 @@ export class SyncEngine {
 
   private async pushFile(file: TFile): Promise<void> {
     try {
+      const docId = pathToDocId(file.path);
       const content = await this.vault.cachedRead(file);
       const doc: CouchDoc = {
-        _id: file.path,
+        _id: docId,
         content,
         mtime: file.stat.mtime,
       };
 
       // Include rev if we have one (update) or fetch it (avoid conflict)
-      if (this.revMap[file.path]) {
-        doc._rev = this.revMap[file.path];
+      if (this.revMap[docId]) {
+        doc._rev = this.revMap[docId];
       } else {
         try {
-          const remote = await this.client.get(file.path);
+          const remote = await this.client.get(docId);
           if (remote._rev) doc._rev = remote._rev;
         } catch {
           // New doc, no rev needed
@@ -430,12 +446,12 @@ export class SyncEngine {
       try {
         const result = await this.client.put(doc);
         if (result.ok && result.rev) {
-          this.revMap[file.path] = result.rev;
+          this.revMap[docId] = result.rev;
           this.persistState();
         }
       } catch (e) {
         if (e instanceof CouchError && e.status === 409) {
-          await this.resolveConflict(file.path, content, file.stat.mtime);
+          await this.resolveConflict(docId, content, file.stat.mtime);
         } else {
           throw e;
         }
@@ -451,12 +467,12 @@ export class SyncEngine {
    * No conflict files are created - resolution is fully automatic.
    */
   private async resolveConflict(
-    path: string,
+    docId: string,
     localContent: string,
     localMtime: number,
   ): Promise<void> {
-    const remote = await this.client.get(path);
-    this.revMap[path] = remote._rev!;
+    const remote = await this.client.get(docId);
+    this.revMap[docId] = remote._rev!;
 
     if (remote.content === localContent) {
       // Same content, no real conflict - just update rev
@@ -467,18 +483,18 @@ export class SyncEngine {
     if (localMtime >= remote.mtime) {
       // Local is newer (or equal mtime) - push local content over remote
       const doc: CouchDoc = {
-        _id: path,
+        _id: docId,
         _rev: remote._rev,
         content: localContent,
         mtime: localMtime,
       };
       const result = await this.client.put(doc);
       if (result.ok && result.rev) {
-        this.revMap[path] = result.rev;
+        this.revMap[docId] = result.rev;
       }
     } else {
       // Remote is newer - apply remote content locally
-      const normalized = normalizePath(path);
+      const normalized = normalizePath(docIdToPath(docId));
       const existing = this.vault.getAbstractFileByPath(normalized);
       if (existing instanceof TFile) {
         this.applyingRemote = true;

@@ -101,7 +101,21 @@ export default class VaultSyncPlugin extends Plugin {
   // --- Settings persistence ---
 
   async loadSettings(): Promise<void> {
-    const data = await this.loadData();
+    const data = (await this.loadData()) || {};
+    // Migrate from v0.1.x settings field names
+    if (data.couchdbUrl && !data.couchDbUrl) {
+      data.couchDbUrl = data.couchdbUrl;
+      data.couchDbName = data.database;
+      data.couchDbUser = data.username;
+      data.couchDbPassword = data.password;
+      data.syncDebounceMs = data.debounceMs ?? DEFAULT_SETTINGS.syncDebounceMs;
+      delete data.couchdbUrl;
+      delete data.database;
+      delete data.username;
+      delete data.password;
+      delete data.debounceMs;
+      delete data.maxBinarySize;
+    }
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
   }
 

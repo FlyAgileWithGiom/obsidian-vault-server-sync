@@ -13,7 +13,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
   couchDbUser: "",
   couchDbPassword: "",
   syncDebounceMs: 500,
-  excludePatterns: [".obsidian/", ".trash/"],
+  excludePatterns: [".trash/"],
 };
 
 export type SyncState = "idle" | "syncing" | "ok" | "error" | "offline" | "not-configured";
