@@ -131,8 +131,19 @@ export class SyncEngine {
   async fullSync(): Promise<void> {
     this.onStateChange("syncing");
     try {
-      await this.pushAllLocal();
-      await this.pullAllRemote();
+      // Fetch all remote docs once, reuse for both push and pull
+      const remoteResult = await this.client.allDocs({
+        startkey: DOC_PREFIX,
+        endkey: `${DOC_PREFIX}\uffff`,
+        include_docs: true,
+      });
+      const remoteMap = new Map<string, CouchDoc>();
+      for (const row of remoteResult.rows) {
+        if (row.doc) remoteMap.set(row.id, row.doc);
+      }
+
+      await this.pushAllLocal(remoteMap);
+      await this.pullAllRemote(remoteMap);
       this.persistState();
       this.onStateChange("ok");
     } catch (e) {
@@ -143,39 +154,26 @@ export class SyncEngine {
 
   /**
    * Push all local vault files to CouchDB.
-   * Uses mtime comparison to avoid unnecessary writes.
+   * Uses pre-fetched remote map to avoid N+1 GETs.
    */
-  private async pushAllLocal(): Promise<void> {
+  private async pushAllLocal(remoteMap: Map<string, CouchDoc>): Promise<void> {
     const files = this.vault.getFiles().filter((f) => !this.isExcluded(f.path));
+
     const batch: CouchDoc[] = [];
 
     for (const file of files) {
       const docId = pathToDocId(file.path);
-      const content = await this.vault.cachedRead(file);
       const mtime = file.stat.mtime;
+      const remote = remoteMap.get(docId);
 
-      // Check if remote has same or newer version
-      if (this.revMap[docId]) {
-        try {
-          const remote = await this.client.get(docId);
-          if (remote.mtime >= mtime) continue; // Remote is same or newer, skip
-          batch.push({ _id: docId, _rev: remote._rev, content, mtime });
-        } catch {
-          // Doc doesn't exist remotely, push it
-          batch.push({ _id: docId, content, mtime });
-        }
+      if (remote) {
+        this.revMap[docId] = remote._rev!;
+        if (remote.mtime >= mtime) continue; // Remote is same or newer, skip
+        const content = await this.vault.cachedRead(file);
+        batch.push({ _id: docId, _rev: remote._rev, content, mtime });
       } else {
-        // No known rev, try to get remote to avoid conflicts
-        try {
-          const remote = await this.client.get(docId);
-          if (remote.mtime >= mtime) {
-            this.revMap[docId] = remote._rev!;
-            continue;
-          }
-          batch.push({ _id: docId, _rev: remote._rev, content, mtime });
-        } catch {
-          batch.push({ _id: docId, content, mtime });
-        }
+        const content = await this.vault.cachedRead(file);
+        batch.push({ _id: docId, content, mtime });
       }
     }
 
@@ -190,7 +188,6 @@ export class SyncEngine {
         if (result.ok && result.rev) {
           this.revMap[result.id] = result.rev;
         } else if (result.error === "conflict") {
-          // Conflict during bulk push: resolve individually
           const localDoc = chunk.find((d) => d._id === result.id);
           if (localDoc) {
             await this.resolveConflict(result.id, localDoc.content, localDoc.mtime);
@@ -202,18 +199,16 @@ export class SyncEngine {
 
   /**
    * Pull all remote docs and apply to vault.
-   * Fetches full doc list and writes files that are newer remotely.
+   * Uses pre-fetched remote map to avoid a second _all_docs call.
    */
-  private async pullAllRemote(): Promise<void> {
-    const result = await this.client.allDocs({ include_docs: true });
-
+  private async pullAllRemote(remoteMap: Map<string, CouchDoc>): Promise<void> {
     this.applyingRemote = true;
     try {
-      for (const row of result.rows) {
-        if (!row.doc || row.id.startsWith("_design/")) continue;
-        await this.applyRemoteDoc(row.doc);
-        if (row.doc._rev) {
-          this.revMap[row.id] = row.doc._rev;
+      for (const [docId, doc] of remoteMap) {
+        if (docId.startsWith("_design/")) continue;
+        await this.applyRemoteDoc(doc);
+        if (doc._rev) {
+          this.revMap[docId] = doc._rev;
         }
       }
     } finally {

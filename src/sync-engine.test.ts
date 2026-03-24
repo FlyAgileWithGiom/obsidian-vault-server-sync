@@ -179,9 +179,16 @@ describe("SyncEngine", () => {
       vault._addFile("notes/old.md", "local content", 1000);
 
       const client = getClient(engine);
-      // Remote doc is newer
-      client.get.mockResolvedValue({ _id: "file/notes/old.md", _rev: "1-r", content: "remote", mtime: 2000 });
-      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      // allDocs returns remote doc with newer mtime
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/old.md",
+          key: "file/notes/old.md",
+          value: { rev: "1-r" },
+          doc: { _id: "file/notes/old.md", _rev: "1-r", content: "remote", mtime: 2000 },
+        }],
+      });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
       await engine.start();
@@ -194,9 +201,17 @@ describe("SyncEngine", () => {
       vault._addFile("notes/newer.md", "updated", 3000);
 
       const client = getClient(engine);
-      client.get.mockResolvedValue({ _id: "file/notes/newer.md", _rev: "1-old", content: "old", mtime: 1000 });
+      // allDocs returns remote doc with older mtime
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/notes/newer.md",
+          key: "file/notes/newer.md",
+          value: { rev: "1-old" },
+          doc: { _id: "file/notes/newer.md", _rev: "1-old", content: "old", mtime: 1000 },
+        }],
+      });
       client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/newer.md", rev: "2-new" }]);
-      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
 
       await engine.start();
