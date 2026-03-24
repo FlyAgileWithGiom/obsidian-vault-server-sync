@@ -148,9 +148,14 @@ export class SyncEngine {
         remoteRevs.set(row.id, row.value.rev);
       }
 
-      const firstSync = Object.keys(this.revMap).length === 0;
+      const localFiles = this.vault.getFiles().filter((f) => !this.isExcluded(f.path));
+      const emptyRevMap = Object.keys(this.revMap).length === 0;
+      // Skip pull content only if we have a populated vault AND empty revMap
+      // (= desktop with existing files, first time running new plugin version)
+      // On an empty vault (mobile first sync), we must pull content.
+      const skipPullContent = emptyRevMap && localFiles.length > 100;
       await this.pushAllLocal(remoteRevs);
-      await this.pullAllRemote(remoteRevs, firstSync);
+      await this.pullAllRemote(remoteRevs, skipPullContent);
       this.persistState();
       this.onStateChange("ok");
     } catch (e) {
