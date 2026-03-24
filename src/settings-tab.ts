@@ -195,8 +195,28 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     new Setting(this.diagnosticsEl)
       .addButton((btn) =>
         btn.setButtonText("Copy").onClick(() => {
-          navigator.clipboard.writeText(this.formatDiagnostics(this.plugin.getDiagnostics()));
-          btn.setButtonText("Copied!");
+          const text = this.formatDiagnostics(this.plugin.getDiagnostics());
+          // Select text in pre element (works on mobile)
+          const range = document.createRange();
+          range.selectNodeContents(pre);
+          const sel = window.getSelection();
+          if (sel) {
+            sel.removeAllRanges();
+            sel.addRange(range);
+          }
+          // Try clipboard API, fallback to execCommand
+          try {
+            navigator.clipboard.writeText(text).then(
+              () => { btn.setButtonText("Copied!"); },
+              () => {
+                document.execCommand("copy");
+                btn.setButtonText("Copied!");
+              }
+            );
+          } catch {
+            document.execCommand("copy");
+            btn.setButtonText("Copied!");
+          }
           setTimeout(() => btn.setButtonText("Copy"), 1500);
         })
       );
