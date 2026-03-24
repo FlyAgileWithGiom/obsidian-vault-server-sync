@@ -306,50 +306,26 @@ export class SyncEngine {
       this.emitCounts();
       let failCount = 0;
       try {
-        // Batch fetch using _all_docs with keys (POST) to avoid N+1 requests.
-        // CouchDB supports POST to _all_docs with {"keys": [...]} body.
-        for (let offset = 0; offset < toPull.length; offset += PULL_BATCH_SIZE) {
-          const batch = toPull.slice(offset, offset + PULL_BATCH_SIZE);
+        // Fetch docs individually via GET (POST _all_docs has encoding issues with requestUrl).
+        // Process in small batches with yield to keep UI responsive.
+        for (let i = 0; i < toPull.length; i++) {
+          const docId = toPull[i];
           try {
-            const result = await this.client.allDocsByKeys(batch);
-            for (const row of result.rows) {
-              if (row.error || !row.doc) {
-                this.pullSkipped++;
-                failCount++;
-                continue;
-              }
-              try {
-                await this.applyRemoteDoc(row.doc);
-                if (row.doc._rev) {
-                  this.revMap[row.doc._id] = row.doc._rev;
-                  this.pullApplied++;
-                }
-              } catch (applyErr) {
-                failCount++;
-                this.pullSkipped++;
-              }
-              this.pullFetched++;
-              this.pullCount--;
-              this.emitCounts();
+            const doc = await this.client.get(docId);
+            await this.applyRemoteDoc(doc);
+            if (doc._rev) {
+              this.revMap[doc._id] = doc._rev;
+              this.pullApplied++;
             }
-          } catch (batchErr) {
-            // Batch failed (timeout?) -- retry docs individually
-            console.warn(`[vault-sync] Pull batch failed at offset ${offset}, retrying individually: ${(batchErr as Error).message}`);
-            for (const docId of batch) {
-              try {
-                const doc = await this.client.get(docId);
-                await this.applyRemoteDoc(doc);
-                if (doc._rev) this.revMap[doc._id] = doc._rev;
-              } catch {
-                failCount++;
-              }
-              this.pullFetched++;
-              this.pullCount--;
-              this.emitCounts();
-            }
+          } catch {
+            failCount++;
+            this.pullSkipped++;
           }
-          await this.yield();
-          this.persistState();
+          this.pullFetched++;
+          this.pullCount--;
+          this.emitCounts();
+          if (i % 10 === 9) await this.yield();
+          if (i % 100 === 99) this.persistState();
         }
         if (failCount > 0) {
           console.warn(`[vault-sync] Pull complete with ${failCount} failures out of ${toPull.length}`);
