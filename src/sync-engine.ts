@@ -173,11 +173,15 @@ export class SyncEngine {
 
   // --- Full sync (initial or manual) ---
 
-  async forceFullSync(): Promise<void> {
-    console.log("[vault-sync] Force full sync: clearing revMap");
+  clearState(): void {
+    console.log("[vault-sync] Clearing revMap and lastSeq");
     this.revMap = {};
     this.lastSeq = 0;
     this.persistState();
+  }
+
+  async forceFullSync(): Promise<void> {
+    this.clearState();
     await this.fullSync();
   }
 
@@ -317,9 +321,13 @@ export class SyncEngine {
               this.revMap[doc._id] = doc._rev;
               this.pullApplied++;
             }
-          } catch {
+          } catch (e) {
             failCount++;
             this.pullSkipped++;
+            // Log first few errors to diagnostics for debugging
+            if (failCount <= 3) {
+              this.setError(`Pull[${i}] ${docId.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+            }
           }
           this.pullFetched++;
           this.pullCount--;

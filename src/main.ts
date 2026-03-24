@@ -152,10 +152,11 @@ export default class VaultSyncPlugin extends Plugin {
 
   /** Public: called from settings tab */
   async forceFullSync(): Promise<void> {
-    if (!this.syncEngine.isRunning()) {
-      await this.startSync();
-    }
-    await this.syncEngine.forceFullSync();
+    // Stop any running sync first to avoid race conditions
+    this.syncEngine.stop();
+    // Reset and restart from scratch
+    this.syncEngine.clearState();
+    await this.startSync();
   }
 
   /** Public: diagnostics for settings tab observability on mobile */
