@@ -1,6 +1,6 @@
 {
-  "id": "vault-sync",
-  "name": "Vault Sync",
+  "id": "fly-vault-sync",
+  "name": "Vault Sync (Fly Agile)",
   "version": "0.5.2",
   "minAppVersion": "1.4.0",
   "description": "Sync your vault to CouchDB for access by vault-server (Claude MCP)",
