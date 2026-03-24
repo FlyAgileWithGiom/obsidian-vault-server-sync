@@ -152,9 +152,8 @@ export default class VaultSyncPlugin extends Plugin {
   async forceFullSync(): Promise<void> {
     if (!this.syncEngine.isRunning()) {
       await this.startSync();
-    } else {
-      await this.syncEngine.fullSync();
     }
+    await this.syncEngine.forceFullSync();
   }
 
   /** Public: called from settings tab */

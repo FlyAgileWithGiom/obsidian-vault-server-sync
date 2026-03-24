@@ -135,6 +135,14 @@ export class SyncEngine {
 
   // --- Full sync (initial or manual) ---
 
+  async forceFullSync(): Promise<void> {
+    console.log("[vault-sync] Force full sync: clearing revMap");
+    this.revMap = {};
+    this.lastSeq = 0;
+    this.persistState();
+    await this.fullSync();
+  }
+
   async fullSync(): Promise<void> {
     this.onStateChange("syncing");
     try {
