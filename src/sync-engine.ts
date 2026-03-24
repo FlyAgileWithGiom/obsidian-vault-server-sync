@@ -14,7 +14,7 @@ const REVMAP_KEY = "vault-sync-revmap";
 const SEQ_KEY = "vault-sync-last-seq";
 const DOC_PREFIX = "file/";
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
-const PULL_BATCH_SIZE = 50; // Docs per _all_docs batch during pull (balances response size vs request count)
+const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
 
 /** Convert a vault file path to a CouchDB doc ID */
 function pathToDocId(path: string): string {
@@ -326,10 +326,20 @@ export class SyncEngine {
               this.emitCounts();
             }
           } catch (batchErr) {
-            // Entire batch failed -- log and continue with next batch
-            failCount += batch.length;
-            console.error(`[vault-sync] Pull batch failed at offset ${offset}: ${(batchErr as Error).message}`);
-            this.setError(`Pull batch failed: ${(batchErr as Error).message}`);
+            // Batch failed (timeout?) -- retry docs individually
+            console.warn(`[vault-sync] Pull batch failed at offset ${offset}, retrying individually: ${(batchErr as Error).message}`);
+            for (const docId of batch) {
+              try {
+                const doc = await this.client.get(docId);
+                await this.applyRemoteDoc(doc);
+                if (doc._rev) this.revMap[doc._id] = doc._rev;
+              } catch {
+                failCount++;
+              }
+              this.pullFetched++;
+              this.pullCount--;
+              this.emitCounts();
+            }
           }
           await this.yield();
           this.persistState();
