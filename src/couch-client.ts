@@ -1,3 +1,4 @@
+import { requestUrl } from "obsidian";
 import type {
   CouchDoc,
   CouchBulkResult,
@@ -7,54 +8,61 @@ import type {
 } from "./types";
 
 /**
- * Lightweight CouchDB client using fetch API.
- * No PouchDB dependency — ~3KB vs 135KB.
+ * Lightweight CouchDB client using Obsidian's requestUrl API.
+ * requestUrl bypasses CORS restrictions in Electron/mobile.
  */
 export class CouchClient {
   private baseUrl: string;
-  private headers: Record<string, string>;
-  private abortController: AbortController | null = null;
+  private authHeader: string | null = null;
+  private cancelled = false;
 
   constructor(private settings: VaultSyncSettings) {
-    const { couchDbUrl, couchDbName } = settings;
-    this.baseUrl = `${couchDbUrl.replace(/\/+$/, "")}/${encodeURIComponent(couchDbName)}`;
-    this.headers = {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    };
-    if (settings.couchDbUser && settings.couchDbPassword) {
-      const creds = btoa(`${settings.couchDbUser}:${settings.couchDbPassword}`);
-      this.headers["Authorization"] = `Basic ${creds}`;
+    this.baseUrl = this.buildBaseUrl(settings);
+    this.authHeader = this.buildAuth(settings);
+  }
+
+  private buildBaseUrl(s: VaultSyncSettings): string {
+    return `${s.couchDbUrl.replace(/\/+$/, "")}/${encodeURIComponent(s.couchDbName)}`;
+  }
+
+  private buildAuth(s: VaultSyncSettings): string | null {
+    if (s.couchDbUser && s.couchDbPassword) {
+      return `Basic ${btoa(`${s.couchDbUser}:${s.couchDbPassword}`)}`;
     }
+    return null;
   }
 
   updateSettings(settings: VaultSyncSettings): void {
     this.settings = settings;
-    const { couchDbUrl, couchDbName } = settings;
-    this.baseUrl = `${couchDbUrl.replace(/\/+$/, "")}/${encodeURIComponent(couchDbName)}`;
-    if (settings.couchDbUser && settings.couchDbPassword) {
-      const creds = btoa(`${settings.couchDbUser}:${settings.couchDbPassword}`);
-      this.headers["Authorization"] = `Basic ${creds}`;
-    }
+    this.baseUrl = this.buildBaseUrl(settings);
+    this.authHeader = this.buildAuth(settings);
   }
 
   private async request<T>(
     path: string,
-    options: RequestInit = {}
+    options: { method?: string; body?: string } = {}
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
-    const resp = await fetch(url, {
-      ...options,
-      headers: { ...this.headers, ...((options.headers as Record<string, string>) || {}) },
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    };
+    if (this.authHeader) headers["Authorization"] = this.authHeader;
+
+    const resp = await requestUrl({
+      url,
+      method: options.method || "GET",
+      headers,
+      body: options.body,
+      throw: false,
     });
-    if (!resp.ok) {
-      const body = await resp.text().catch(() => "");
-      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${body}`);
+
+    if (resp.status >= 400) {
+      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${resp.text}`);
     }
-    return resp.json();
+    return resp.json;
   }
 
-  /** Check if DB is reachable */
   async ping(): Promise<boolean> {
     try {
       await this.request<{ db_name: string }>("");
@@ -64,26 +72,22 @@ export class CouchClient {
     }
   }
 
-  /** Ensure the database exists, create if not */
   async ensureDb(): Promise<void> {
     try {
       await this.request("");
     } catch (e) {
       if (e instanceof CouchError && e.status === 404) {
-        const url = this.baseUrl;
-        await fetch(url, { method: "PUT", headers: this.headers });
+        await this.request("", { method: "PUT" });
       } else {
         throw e;
       }
     }
   }
 
-  /** Get a single document */
   async get(docId: string): Promise<CouchDoc> {
     return this.request<CouchDoc>(`/${encodeURIComponent(docId)}`);
   }
 
-  /** Put a single document */
   async put(doc: CouchDoc): Promise<CouchBulkResult> {
     return this.request<CouchBulkResult>(`/${encodeURIComponent(doc._id)}`, {
       method: "PUT",
@@ -91,7 +95,6 @@ export class CouchClient {
     });
   }
 
-  /** Delete a document (mark as deleted) */
   async delete(docId: string, rev: string): Promise<CouchBulkResult> {
     return this.request<CouchBulkResult>(
       `/${encodeURIComponent(docId)}?rev=${encodeURIComponent(rev)}`,
@@ -99,7 +102,6 @@ export class CouchClient {
     );
   }
 
-  /** Bulk get all docs with content (for initial sync) */
   async allDocs(options: {
     startkey?: string;
     endkey?: string;
@@ -115,7 +117,6 @@ export class CouchClient {
     return this.request<CouchAllDocsResult>(`/_all_docs${qs ? "?" + qs : ""}`);
   }
 
-  /** Bulk write documents */
   async bulkDocs(docs: CouchDoc[]): Promise<CouchBulkResult[]> {
     return this.request<CouchBulkResult[]>("/_bulk_docs", {
       method: "POST",
@@ -124,43 +125,31 @@ export class CouchClient {
   }
 
   /**
-   * Poll changes feed (long-polling, mobile-friendly).
-   * Returns when changes arrive or timeout.
+   * Poll changes feed using normal feed with short timeout (not longpoll).
+   * Uses requestUrl for CORS compatibility. Polling loop in SyncEngine provides near-realtime.
    */
   async changes(since: string | number = 0, options: {
     timeout?: number;
     limit?: number;
     include_docs?: boolean;
   } = {}): Promise<CouchChangesResult> {
-    // Cancel any previous long-poll
-    this.cancelChanges();
-
-    this.abortController = new AbortController();
+    this.cancelled = false;
     const params = new URLSearchParams({
       since: String(since),
-      feed: "longpoll",
-      timeout: String(options.timeout ?? 25000),
+      feed: "normal",
       include_docs: String(options.include_docs ?? true),
     });
     if (options.limit) params.set("limit", String(options.limit));
 
-    const url = `${this.baseUrl}/_changes?${params.toString()}`;
-    const resp = await fetch(url, {
-      headers: this.headers,
-      signal: this.abortController.signal,
-    });
-    if (!resp.ok) {
-      throw new CouchError(resp.status, `Changes feed error: ${resp.status}`);
-    }
-    return resp.json();
+    return this.request<CouchChangesResult>(`/_changes?${params.toString()}`);
   }
 
-  /** Cancel an ongoing long-poll */
   cancelChanges(): void {
-    if (this.abortController) {
-      this.abortController.abort();
-      this.abortController = null;
-    }
+    this.cancelled = true;
+  }
+
+  isCancelled(): boolean {
+    return this.cancelled;
   }
 
   isConfigured(): boolean {

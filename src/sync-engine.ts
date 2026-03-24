@@ -94,20 +94,25 @@ export class SyncEngine {
 
   async start(): Promise<void> {
     if (!this.client.isConfigured()) {
+      console.log("[vault-sync] Not configured, skipping start");
       this.onStateChange("not-configured");
       return;
     }
     this.running = true;
     this.onStateChange("syncing");
+    console.log("[vault-sync] Starting sync...");
 
     try {
       await this.client.ensureDb();
+      console.log("[vault-sync] DB ensured, starting fullSync");
       await this.fullSync();
+      console.log("[vault-sync] fullSync complete, starting polling");
       this.onStateChange("ok");
       this.startPolling();
     } catch (e) {
       this.running = false;
       this.onStateChange("error");
+      console.error("[vault-sync] Start failed:", e);
       this.onError(`Sync start failed: ${(e as Error).message}`);
     }
   }
@@ -301,9 +306,10 @@ export class SyncEngine {
       this.persistState();
       this.onStateChange("ok");
 
-      // Immediately poll again (long-poll will block server-side)
+      // Poll again after interval (normal feed, not longpoll)
       if (this.running) {
-        this.changesPollTimer = setTimeout(() => this.pollChanges(), 100);
+        const POLL_INTERVAL = 3000; // 3 seconds for near-realtime
+        this.changesPollTimer = setTimeout(() => this.pollChanges(), POLL_INTERVAL);
       }
     } catch (e) {
       if (!this.running) return; // Expected abort on stop
@@ -367,8 +373,20 @@ export class SyncEngine {
       }
     } else if (!existing) {
       // New file from remote - ensure parent directories exist
-      await this.ensureParentDirs(normalized);
-      await this.vault.create(normalized, doc.content);
+      try {
+        await this.ensureParentDirs(normalized);
+        await this.vault.create(normalized, doc.content);
+      } catch (e) {
+        if ((e as Error).message?.includes("already exists")) {
+          // Race condition: file appeared between check and create, use modify
+          const file = this.vault.getAbstractFileByPath(normalized);
+          if (file instanceof TFile) {
+            await this.vault.modify(file, doc.content);
+          }
+        } else {
+          throw e;
+        }
+      }
     }
   }
 
@@ -407,6 +425,7 @@ export class SyncEngine {
     if (!this.running || this.applyingRemote) return;
     if (!(file instanceof TFile)) return;
     if (this.isExcluded(file.path)) return;
+    console.log(`[vault-sync] Local change: ${file.path}`);
 
     // Cancel any pending debounce for this file
     const existing = this.pendingWrites.get(file.path);

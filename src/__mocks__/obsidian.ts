@@ -1,5 +1,17 @@
 /** Minimal mock of the Obsidian API for testing */
 
+/** Mock requestUrl - tests override via vi.mocked(requestUrl) */
+export async function requestUrl(options: {
+  url: string;
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+  throw?: boolean;
+}): Promise<{ status: number; json: unknown; text: string }> {
+  // Default mock - tests should override this
+  return { status: 200, json: {}, text: "{}" };
+}
+
 export class TFile {
   path: string;
   stat: { mtime: number; ctime: number; size: number };
