@@ -435,6 +435,8 @@ export class SyncEngine {
       await this.handleRemoteDelete(doc._id);
       return;
     }
+    // Skip docs with null/undefined content (corrupted or binary)
+    if (typeof doc.content !== "string") return;
 
     const normalized = normalizePath(path);
     const existing = this.vault.getAbstractFileByPath(normalized);
