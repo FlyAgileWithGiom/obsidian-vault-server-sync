@@ -888,7 +888,7 @@ describe("SyncEngine", () => {
 
       await engine.start();
 
-      expect(client.getAttachment).toHaveBeenCalledWith("file/images/photo.png", "data");
+      expect(client.getAttachment).toHaveBeenCalledWith("file/images/photo.png", "data.bin");
       expect(vault._getBinaryContent("images/photo.png")).toBe(pngData);
     });
 
@@ -938,7 +938,7 @@ describe("SyncEngine", () => {
       await engine.start();
       await new Promise((r) => setTimeout(r, 3500));
 
-      expect(client.getAttachment).toHaveBeenCalledWith("file/images/new.png", "data");
+      expect(client.getAttachment).toHaveBeenCalledWith("file/images/new.png", "data.bin");
       expect(vault._getBinaryContent("images/new.png")).toBe(pngData);
     });
   });
@@ -959,7 +959,7 @@ describe("SyncEngine", () => {
 
       expect(client.putAttachment).toHaveBeenCalledWith(
         "file/images/photo.png",
-        "data",
+        "data.bin",
         expect.any(String), // rev from the put
         pngData,
         "image/png"
@@ -983,7 +983,7 @@ describe("SyncEngine", () => {
 
       expect(client.putAttachment).toHaveBeenCalledWith(
         "file/images/icon.png",
-        "data",
+        "data.bin",
         expect.any(String),
         pngData,
         "image/png"
