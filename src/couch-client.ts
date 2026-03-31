@@ -158,6 +158,28 @@ export class CouchClient {
     return this.request<CouchChangesResult>(`/_changes?${params.toString()}`);
   }
 
+  async getAttachment(docId: string, attName: string): Promise<ArrayBuffer> {
+    const url = `${this.baseUrl}/${encodeURIComponent(docId)}/${encodeURIComponent(attName)}`;
+    const headers: Record<string, string> = {};
+    if (this.authHeader) headers["Authorization"] = this.authHeader;
+    const resp = await requestUrl({ url, method: "GET", headers, throw: false });
+    if (resp.status >= 400) {
+      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${resp.text}`);
+    }
+    return resp.arrayBuffer;
+  }
+
+  async putAttachment(docId: string, attName: string, rev: string, data: ArrayBuffer, contentType: string): Promise<CouchBulkResult> {
+    const url = `${this.baseUrl}/${encodeURIComponent(docId)}/${encodeURIComponent(attName)}?rev=${encodeURIComponent(rev)}`;
+    const headers: Record<string, string> = { "Content-Type": contentType };
+    if (this.authHeader) headers["Authorization"] = this.authHeader;
+    const resp = await requestUrl({ url, method: "PUT", headers, body: data as unknown as string, throw: false });
+    if (resp.status >= 400) {
+      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${resp.text}`);
+    }
+    return resp.json as CouchBulkResult;
+  }
+
   cancelChanges(): void {
     this.cancelled = true;
   }

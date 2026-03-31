@@ -41,14 +41,13 @@ export function normalizePath(path: string): string {
 
 export class Vault {
   private files: Map<string, { file: TFile; content: string }> = new Map();
+  private binaryFiles: Map<string, { file: TFile; content: ArrayBuffer }> = new Map();
 
   getFiles(): TFile[] {
-    return Array.from(this.files.values()).map((f) => f.file);
-  }
-
-  getAbstractFileByPath(path: string): TFile | null {
-    const entry = this.files.get(path);
-    return entry ? entry.file : null;
+    return [
+      ...Array.from(this.files.values()).map((f) => f.file),
+      ...Array.from(this.binaryFiles.values()).map((f) => f.file),
+    ];
   }
 
   async cachedRead(file: TFile): Promise<string> {
@@ -67,6 +66,40 @@ export class Vault {
     }
   }
 
+  async readBinary(file: TFile): Promise<ArrayBuffer> {
+    const entry = this.binaryFiles.get(file.path);
+    return entry ? entry.content : new ArrayBuffer(0);
+  }
+
+  async createBinary(path: string, data: ArrayBuffer): Promise<TFile> {
+    const file = new TFile(path);
+    this.binaryFiles.set(path, { file, content: data });
+    return file;
+  }
+
+  async modifyBinary(file: TFile, data: ArrayBuffer): Promise<void> {
+    const entry = this.binaryFiles.get(file.path);
+    if (entry) {
+      entry.content = data;
+    }
+  }
+
+  // Test helpers for binary files
+  _addBinaryFile(path: string, data: ArrayBuffer, mtime = Date.now()): TFile {
+    const file = new TFile(path, mtime);
+    this.binaryFiles.set(path, { file, content: data });
+    return file;
+  }
+
+  _getBinaryContent(path: string): ArrayBuffer | undefined {
+    return this.binaryFiles.get(path)?.content;
+  }
+
+  getAbstractFileByPath(path: string): TFile | null {
+    const entry = this.files.get(path) ?? this.binaryFiles.get(path);
+    return entry ? entry.file : null;
+  }
+
   async create(path: string, content: string): Promise<TFile> {
     const file = new TFile(path);
     this.files.set(path, { file, content });
@@ -79,6 +112,7 @@ export class Vault {
 
   async delete(file: TFile): Promise<void> {
     this.files.delete(file.path);
+    this.binaryFiles.delete(file.path);
   }
 
   // Test helpers (not in real Obsidian API)

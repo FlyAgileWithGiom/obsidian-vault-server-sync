@@ -31,9 +31,16 @@ export interface RevMap {
 export interface CouchDoc {
   _id: string;
   _rev?: string;
-  content: string;
+  content: string | null;
   mtime: number;
   deleted?: boolean;
+  _attachments?: Record<string, CouchAttachmentStub>;
+}
+
+export interface CouchAttachmentStub {
+  content_type: string;
+  length: number;
+  stub: true;
 }
 
 export interface CouchBulkResult {

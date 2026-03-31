@@ -186,4 +186,51 @@ describe("CouchClient", () => {
       expect(error).toBeInstanceOf(Error);
     });
   });
+
+  describe("getAttachment", () => {
+    it("fetches attachment as ArrayBuffer", async () => {
+      const buf = new ArrayBuffer(4);
+      mockRequestUrl.mockResolvedValue({ status: 200, json: {}, text: "", headers: {}, arrayBuffer: buf } as any);
+      const client = new CouchClient(makeSettings());
+      const result = await client.getAttachment("file/image.png", "data");
+      expect(result).toBe(buf);
+      const call = mockRequestUrl.mock.calls[0][0];
+      expect(call.url).toContain("/file%2Fimage.png/data");
+      expect(call.method).toBe("GET");
+    });
+
+    it("sends auth header in attachment GET", async () => {
+      const buf = new ArrayBuffer(0);
+      mockRequestUrl.mockResolvedValue({ status: 200, json: {}, text: "", headers: {}, arrayBuffer: buf } as any);
+      await new CouchClient(makeSettings()).getAttachment("file/a.png", "data");
+      expect(mockRequestUrl.mock.calls[0][0].headers?.["Authorization"]).toBe(`Basic ${btoa("admin:secret")}`);
+    });
+
+    it("throws CouchError on 404", async () => {
+      mockError(404, "not found");
+      await expect(new CouchClient(makeSettings()).getAttachment("file/missing.png", "data")).rejects.toThrow(CouchError);
+    });
+  });
+
+  describe("putAttachment", () => {
+    it("PUTs attachment with correct URL, Content-Type, and body", async () => {
+      mockOk({ ok: true, id: "file/image.png", rev: "2-xyz" });
+      const data = new ArrayBuffer(8);
+      const client = new CouchClient(makeSettings());
+      const result = await client.putAttachment("file/image.png", "data", "1-abc", data, "image/png");
+      expect(result).toEqual({ ok: true, id: "file/image.png", rev: "2-xyz" });
+      const call = mockRequestUrl.mock.calls[0][0];
+      expect(call.url).toContain("/file%2Fimage.png/data");
+      expect(call.url).toContain("rev=1-abc");
+      expect(call.method).toBe("PUT");
+      expect(call.headers?.["Content-Type"]).toBe("image/png");
+      expect(call.body).toBe(data);
+    });
+
+    it("throws CouchError on 409 conflict", async () => {
+      mockError(409, "conflict");
+      const data = new ArrayBuffer(0);
+      await expect(new CouchClient(makeSettings()).putAttachment("file/img.png", "data", "1-abc", data, "image/png")).rejects.toThrow(CouchError);
+    });
+  });
 });

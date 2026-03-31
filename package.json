@@ -1,6 +1,6 @@
 {
   "name": "obsidian-vault-sync",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "Lightweight CouchDB sync for Obsidian vaults",
   "main": "main.js",
   "scripts": {

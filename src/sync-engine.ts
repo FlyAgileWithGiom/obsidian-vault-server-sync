@@ -15,6 +15,26 @@ const SEQ_KEY = "vault-sync-last-seq";
 const DOC_PREFIX = "file/";
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
+const ATTACHMENT_NAME = "data";
+
+const CONTENT_TYPE_MAP: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  pdf: "application/pdf",
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  wav: "audio/wav",
+  mp4: "video/mp4",
+  mov: "video/quicktime",
+};
+
+function contentTypeForPath(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  return CONTENT_TYPE_MAP[ext] ?? "application/octet-stream";
+}
 
 /** Convert a vault file path to a CouchDB doc ID */
 function pathToDocId(path: string): string {
@@ -231,13 +251,19 @@ export class SyncEngine {
         continue; // Rev unknown or changed - pull will handle
       } else {
         // New file, not on remote
-        const content = await this.vault.cachedRead(file);
-        batch.push({ _id: docId, content, mtime: file.stat.mtime });
-
-        // Flush in small chunks to avoid nginx 413
-        if (batch.length >= 10) {
-          await this.pushBatch(batch.splice(0));
+        if (this.isBinaryDoc(docId)) {
+          // Binary files need attachment PUT, not bulk_docs
+          await this.pushBinaryFile(file);
           await this.yield();
+        } else {
+          const content = await this.vault.cachedRead(file);
+          batch.push({ _id: docId, content, mtime: file.stat.mtime });
+
+          // Flush in small chunks to avoid nginx 413
+          if (batch.length >= 10) {
+            await this.pushBatch(batch.splice(0));
+            await this.yield();
+          }
         }
       }
     }
@@ -306,78 +332,33 @@ export class SyncEngine {
   }
 
   private async pullAllRemote(remoteRevs: Map<string, string>): Promise<void> {
-    const toPull: string[] = [];
-    let skippedBinary = 0;
+    const textToPull: string[] = [];
+    const binaryToPull: string[] = [];
+
     for (const [docId, rev] of remoteRevs) {
       if (docId.startsWith("_design/")) continue;
       if (this.revMap[docId] === rev) continue;
-      if (this.isBinaryDoc(docId)) { skippedBinary++; continue; }
-      toPull.push(docId);
-    }
-    if (skippedBinary > 0) {
-      console.log(`[vault-sync] Pull: skipped ${skippedBinary} binary docs`);
+      if (this.isBinaryDoc(docId)) {
+        binaryToPull.push(docId);
+      } else {
+        textToPull.push(docId);
+      }
     }
 
-    console.log(`[vault-sync] Pull: ${toPull.length} docs to fetch`);
+    console.log(`[vault-sync] Pull: ${textToPull.length} text docs, ${binaryToPull.length} binary docs to fetch`);
 
-    if (toPull.length > 0) {
+    const totalToPull = textToPull.length + binaryToPull.length;
+    if (totalToPull > 0) {
       this.applyingRemote = true;
-      this.pullCount = toPull.length;
-      this.pullTotal = toPull.length;
+      this.pullCount = totalToPull;
+      this.pullTotal = totalToPull;
       this.pullFetched = 0;
       this.pullSkipped = 0;
       this.pullApplied = 0;
       this.emitCounts();
-      let failCount = 0;
       try {
-        // Batch fetch via POST _all_docs with keys. Falls back to individual GETs on failure.
-        for (let offset = 0; offset < toPull.length; offset += PULL_BATCH_SIZE) {
-          const batchKeys = toPull.slice(offset, offset + PULL_BATCH_SIZE);
-          let docs: (CouchDoc | null)[];
-
-          try {
-            const result = await this.client.allDocsByKeys(batchKeys);
-            docs = result.rows.map((row) => (row.error || !row.doc) ? null : row.doc);
-          } catch {
-            // Batch failed -- fall back to individual GETs
-            docs = [];
-            for (const docId of batchKeys) {
-              try {
-                docs.push(await this.client.get(docId));
-              } catch {
-                docs.push(null);
-              }
-            }
-          }
-
-          for (const doc of docs) {
-            if (doc) {
-              try {
-                await this.applyRemoteDoc(doc);
-                if (doc._rev) {
-                  this.revMap[doc._id] = doc._rev;
-                  this.pullApplied++;
-                }
-              } catch (e) {
-                failCount++;
-                this.pullSkipped++;
-                if (failCount <= 3) {
-                  this.setError(`Pull ${doc._id.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
-                }
-              }
-            } else {
-              this.pullSkipped++;
-            }
-            this.pullFetched++;
-            this.pullCount--;
-            this.emitCounts();
-          }
-          await this.yield();
-          this.persistState();
-        }
-        if (failCount > 0) {
-          console.warn(`[vault-sync] Pull complete with ${failCount} failures out of ${toPull.length}`);
-        }
+        await this.pullTextDocs(textToPull);
+        await this.pullBinaryDocs(binaryToPull, remoteRevs);
       } finally {
         this.pullCount = 0;
         this.pullTotal = 0;
@@ -403,6 +384,107 @@ export class SyncEngine {
     const changes = await this.client.changes(0, { limit: 0, include_docs: false });
     this.lastSeq = changes.last_seq;
     this.persistState();
+  }
+
+  private async pullTextDocs(keys: string[]): Promise<void> {
+    let failCount = 0;
+    for (let offset = 0; offset < keys.length; offset += PULL_BATCH_SIZE) {
+      const batchKeys = keys.slice(offset, offset + PULL_BATCH_SIZE);
+      let docs: (CouchDoc | null)[];
+
+      try {
+        const result = await this.client.allDocsByKeys(batchKeys);
+        docs = result.rows.map((row) => (row.error || !row.doc) ? null : row.doc);
+      } catch {
+        // Batch failed -- fall back to individual GETs
+        docs = [];
+        for (const docId of batchKeys) {
+          try {
+            docs.push(await this.client.get(docId));
+          } catch {
+            docs.push(null);
+          }
+        }
+      }
+
+      for (const doc of docs) {
+        if (doc) {
+          try {
+            await this.applyRemoteDoc(doc);
+            if (doc._rev) {
+              this.revMap[doc._id] = doc._rev;
+              this.pullApplied++;
+            }
+          } catch (e) {
+            failCount++;
+            this.pullSkipped++;
+            if (failCount <= 3) {
+              this.setError(`Pull ${doc._id.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+            }
+          }
+        } else {
+          this.pullSkipped++;
+        }
+        this.pullFetched++;
+        this.pullCount--;
+        this.emitCounts();
+      }
+      await this.yield();
+      this.persistState();
+    }
+    if (failCount > 0) {
+      console.warn(`[vault-sync] Text pull complete with ${failCount} failures out of ${keys.length}`);
+    }
+  }
+
+  private async pullBinaryDocs(docIds: string[], remoteRevs: Map<string, string>): Promise<void> {
+    for (let i = 0; i < docIds.length; i++) {
+      const docId = docIds[i];
+      try {
+        const data = await this.client.getAttachment(docId, ATTACHMENT_NAME);
+        await this.applyRemoteBinary(docId, data);
+        const rev = remoteRevs.get(docId);
+        if (rev) this.revMap[docId] = rev;
+        this.pullApplied++;
+      } catch (e) {
+        this.pullSkipped++;
+        this.setError(`Binary pull ${docId.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+      }
+      this.pullFetched++;
+      this.pullCount--;
+      this.emitCounts();
+      if (i % 5 === 4) await this.yield();
+      if (i % 50 === 49) this.persistState();
+    }
+  }
+
+  private async applyRemoteBinary(docId: string, data: ArrayBuffer): Promise<void> {
+    const path = docIdToPath(docId);
+    if (this.isExcluded(path)) return;
+
+    const normalized = normalizePath(path);
+
+    this.recentRemotePaths.add(normalized);
+    setTimeout(() => this.recentRemotePaths.delete(normalized), 2000);
+
+    const existing = this.vault.getAbstractFileByPath(normalized);
+    if (existing instanceof TFile) {
+      await this.vault.modifyBinary(existing, data);
+    } else if (!existing) {
+      try {
+        await this.ensureParentDirs(normalized);
+        await this.vault.createBinary(normalized, data);
+      } catch (e) {
+        if ((e as Error).message?.includes("already exists")) {
+          const file = this.vault.getAbstractFileByPath(normalized);
+          if (file instanceof TFile) {
+            await this.vault.modifyBinary(file, data);
+          }
+        } else {
+          throw e;
+        }
+      }
+    }
   }
 
   // --- Incremental sync (changes feed) ---
@@ -463,7 +545,12 @@ export class SyncEngine {
         if (change.deleted) {
           await this.handleRemoteDelete(change.id);
         } else if (change.doc) {
-          await this.applyRemoteDoc(change.doc);
+          if (this.isBinaryDoc(change.id)) {
+            const data = await this.client.getAttachment(change.id, ATTACHMENT_NAME);
+            await this.applyRemoteBinary(change.id, data);
+          } else {
+            await this.applyRemoteDoc(change.doc);
+          }
         }
 
         // Update rev map
@@ -632,6 +719,14 @@ export class SyncEngine {
   // --- Push single file ---
 
   private async pushFile(file: TFile): Promise<void> {
+    if (this.isBinaryDoc(pathToDocId(file.path))) {
+      await this.pushBinaryFile(file);
+    } else {
+      await this.pushTextFile(file);
+    }
+  }
+
+  private async pushTextFile(file: TFile): Promise<void> {
     try {
       const docId = pathToDocId(file.path);
       const content = await this.vault.cachedRead(file);
@@ -668,6 +763,36 @@ export class SyncEngine {
       }
     } catch (e) {
       this.setError(`Push failed for ${file.path}: ${(e as Error).message}`);
+    }
+  }
+
+  private async pushBinaryFile(file: TFile): Promise<void> {
+    try {
+      const docId = pathToDocId(file.path);
+      const data = await this.vault.readBinary(file);
+      const contentType = contentTypeForPath(file.path);
+
+      // Ensure the stub doc exists first (needed for the attachment PUT)
+      let rev = this.revMap[docId];
+      if (!rev) {
+        try {
+          const remote = await this.client.get(docId);
+          rev = remote._rev ?? "";
+        } catch {
+          // Create stub doc
+          const stubResult = await this.client.put({ _id: docId, content: null, mtime: file.stat.mtime });
+          rev = stubResult.rev ?? "";
+          if (stubResult.rev) this.revMap[docId] = stubResult.rev;
+        }
+      }
+
+      const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, rev, data, contentType);
+      if (result.ok && result.rev) {
+        this.revMap[docId] = result.rev;
+        this.persistState();
+      }
+    } catch (e) {
+      this.setError(`Binary push failed for ${file.path}: ${(e as Error).message}`);
     }
   }
 

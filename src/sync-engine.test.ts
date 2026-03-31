@@ -19,6 +19,8 @@ vi.mock("./couch-client", () => {
       changes: vi.fn().mockResolvedValue({ last_seq: "0", results: [] }),
       cancelChanges: vi.fn(),
       updateSettings: vi.fn(),
+      getAttachment: vi.fn().mockResolvedValue(new ArrayBuffer(0)),
+      putAttachment: vi.fn().mockResolvedValue({ ok: true, id: "", rev: "1-x" }),
     })),
     CouchError: class CouchError extends Error {
       constructor(public status: number, message: string) {
@@ -870,6 +872,122 @@ describe("SyncEngine", () => {
       const newSettings = makeSettings({ couchDbUrl: "https://new-host.com" });
       engine.updateSettings(newSettings);
       expect(client.updateSettings).toHaveBeenCalledWith(newSettings);
+    });
+  });
+
+  describe("binary file sync - pull", () => {
+    it("pulls binary file via getAttachment and creates it in vault", async () => {
+      const pngData = new Uint8Array([137, 80, 78, 71]).buffer; // PNG magic bytes
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/photo.png", key: "file/images/photo.png", value: { rev: "1-p" } }],
+      });
+      client.getAttachment = vi.fn().mockResolvedValue(pngData);
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      expect(client.getAttachment).toHaveBeenCalledWith("file/images/photo.png", "data");
+      expect(vault._getBinaryContent("images/photo.png")).toBe(pngData);
+    });
+
+    it("updates existing binary file when remote rev differs", async () => {
+      const oldData = new Uint8Array([1, 2, 3]).buffer;
+      const newData = new Uint8Array([4, 5, 6]).buffer;
+      vault._addBinaryFile("images/photo.png", oldData);
+
+      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/images/photo.png": "1-old" });
+      const engine2 = new SyncEngine(settings, vault as any);
+      engine2.onStateChange = () => {};
+      engine2.onError = () => {};
+
+      const client = getClient(engine2);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/photo.png", key: "file/images/photo.png", value: { rev: "2-new" } }],
+      });
+      client.getAttachment = vi.fn().mockResolvedValue(newData);
+      client.changes.mockResolvedValue({ last_seq: "2", results: [] });
+
+      await engine2.start();
+
+      expect(vault._getBinaryContent("images/photo.png")).toBe(newData);
+      engine2.stop();
+    });
+
+    it("routes binary changes feed doc to getAttachment", async () => {
+      const pngData = new Uint8Array([1]).buffer;
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+
+      // First poll: nothing; second poll: binary change arrives
+      client.changes
+        .mockResolvedValueOnce({ last_seq: "1", results: [] })
+        .mockResolvedValueOnce({
+          last_seq: "2",
+          results: [{
+            seq: "2",
+            id: "file/images/new.png",
+            changes: [{ rev: "1-p" }],
+            doc: { _id: "file/images/new.png", _rev: "1-p", content: null, mtime: 0 },
+          }],
+        });
+      client.getAttachment = vi.fn().mockResolvedValue(pngData);
+
+      await engine.start();
+      await new Promise((r) => setTimeout(r, 3500));
+
+      expect(client.getAttachment).toHaveBeenCalledWith("file/images/new.png", "data");
+      expect(vault._getBinaryContent("images/new.png")).toBe(pngData);
+    });
+  });
+
+  describe("binary file sync - push", () => {
+    it("pushes new binary file via putAttachment", async () => {
+      const pngData = new Uint8Array([137, 80, 78, 71]).buffer;
+      vault._addBinaryFile("images/photo.png", pngData);
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.get = vi.fn().mockRejectedValue(new Error("not found"));
+      client.put = vi.fn().mockResolvedValue({ ok: true, id: "file/images/photo.png", rev: "1-p" });
+      client.putAttachment = vi.fn().mockResolvedValue({ ok: true, id: "file/images/photo.png", rev: "2-p" });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      expect(client.putAttachment).toHaveBeenCalledWith(
+        "file/images/photo.png",
+        "data",
+        expect.any(String), // rev from the put
+        pngData,
+        "image/png"
+      );
+    });
+
+    it("pushes binary file on local change event", async () => {
+      const pngData = new Uint8Array([1, 2]).buffer;
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      client.get = vi.fn().mockRejectedValue(new Error("not found"));
+      client.put = vi.fn().mockResolvedValue({ ok: true, id: "file/images/icon.png", rev: "1-p" });
+      client.putAttachment = vi.fn().mockResolvedValue({ ok: true, id: "file/images/icon.png", rev: "2-p" });
+
+      await engine.start();
+
+      const file = vault._addBinaryFile("images/icon.png", pngData);
+      engine.handleLocalChange(file as any);
+      await new Promise((r) => setTimeout(r, 120));
+
+      expect(client.putAttachment).toHaveBeenCalledWith(
+        "file/images/icon.png",
+        "data",
+        expect.any(String),
+        pngData,
+        "image/png"
+      );
     });
   });
 });
