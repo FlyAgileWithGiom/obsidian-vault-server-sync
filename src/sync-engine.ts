@@ -448,7 +448,10 @@ export class SyncEngine {
         this.pullApplied++;
       } catch (e) {
         this.pullSkipped++;
-        this.setError(`Binary pull ${docId.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+        // 404 = doc has no attachment (orphan), not a real error
+        if (!(e instanceof CouchError && e.status === 404)) {
+          this.setError(`Binary pull ${docId.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+        }
       }
       this.pullFetched++;
       this.pullCount--;
