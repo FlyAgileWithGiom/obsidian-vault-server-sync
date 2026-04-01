@@ -876,12 +876,125 @@ describe("SyncEngine", () => {
   });
 
   describe("binary file sync - pull", () => {
+    it("skips getAttachment for orphan docs without _attachments", async () => {
+      // 386 orphan docs in production have no _attachments field (metadata-only docs from old LiveSync)
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 2,
+        rows: [
+          { id: "file/images/orphan.png", key: "file/images/orphan.png", value: { rev: "1-o" } },
+          { id: "file/images/real.png", key: "file/images/real.png", value: { rev: "1-r" } },
+        ],
+      });
+      // allDocsByKeys returns: orphan has no _attachments, real one has data.bin attachment
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 2,
+        rows: [
+          {
+            id: "file/images/orphan.png",
+            key: "file/images/orphan.png",
+            value: { rev: "1-o" },
+            doc: { _id: "file/images/orphan.png", _rev: "1-o", content: null, mtime: 0 },
+            // No _attachments field
+          },
+          {
+            id: "file/images/real.png",
+            key: "file/images/real.png",
+            value: { rev: "1-r" },
+            doc: {
+              _id: "file/images/real.png", _rev: "1-r", content: null, mtime: 0,
+              _attachments: { "data.bin": { content_type: "image/png", length: 4, stub: true } },
+            },
+          },
+        ],
+      });
+      const pngData = new Uint8Array([1, 2, 3, 4]).buffer;
+      client.getAttachment = vi.fn().mockResolvedValue(pngData);
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      // getAttachment must be called only once (for real.png), not for orphan.png
+      expect(client.getAttachment).toHaveBeenCalledTimes(1);
+      expect(client.getAttachment).toHaveBeenCalledWith("file/images/real.png", "data.bin");
+      expect(client.getAttachment).not.toHaveBeenCalledWith("file/images/orphan.png", "data.bin");
+    });
+
+    it("records orphan rev in revMap without calling getAttachment", async () => {
+      // Orphan docs should have their rev recorded so they are not re-fetched on next sync
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/orphan.png", key: "file/images/orphan.png", value: { rev: "1-o" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/images/orphan.png",
+          key: "file/images/orphan.png",
+          value: { rev: "1-o" },
+          doc: { _id: "file/images/orphan.png", _rev: "1-o", content: null, mtime: 0 },
+          // No _attachments
+        }],
+      });
+      client.getAttachment = vi.fn();
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      expect(client.getAttachment).not.toHaveBeenCalled();
+      // Rev should be persisted (no errors emitted)
+      expect(errors).toHaveLength(0);
+    });
+
+    it("reports setError for real attachment fetch errors (non-404)", async () => {
+      // Non-404 errors (network error, auth failure) should still surface via setError
+      const { CouchError } = await import("./couch-client");
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/broken.png", key: "file/images/broken.png", value: { rev: "1-b" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/images/broken.png",
+          key: "file/images/broken.png",
+          value: { rev: "1-b" },
+          doc: {
+            _id: "file/images/broken.png", _rev: "1-b", content: null, mtime: 0,
+            _attachments: { "data.bin": { content_type: "image/png", length: 0, stub: true } },
+          },
+        }],
+      });
+      // Simulate a 500 server error when fetching the attachment
+      client.getAttachment = vi.fn().mockRejectedValue(new CouchError(500, "Internal Server Error"));
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors[0]).toContain("broken.png");
+    });
+
     it("pulls binary file via getAttachment and creates it in vault", async () => {
       const pngData = new Uint8Array([137, 80, 78, 71]).buffer; // PNG magic bytes
       const client = getClient(engine);
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{ id: "file/images/photo.png", key: "file/images/photo.png", value: { rev: "1-p" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/images/photo.png",
+          key: "file/images/photo.png",
+          value: { rev: "1-p" },
+          doc: {
+            _id: "file/images/photo.png", _rev: "1-p", content: null, mtime: 0,
+            _attachments: { "data.bin": { content_type: "image/png", length: 4, stub: true } },
+          },
+        }],
       });
       client.getAttachment = vi.fn().mockResolvedValue(pngData);
       client.changes.mockResolvedValue({ last_seq: "1", results: [] });
@@ -906,6 +1019,18 @@ describe("SyncEngine", () => {
       client.allDocs.mockResolvedValue({
         total_rows: 1,
         rows: [{ id: "file/images/photo.png", key: "file/images/photo.png", value: { rev: "2-new" } }],
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/images/photo.png",
+          key: "file/images/photo.png",
+          value: { rev: "2-new" },
+          doc: {
+            _id: "file/images/photo.png", _rev: "2-new", content: null, mtime: 0,
+            _attachments: { "data.bin": { content_type: "image/png", length: 3, stub: true } },
+          },
+        }],
       });
       client.getAttachment = vi.fn().mockResolvedValue(newData);
       client.changes.mockResolvedValue({ last_seq: "2", results: [] });

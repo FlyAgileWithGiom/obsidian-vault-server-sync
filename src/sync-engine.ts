@@ -438,8 +438,29 @@ export class SyncEngine {
   }
 
   private async pullBinaryDocs(docIds: string[], remoteRevs: Map<string, string>): Promise<void> {
+    // Batch-fetch doc metadata to determine which docs have attachments.
+    // Orphan docs (metadata-only, no _attachments) are skipped without any HTTP request.
+    const metaResult = await this.client.allDocsByKeys(docIds);
+    const hasAttachment = new Set<string>();
+    for (const row of metaResult.rows) {
+      if (!row.error && row.doc?._attachments?.[ATTACHMENT_NAME]) {
+        hasAttachment.add(row.id);
+      }
+    }
+
     for (let i = 0; i < docIds.length; i++) {
       const docId = docIds[i];
+      if (!hasAttachment.has(docId)) {
+        // Orphan: record rev so we don't re-fetch on next sync
+        const rev = remoteRevs.get(docId);
+        if (rev) this.revMap[docId] = rev;
+        this.pullSkipped++;
+        this.pullFetched++;
+        this.pullCount--;
+        this.emitCounts();
+        continue;
+      }
+
       try {
         const data = await this.client.getAttachment(docId, ATTACHMENT_NAME);
         await this.applyRemoteBinary(docId, data);
@@ -448,10 +469,7 @@ export class SyncEngine {
         this.pullApplied++;
       } catch (e) {
         this.pullSkipped++;
-        // 404 = doc has no attachment (orphan), not a real error
-        if (!(e instanceof CouchError && e.status === 404)) {
-          this.setError(`Binary pull ${docId.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
-        }
+        this.setError(`Binary pull ${docId.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
       }
       this.pullFetched++;
       this.pullCount--;
