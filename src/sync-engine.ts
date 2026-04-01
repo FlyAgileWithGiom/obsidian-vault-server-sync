@@ -16,6 +16,7 @@ const DOC_PREFIX = "file/";
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
 const ATTACHMENT_NAME = "data.bin";
+const PARALLEL_BINARY_PULLS = 5;
 
 const CONTENT_TYPE_MAP: Record<string, string> = {
   png: "image/png",
@@ -448,8 +449,9 @@ export class SyncEngine {
       }
     }
 
-    for (let i = 0; i < docIds.length; i++) {
-      const docId = docIds[i];
+    // Separate orphans (no attachment) from real downloads
+    const toDownload: string[] = [];
+    for (const docId of docIds) {
       if (!hasAttachment.has(docId)) {
         // Orphan: record rev so we don't re-fetch on next sync
         const rev = remoteRevs.get(docId);
@@ -458,24 +460,40 @@ export class SyncEngine {
         this.pullFetched++;
         this.pullCount--;
         this.emitCounts();
-        continue;
+      } else {
+        toDownload.push(docId);
+      }
+    }
+
+    // Download attachments in parallel batches of PARALLEL_BINARY_PULLS
+    for (let batchStart = 0; batchStart < toDownload.length; batchStart += PARALLEL_BINARY_PULLS) {
+      const batch = toDownload.slice(batchStart, batchStart + PARALLEL_BINARY_PULLS);
+      const results = await Promise.allSettled(
+        batch.map((docId) =>
+          this.client.getAttachment(docId, ATTACHMENT_NAME).then((data) => ({ docId, data }))
+        )
+      );
+
+      for (let j = 0; j < results.length; j++) {
+        const result = results[j];
+        if (result.status === "fulfilled") {
+          const { docId, data } = result.value;
+          await this.applyRemoteBinary(docId, data);
+          const rev = remoteRevs.get(docId);
+          if (rev) this.revMap[docId] = rev;
+          this.pullApplied++;
+        } else {
+          const docId = batch[j];
+          this.pullSkipped++;
+          this.setError(`Binary pull ${docId.slice(0, 40)}: ${(result.reason as Error).message?.slice(0, 80)}`);
+        }
+        this.pullFetched++;
+        this.pullCount--;
+        this.emitCounts();
       }
 
-      try {
-        const data = await this.client.getAttachment(docId, ATTACHMENT_NAME);
-        await this.applyRemoteBinary(docId, data);
-        const rev = remoteRevs.get(docId);
-        if (rev) this.revMap[docId] = rev;
-        this.pullApplied++;
-      } catch (e) {
-        this.pullSkipped++;
-        this.setError(`Binary pull ${docId.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
-      }
-      this.pullFetched++;
-      this.pullCount--;
-      this.emitCounts();
-      if (i % 5 === 4) await this.yield();
-      if (i % 50 === 49) this.persistState();
+      await this.yield();
+      if (batchStart % 50 === 0 && batchStart > 0) this.persistState();
     }
   }
 

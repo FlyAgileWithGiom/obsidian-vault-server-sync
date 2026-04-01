@@ -1068,6 +1068,114 @@ describe("SyncEngine", () => {
     });
   });
 
+  describe("binary file sync - parallel pull", () => {
+    function makeBinaryRow(id: string, rev: string) {
+      return {
+        id,
+        key: id,
+        value: { rev },
+        doc: {
+          _id: id, _rev: rev, content: null, mtime: 0,
+          _attachments: { "data.bin": { content_type: "image/png", length: 4, stub: true } },
+        },
+      };
+    }
+
+    it("downloads multiple attachments in parallel", async () => {
+      // 6 docs: with PARALLEL_BINARY_PULLS=5 the first batch of 5 should start before any resolves
+      const docIds = ["a", "b", "c", "d", "e", "f"].map(n => `file/images/${n}.png`);
+      const revs = docIds.map((_, i) => `1-${i}`);
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => makeBinaryRow(id, revs[i])),
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      // Track concurrent in-flight count
+      let maxConcurrent = 0;
+      let inFlight = 0;
+      client.getAttachment = vi.fn().mockImplementation(() => {
+        inFlight++;
+        if (inFlight > maxConcurrent) maxConcurrent = inFlight;
+        return new Promise<ArrayBuffer>((resolve) =>
+          setTimeout(() => { inFlight--; resolve(new ArrayBuffer(4)); }, 20)
+        );
+      });
+
+      await engine.start();
+
+      // With parallel downloads, at least 2 should have been in-flight simultaneously
+      expect(maxConcurrent).toBeGreaterThan(1);
+      expect(client.getAttachment).toHaveBeenCalledTimes(docIds.length);
+    });
+
+    it("handles partial failures gracefully - successful docs applied, failed skipped", async () => {
+      const { CouchError } = await import("./couch-client");
+      const docIds = ["ok1", "fail", "ok2", "ok3", "ok4"].map(n => `file/images/${n}.png`);
+      const revs = docIds.map((_, i) => `1-${i}`);
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => makeBinaryRow(id, revs[i])),
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      client.getAttachment = vi.fn().mockImplementation((docId: string) => {
+        if (docId.includes("fail")) {
+          return Promise.reject(new CouchError(500, "Server Error"));
+        }
+        return Promise.resolve(new ArrayBuffer(4));
+      });
+
+      await engine.start();
+
+      // 4 successful, 1 failed → error emitted for the failure
+      expect(errors.length).toBeGreaterThan(0);
+      expect(errors[0]).toContain("fail");
+      // The 4 successful docs should have been written to vault
+      expect(vault._getBinaryContent("images/ok1.png")).toBeTruthy();
+      expect(vault._getBinaryContent("images/ok2.png")).toBeTruthy();
+      expect(vault._getBinaryContent("images/ok3.png")).toBeTruthy();
+      expect(vault._getBinaryContent("images/ok4.png")).toBeTruthy();
+    });
+
+    it("updates revMap for all successful parallel downloads", async () => {
+      const docIds = ["img1", "img2", "img3"].map(n => `file/images/${n}.png`);
+      const revs = ["1-aaa", "1-bbb", "1-ccc"];
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => makeBinaryRow(id, revs[i])),
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      client.getAttachment = vi.fn().mockResolvedValue(new ArrayBuffer(4));
+
+      await engine.start();
+
+      // All 3 revs must be persisted in localStorage (revMap)
+      const saved = JSON.parse(localStorageMock["vault-sync-revmap"] ?? "{}");
+      expect(saved["file/images/img1.png"]).toBe("1-aaa");
+      expect(saved["file/images/img2.png"]).toBe("1-bbb");
+      expect(saved["file/images/img3.png"]).toBe("1-ccc");
+    });
+  });
+
   describe("binary file sync - push", () => {
     it("pushes new binary file via putAttachment", async () => {
       const pngData = new Uint8Array([137, 80, 78, 71]).buffer;
