@@ -631,6 +631,33 @@ describe("SyncEngine", () => {
       expect(client.delete).toHaveBeenCalledWith("file/notes/gone.md", "1-a");
     });
 
+    it("treats 404 on remote delete as success (already deleted)", async () => {
+      const { CouchError } = await import("./couch-client");
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      await engine.start();
+
+      // Push a file so revMap has it
+      const file = vault._addFile("notes/already-gone.md", "content", 1000);
+      client.get.mockRejectedValue(new Error("not found"));
+      client.put.mockResolvedValue({ ok: true, id: "file/notes/already-gone.md", rev: "1-a" });
+      engine.handleLocalChange(file as any);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Remote delete returns 404 (already deleted)
+      client.delete.mockRejectedValue(new CouchError(404, '{"error":"not_found","reason":"deleted"}'));
+
+      const errorSpy = vi.fn();
+      engine.onError = errorSpy;
+
+      await engine.handleLocalDelete(file as any);
+
+      // Should NOT show an error notification
+      expect(errorSpy).not.toHaveBeenCalled();
+    });
+
     it("handles rename as delete old + push new", async () => {
       const client = getClient(engine);
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
