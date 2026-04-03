@@ -741,7 +741,13 @@ export class SyncEngine {
         this.persistState();
       }
     } catch (e) {
-      this.setError(`Failed to delete remote ${file.path}: ${(e as Error).message}`);
+      if (e instanceof CouchError && e.status === 404) {
+        // Already deleted remotely — clean up local state
+        delete this.revMap[docId];
+        this.persistState();
+      } else {
+        this.setError(`Failed to delete remote ${file.path}: ${(e as Error).message}`);
+      }
     }
   }
 
