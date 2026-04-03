@@ -1,4 +1,4 @@
-import { TFile, TAbstractFile, Vault, normalizePath } from "obsidian";
+import { TFile, TFolder, TAbstractFile, Vault, normalizePath } from "obsidian";
 import { CouchClient, CouchError } from "./couch-client";
 import type {
   VaultSyncSettings,
@@ -663,8 +663,25 @@ export class SyncEngine {
     const file = this.vault.getAbstractFileByPath(normalized);
     if (file instanceof TFile) {
       await this.vault.delete(file);
+      await this.cleanupEmptyParents(normalized);
     }
     delete this.revMap[docId];
+  }
+
+  /** Remove empty parent directories after a file deletion */
+  private async cleanupEmptyParents(filePath: string): Promise<void> {
+    const parts = filePath.split("/");
+    // Walk up from immediate parent to root
+    for (let i = parts.length - 2; i >= 0; i--) {
+      const dirPath = normalizePath(parts.slice(0, i + 1).join("/"));
+      const dir = this.vault.getAbstractFileByPath(dirPath);
+      if (!dir || !(dir instanceof TFolder)) break;
+      if (dir.children.length === 0) {
+        await this.vault.delete(dir);
+      } else {
+        break; // Parent not empty, stop climbing
+      }
+    }
   }
 
   private async ensureParentDirs(filePath: string): Promise<void> {
