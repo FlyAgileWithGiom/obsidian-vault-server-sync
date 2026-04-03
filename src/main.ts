@@ -4,6 +4,7 @@ import { SyncEngine } from "./sync-engine";
 import { VaultSyncSettingTab } from "./settings-tab";
 import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
+import { slugify } from "./slugify";
 
 /**
  * Vault Sync - Lightweight CouchDB sync for Obsidian.
@@ -23,6 +24,13 @@ export default class VaultSyncPlugin extends Plugin {
 
   async onload(): Promise<void> {
     await this.loadSettings();
+
+    // Auto-derive database name from vault name
+    const derivedDb = `vault-${slugify(this.app.vault.getName())}`;
+    if (this.settings.couchDbName !== derivedDb) {
+      this.settings.couchDbName = derivedDb;
+      await this.saveSettings();
+    }
 
     this.syncEngine = new SyncEngine(this.settings, this.app.vault);
     this.syncEngine.onStateChange = (state) => this.updateState(state);
