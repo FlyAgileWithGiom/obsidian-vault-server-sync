@@ -65,6 +65,7 @@ export class SyncEngine {
   private pendingWrites: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private applyingRemote = false;
   private recentRemotePaths: Set<string> = new Set();
+  private pushLocks: Map<string, Promise<void>> = new Map();
   private running = false;
   private pullCount = 0;
   private pullTotal = 0;
@@ -778,11 +779,20 @@ export class SyncEngine {
   // --- Push single file ---
 
   private async pushFile(file: TFile): Promise<void> {
-    if (this.isBinaryDoc(pathToDocId(file.path))) {
-      await this.pushBinaryFile(file);
-    } else {
-      await this.pushTextFile(file);
-    }
+    const key = file.path;
+    // Serialize pushes per file to prevent concurrent 409 conflicts
+    const prev = this.pushLocks.get(key) ?? Promise.resolve();
+    const settled = prev.catch(() => {}); // ensure chain continues even if prev failed
+    const next = settled.then(async () => {
+      if (this.isBinaryDoc(pathToDocId(file.path))) {
+        await this.pushBinaryFile(file);
+      } else {
+        await this.pushTextFile(file);
+      }
+    });
+    const swallowed = next.catch(() => {}); // store settled version so chain never rejects
+    this.pushLocks.set(key, swallowed);
+    await next;
   }
 
   private async pushTextFile(file: TFile): Promise<void> {
@@ -859,48 +869,62 @@ export class SyncEngine {
    * Resolve a push conflict using last-write-wins by mtime.
    * Fetches the remote version, compares mtime, and the newest version wins.
    * No conflict files are created - resolution is fully automatic.
+   * Retries up to MAX_RETRIES times if further 409s occur during resolution.
    */
   private async resolveConflict(
     docId: string,
     localContent: string,
     localMtime: number,
   ): Promise<void> {
-    const remote = await this.client.get(docId);
-    this.revMap[docId] = remote._rev!;
+    const MAX_RETRIES = 3;
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      const remote = await this.client.get(docId);
+      this.revMap[docId] = remote._rev!;
 
-    if (remote.content === localContent) {
-      // Same content, no real conflict - just update rev
-      this.persistState();
-      return;
-    }
-
-    if (localMtime >= remote.mtime) {
-      // Local is newer (or equal mtime) - push local content over remote
-      const doc: CouchDoc = {
-        _id: docId,
-        _rev: remote._rev,
-        content: localContent,
-        mtime: localMtime,
-      };
-      const result = await this.client.put(doc);
-      if (result.ok && result.rev) {
-        this.revMap[docId] = result.rev;
+      if (remote.content === localContent) {
+        // Same content, no real conflict - just update rev
+        this.persistState();
+        return;
       }
-    } else {
-      // Remote is newer - apply remote content locally
-      const normalized = normalizePath(docIdToPath(docId));
-      const existing = this.vault.getAbstractFileByPath(normalized);
-      if (existing instanceof TFile) {
-        this.applyingRemote = true;
+
+      if (localMtime >= remote.mtime) {
+        // Local is newer (or equal mtime) - push local content over remote
+        const doc: CouchDoc = {
+          _id: docId,
+          _rev: remote._rev,
+          content: localContent,
+          mtime: localMtime,
+        };
         try {
-          await this.vault.modify(existing, remote.content);
-        } finally {
-          this.applyingRemote = false;
+          const result = await this.client.put(doc);
+          if (result.ok && result.rev) {
+            this.revMap[docId] = result.rev;
+          }
+          this.persistState();
+          return;
+        } catch (e) {
+          if (e instanceof CouchError && e.status === 409 && attempt < MAX_RETRIES - 1) {
+            // Rev changed again between fetch and put, retry
+            continue;
+          }
+          throw e;
         }
+      } else {
+        // Remote is newer - apply remote content locally
+        const normalized = normalizePath(docIdToPath(docId));
+        const existing = this.vault.getAbstractFileByPath(normalized);
+        if (existing instanceof TFile) {
+          this.applyingRemote = true;
+          try {
+            await this.vault.modify(existing, remote.content);
+          } finally {
+            this.applyingRemote = false;
+          }
+        }
+        this.persistState();
+        return;
       }
     }
-
-    this.persistState();
   }
 
   // --- Counts ---

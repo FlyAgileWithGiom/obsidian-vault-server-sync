@@ -866,6 +866,59 @@ describe("SyncEngine", () => {
       expect(conflictFiles).toHaveLength(0);
     });
 
+    it("retries when resolveConflict itself gets a 409", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "0", results: [] });
+
+      await engine.start();
+
+      const file = vault._addFile("notes/double-conflict.md", "latest local", 5000);
+      const { CouchError } = await import("./couch-client");
+
+      // Initial push → 409
+      // Resolve attempt 1: get remote, put → 409 again (rev changed between fetch and put)
+      // Resolve attempt 2: get remote (fresh rev), put → success
+      client.put
+        .mockRejectedValueOnce(new CouchError(409, "conflict"))
+        .mockRejectedValueOnce(new CouchError(409, "conflict"))
+        .mockResolvedValueOnce({ ok: true, id: "file/notes/double-conflict.md", rev: "4-final" });
+
+      // get is called 3 times: once in pushTextFile (to fetch rev), twice in resolveConflict retries
+      client.get
+        .mockResolvedValueOnce({
+          _id: "file/notes/double-conflict.md",
+          _rev: "2-stale",
+          content: "remote v1",
+          mtime: 3000,
+        })
+        .mockResolvedValueOnce({
+          _id: "file/notes/double-conflict.md",
+          _rev: "2-stale",
+          content: "remote v1",
+          mtime: 3000,
+        })
+        .mockResolvedValueOnce({
+          _id: "file/notes/double-conflict.md",
+          _rev: "3-intermediate",
+          content: "remote v2",
+          mtime: 4000,
+        });
+
+      engine.handleLocalChange(file as any);
+      await new Promise((r) => setTimeout(r, 100));
+
+      // Should have succeeded on third put with the fresh rev
+      expect(client.put).toHaveBeenCalledTimes(3);
+      expect(client.put).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          _rev: "3-intermediate",
+          content: "latest local",
+          mtime: 5000,
+        })
+      );
+    });
+
     it("skips re-push when content is identical", async () => {
       const client = getClient(engine);
       client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
