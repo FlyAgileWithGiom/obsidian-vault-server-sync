@@ -21,6 +21,7 @@ export default class VaultSyncPlugin extends Plugin {
   private syncState: SyncState = "idle";
   private syncCounts: SyncCounts = { pendingPush: 0, pendingPull: 0 };
   private diagnosticsListeners: Set<() => void> = new Set();
+  private startupTimer: ReturnType<typeof setTimeout> | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -100,11 +101,18 @@ export default class VaultSyncPlugin extends Plugin {
     if (this.settings.couchDbUrl && this.settings.couchDbName) {
       // Delay start slightly to let Obsidian finish loading on mobile
       const STARTUP_DELAY_MS = 2000;
-      setTimeout(() => this.startSync(), STARTUP_DELAY_MS);
+      this.startupTimer = setTimeout(() => {
+        this.startupTimer = null;
+        this.startSync();
+      }, STARTUP_DELAY_MS);
     }
   }
 
   onunload(): void {
+    if (this.startupTimer) {
+      clearTimeout(this.startupTimer);
+      this.startupTimer = null;
+    }
     this.stopSync();
   }
 
