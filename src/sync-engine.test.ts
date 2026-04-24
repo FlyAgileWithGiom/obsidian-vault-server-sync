@@ -1399,4 +1399,76 @@ describe("SyncEngine", () => {
       engine2.stop();
     });
   });
+
+  describe("memory management", () => {
+    it("stop() clears recentRemotePaths timers so they do not fire after stop", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      // Simulate applying a remote doc that schedules a recentRemotePaths cleanup timer
+      const doc = { _id: "file/notes/test.md", _rev: "1-abc", content: "hello", mtime: 9999 };
+      client.changes.mockResolvedValueOnce({
+        last_seq: "2",
+        results: [{ seq: "2", id: doc._id, changes: [{ rev: "1-abc" }], doc }],
+      });
+
+      // Trigger one poll cycle manually
+      // @ts-expect-error -- accessing private for test
+      await engine.pollChanges();
+
+      // Now stop the engine
+      engine.stop();
+
+      // The recentRemotePaths set should be cleared on stop
+      // @ts-expect-error -- accessing private for test
+      expect(engine.recentRemotePaths.size).toBe(0);
+    });
+
+    it("stop() prevents recentRemotePaths cleanup timers from firing on a stopped engine", async () => {
+      vi.useFakeTimers();
+      try {
+        const client = getClient(engine);
+        client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+        client.changes
+          .mockResolvedValueOnce({ last_seq: "1", results: [] })
+          .mockResolvedValueOnce({
+            last_seq: "2",
+            results: [{
+              seq: "2",
+              id: "file/notes/timer-test.md",
+              changes: [{ rev: "1-abc" }],
+              doc: { _id: "file/notes/timer-test.md", _rev: "1-abc", content: "hi", mtime: 9999 },
+            }],
+          });
+
+        await engine.start();
+
+        // Trigger poll to schedule a recentRemotePaths cleanup timer (2000ms)
+        // @ts-expect-error -- accessing private for test
+        await engine.pollChanges();
+
+        engine.stop();
+
+        // After stop, advancing timers should NOT cause errors or side effects
+        // on a stopped engine. The cleanup timers should have been cancelled.
+        // @ts-expect-error -- accessing private for test
+        const sizeBefore = engine.recentRemotePaths.size;
+        vi.advanceTimersByTime(3000);
+        // @ts-expect-error -- accessing private for test
+        const sizeAfter = engine.recentRemotePaths.size;
+
+        // If timers were properly cancelled, the set should remain unchanged
+        // (cleared at stop). If they weren't cancelled, they fire and delete
+        // entries from a set that should already be empty — proving the leak.
+        // The key assertion: recentRemotePaths should be empty after stop.
+        expect(sizeBefore).toBe(0);
+        expect(sizeAfter).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });

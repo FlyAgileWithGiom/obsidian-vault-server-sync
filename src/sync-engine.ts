@@ -66,6 +66,7 @@ export class SyncEngine {
   private applyingRemote = false;
   private recentRemotePaths: Set<string> = new Set();
   private pushLocks: Map<string, Promise<void>> = new Map();
+  private recentRemoteTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private running = false;
   private pullCount = 0;
   private pullTotal = 0;
@@ -190,6 +191,11 @@ export class SyncEngine {
       clearTimeout(timer);
     }
     this.pendingWrites.clear();
+    for (const timer of this.recentRemoteTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.recentRemoteTimers.clear();
+    this.recentRemotePaths.clear();
     this.setState("idle");
   }
 
@@ -504,8 +510,7 @@ export class SyncEngine {
 
     const normalized = normalizePath(path);
 
-    this.recentRemotePaths.add(normalized);
-    setTimeout(() => this.recentRemotePaths.delete(normalized), 2000);
+    this.trackRecentRemotePath(normalized);
 
     const existing = this.vault.getAbstractFileByPath(normalized);
     if (existing instanceof TFile) {
@@ -621,8 +626,7 @@ export class SyncEngine {
     const existing = this.vault.getAbstractFileByPath(normalized);
 
     // Track path to suppress echo events from async vault notifications
-    this.recentRemotePaths.add(normalized);
-    setTimeout(() => this.recentRemotePaths.delete(normalized), 2000);
+    this.trackRecentRemotePath(normalized);
 
     if (existing instanceof TFile) {
       // Compare mtime: overwrite if remote is newer.
@@ -925,6 +929,19 @@ export class SyncEngine {
         return;
       }
     }
+  }
+
+  // --- Recent remote path tracking (echo suppression with cleanup) ---
+
+  private trackRecentRemotePath(path: string): void {
+    this.recentRemotePaths.add(path);
+    const existing = this.recentRemoteTimers.get(path);
+    if (existing) clearTimeout(existing);
+    const timer = setTimeout(() => {
+      this.recentRemotePaths.delete(path);
+      this.recentRemoteTimers.delete(path);
+    }, 2000);
+    this.recentRemoteTimers.set(path, timer);
   }
 
   // --- Counts ---
