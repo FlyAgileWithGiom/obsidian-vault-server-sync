@@ -11,6 +11,7 @@ export class ObsidianTransport implements HttpTransport {
     method?: string;
     headers?: Record<string, string>;
     body?: string | ArrayBuffer;
+    timeoutMs?: number;
   }): Promise<HttpResponse> {
     const resp = await requestUrl({
       url: options.url,
@@ -18,6 +19,7 @@ export class ObsidianTransport implements HttpTransport {
       headers: options.headers,
       body: options.body as string | undefined,
       throw: false,
+      ...(options.timeoutMs !== undefined && { timeout: options.timeoutMs }),
     });
 
     return {
