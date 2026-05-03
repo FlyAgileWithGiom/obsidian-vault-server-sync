@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.flyagile.vault-sync-daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/guillaume/.nvm/versions/node/v22.19.0/bin/node</string>
+        <string>/Users/guillaume/dev/tools/mcp/servers/obsidian-vault-sync/dist/headless.js</string>
+        <string>/Users/guillaume/ObsidianNotes</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>10240</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guillaume/.local/log/vault-sync-daemon.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/guillaume/.local/log/vault-sync-daemon.log</string>
+</dict>
+</plist>
