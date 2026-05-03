@@ -1416,8 +1416,9 @@ describe("SyncEngine", () => {
 
     it("retries putAttachment with fresh rev when 409 conflict occurs", async () => {
       // Pre-populate revMap so engine skips stub-creation and goes straight to putAttachment
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/images/conflict.jpeg": "1-stale" });
-      const conflictEngine = new SyncEngine(settings, vault as any);
+      const conflictStore = new TestStateStore();
+      conflictStore.set("vault-sync-revmap", JSON.stringify({ "file/images/conflict.jpeg": "1-stale" }));
+      const conflictEngine = makeEngine(settings, vaultAdapter, conflictStore);
       conflictEngine.onStateChange = () => {};
       conflictEngine.onError = (msg) => errors.push(msg);
       const conflictClient = getClient(conflictEngine);
@@ -1441,8 +1442,9 @@ describe("SyncEngine", () => {
 
       await conflictEngine.start();
 
-      const file = vault._addBinaryFile("images/conflict.jpeg", jpegData);
-      conflictEngine.handleLocalChange(file as any);
+      vault._addBinaryFile("images/conflict.jpeg", jpegData);
+      const file: VaultFile = { kind: "file", path: "images/conflict.jpeg", mtime: Date.now(), size: jpegData.byteLength };
+      conflictEngine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 120));
 
       // putAttachment should have been called twice (once with stale rev, once with fresh rev)
@@ -1463,8 +1465,9 @@ describe("SyncEngine", () => {
     });
 
     it("surfaces error via setError when all binary 409 retries are exhausted", async () => {
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/images/persistent.jpeg": "1-stale" });
-      const retryEngine = new SyncEngine(settings, vault as any);
+      const retryStore = new TestStateStore();
+      retryStore.set("vault-sync-revmap", JSON.stringify({ "file/images/persistent.jpeg": "1-stale" }));
+      const retryEngine = makeEngine(settings, vaultAdapter, retryStore);
       retryEngine.onStateChange = () => {};
       const retryErrors: string[] = [];
       retryEngine.onError = (msg) => retryErrors.push(msg);
@@ -1488,8 +1491,9 @@ describe("SyncEngine", () => {
 
       await retryEngine.start();
 
-      const file = vault._addBinaryFile("images/persistent.jpeg", jpegData);
-      retryEngine.handleLocalChange(file as any);
+      vault._addBinaryFile("images/persistent.jpeg", jpegData);
+      const file: VaultFile = { kind: "file", path: "images/persistent.jpeg", mtime: Date.now(), size: jpegData.byteLength };
+      retryEngine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 120));
 
       // After MAX_RETRIES exhausted, error must be surfaced

@@ -148,7 +148,7 @@ export default class VaultSyncPlugin extends Plugin {
 
   async saveSettings(): Promise<void> {
     await this.saveData(this.settings);
-    this.syncEngine.updateSettings(this.settings);
+    this.syncEngine?.updateSettings(this.settings);
   }
 
   // --- Sync control ---
