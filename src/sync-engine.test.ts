@@ -1140,8 +1140,8 @@ describe("SyncEngine", () => {
 
       // getAttachment must be called only once (for real.png), not for orphan.png
       expect(client.getAttachment).toHaveBeenCalledTimes(1);
-      expect(client.getAttachment).toHaveBeenCalledWith("file/images/real.png", "data.bin");
-      expect(client.getAttachment).not.toHaveBeenCalledWith("file/images/orphan.png", "data.bin");
+      expect(client.getAttachment).toHaveBeenCalledWith("file/images/real.png", "data.bin", expect.any(Number));
+      expect(client.getAttachment).not.toHaveBeenCalledWith("file/images/orphan.png", "data.bin", expect.any(Number));
     });
 
     it("records orphan rev in revMap without calling getAttachment", async () => {
@@ -1225,7 +1225,7 @@ describe("SyncEngine", () => {
 
       await engine.start();
 
-      expect(client.getAttachment).toHaveBeenCalledWith("file/images/photo.png", "data.bin");
+      expect(client.getAttachment).toHaveBeenCalledWith("file/images/photo.png", "data.bin", expect.any(Number));
       expect(vault._getBinaryContent("images/photo.png")).toBe(pngData);
     });
 
@@ -1286,7 +1286,7 @@ describe("SyncEngine", () => {
       await engine.start();
       await new Promise((r) => setTimeout(r, 3500));
 
-      expect(client.getAttachment).toHaveBeenCalledWith("file/images/new.png", "data.bin");
+      expect(client.getAttachment).toHaveBeenCalledWith("file/images/new.png", "data.bin", expect.any(Number));
       expect(vault._getBinaryContent("images/new.png")).toBe(pngData);
     });
   });

@@ -168,11 +168,11 @@ export class CouchClient {
     return this.request<CouchChangesResult>(`/_changes?${params.toString()}`);
   }
 
-  async getAttachment(docId: string, attName: string): Promise<ArrayBuffer> {
+  async getAttachment(docId: string, attName: string, timeoutMs = 120_000): Promise<ArrayBuffer> {
     const url = `${this.baseUrl}/${encodeURIComponent(docId)}/${encodeURIComponent(attName)}`;
     const headers: Record<string, string> = {};
     if (this.authHeader) headers["Authorization"] = this.authHeader;
-    const resp = await this.transport.request({ url, method: "GET", headers });
+    const resp = await this.transport.request({ url, method: "GET", headers, timeoutMs });
     if (resp.status >= 400) {
       const text = await resp.text();
       throw new CouchError(resp.status, `CouchDB ${resp.status}: ${text}`);

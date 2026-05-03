@@ -126,6 +126,7 @@ export interface HttpTransport {
     method?: string;
     headers?: Record<string, string>;
     body?: string | ArrayBuffer;
+    timeoutMs?: number;
   }): Promise<HttpResponse>;
 }
 

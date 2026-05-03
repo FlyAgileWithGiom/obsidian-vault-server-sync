@@ -13,6 +13,7 @@ export class FetchTransport implements HttpTransport {
     const init: RequestInit = {
       method: options.method || "GET",
       headers: options.headers,
+      signal: AbortSignal.timeout(options.timeoutMs ?? 30000),
     };
 
     if (options.body !== undefined) {

@@ -21,6 +21,8 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TOD
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
 const ATTACHMENT_NAME = "data.bin";
 const PARALLEL_BINARY_PULLS = 5;
+const BINARY_PULL_RETRIES = 3;
+const BINARY_PULL_TIMEOUT_MS = 120_000;
 
 const CONTENT_TYPE_MAP: Record<string, string> = {
   png: "image/png",
@@ -497,9 +499,22 @@ export class SyncEngine {
     for (let batchStart = 0; batchStart < toDownload.length; batchStart += PARALLEL_BINARY_PULLS) {
       const batch = toDownload.slice(batchStart, batchStart + PARALLEL_BINARY_PULLS);
       const results = await Promise.allSettled(
-        batch.map((docId) =>
-          this.client.getAttachment(docId, ATTACHMENT_NAME).then((data) => ({ docId, data }))
-        )
+        batch.map(async (docId) => {
+          let lastErr: Error | undefined;
+          for (let attempt = 0; attempt < BINARY_PULL_RETRIES; attempt++) {
+            try {
+              const data = await this.client.getAttachment(docId, ATTACHMENT_NAME, BINARY_PULL_TIMEOUT_MS);
+              return { docId, data };
+            } catch (e) {
+              lastErr = e as Error;
+              // Only retry on timeout/network errors, not on 4xx
+              const isRetryable = !(e instanceof CouchError) || e.status >= 500;
+              if (!isRetryable || attempt === BINARY_PULL_RETRIES - 1) break;
+              await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+            }
+          }
+          throw lastErr;
+        })
       );
 
       for (let j = 0; j < results.length; j++) {
@@ -612,7 +627,7 @@ export class SyncEngine {
           await this.handleRemoteDelete(change.id);
         } else if (change.doc) {
           if (this.isBinaryDoc(change.id)) {
-            const data = await this.client.getAttachment(change.id, ATTACHMENT_NAME);
+            const data = await this.client.getAttachment(change.id, ATTACHMENT_NAME, BINARY_PULL_TIMEOUT_MS);
             await this.applyRemoteBinary(change.id, data);
           } else {
             await this.applyRemoteDoc(change.doc);
