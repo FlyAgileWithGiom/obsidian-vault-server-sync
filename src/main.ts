@@ -6,7 +6,7 @@ import { ObsidianStateStore } from "./ObsidianStateStore";
 import { ObsidianTransport } from "./ObsidianTransport";
 import { VaultSyncSettingTab } from "./settings-tab";
 import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics } from "./types";
-import { DEFAULT_SETTINGS } from "./types";
+import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
 import { slugify } from "./slugify";
 
 /**
@@ -125,29 +125,55 @@ export default class VaultSyncPlugin extends Plugin {
   // --- Settings persistence ---
 
   async loadSettings(): Promise<void> {
-    const data = (await this.loadData()) || {};
+    // Primary: read from .vault-sync.json at vault root
+    try {
+      const raw = await this.app.vault.adapter.read(VAULT_SYNC_CONFIG_FILE);
+      try {
+        const parsed = JSON.parse(raw);
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, parsed);
+        return;
+      } catch {
+        console.warn("[vault-sync] Failed to parse .vault-sync.json, falling back to data.json");
+      }
+    } catch {
+      // File does not exist — fall through to data.json migration path
+    }
+
+    // Fallback: load from Obsidian's data.json
+    const data = ((await this.loadData()) as Record<string, unknown> | null) || {};
+
     // Migrate from v0.1.x settings field names
     if (data.couchdbUrl && !data.couchDbUrl) {
       data.couchDbUrl = data.couchdbUrl;
       data.couchDbName = data.database;
       data.couchDbUser = data.username;
       data.couchDbPassword = data.password;
-      data.syncDebounceMs = data.debounceMs ?? DEFAULT_SETTINGS.syncDebounceMs;
+      data.syncDebounceMs = (data.debounceMs as number | undefined) ?? DEFAULT_SETTINGS.syncDebounceMs;
       delete data.couchdbUrl;
       delete data.database;
       delete data.username;
       delete data.password;
       delete data.debounceMs;
       delete data.maxBinarySize;
-      this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
-      await this.saveData(this.settings);
-      return;
     }
+
     this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+
+    // Migrate data.json to .vault-sync.json when a real URL is present
+    if (this.settings.couchDbUrl && this.settings.couchDbUrl !== DEFAULT_SETTINGS.couchDbUrl) {
+      await this.app.vault.adapter.write(
+        VAULT_SYNC_CONFIG_FILE,
+        JSON.stringify(this.settings, null, 2)
+      );
+      await this.saveData({});
+    }
   }
 
   async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    await this.app.vault.adapter.write(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify(this.settings, null, 2)
+    );
     this.syncEngine?.updateSettings(this.settings);
   }
 

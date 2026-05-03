@@ -41,10 +41,38 @@ export function normalizePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+/g, "/");
 }
 
+/** In-memory adapter for testing vault.adapter.read/write */
+export class MockVaultAdapter {
+  private store: Map<string, string> = new Map();
+
+  async read(path: string): Promise<string> {
+    const val = this.store.get(path);
+    if (val === undefined) throw new Error(`ENOENT: no such file: ${path}`);
+    return val;
+  }
+
+  async write(path: string, data: string): Promise<void> {
+    this.store.set(path, data);
+  }
+
+  _getStored(path: string): string | undefined {
+    return this.store.get(path);
+  }
+
+  _setStored(path: string, data: string): void {
+    this.store.set(path, data);
+  }
+
+  _has(path: string): boolean {
+    return this.store.has(path);
+  }
+}
+
 export class Vault {
   private files: Map<string, { file: TFile; content: string }> = new Map();
   private binaryFiles: Map<string, { file: TFile; content: ArrayBuffer }> = new Map();
   private folders: Map<string, TFolder> = new Map();
+  adapter = new MockVaultAdapter();
 
   getFiles(): TFile[] {
     return [
@@ -162,6 +190,7 @@ export class Plugin {
   async loadData(): Promise<unknown> { return {}; }
   async saveData(_data: unknown): Promise<void> {}
   addRibbonIcon(): HTMLElement { return document.createElement("div"); }
+  addStatusBarItem(): HTMLElement { return document.createElement("div"); }
   addCommand(): void {}
   addSettingTab(): void {}
   registerEvent(): void {}

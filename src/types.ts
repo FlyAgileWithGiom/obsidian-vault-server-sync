@@ -7,13 +7,16 @@ export interface VaultSyncSettings {
   excludePatterns: string[];
 }
 
+/** Filename for plugin-managed settings at vault root */
+export const VAULT_SYNC_CONFIG_FILE = ".vault-sync.json";
+
 export const DEFAULT_SETTINGS: VaultSyncSettings = {
   couchDbUrl: "https://sync.fly-agile.com",
   couchDbName: "",
   couchDbUser: "",
   couchDbPassword: "",
   syncDebounceMs: 500,
-  excludePatterns: [".trash/", ".vault-sync-state.json"],
+  excludePatterns: [".trash/", ".vault-sync-state.json", VAULT_SYNC_CONFIG_FILE],
 };
 
 export type SyncState = "idle" | "syncing" | "ok" | "error" | "offline" | "not-configured";
