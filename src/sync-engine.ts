@@ -58,6 +58,15 @@ function docIdToPath(docId: string): string {
 }
 
 /**
+ * Returns true when a CouchDB 404 error represents a tombstone ("deleted") rather
+ * than a doc that never existed ("missing"). The distinction matters for push paths:
+ * a tombstone means the server intentionally removed the doc and we must not resurrect it.
+ */
+function isTombstone404(e: unknown): boolean {
+  return e instanceof CouchError && e.status === 404 && e.message.includes('"reason":"deleted"');
+}
+
+/**
  * Bidirectional sync engine between a vault and CouchDB.
  *
  * Design decisions for mobile-first:
@@ -929,8 +938,13 @@ export class SyncEngine {
         try {
           const remote = await this.client.get(docId);
           rev = remote._rev ?? "";
-        } catch {
-          // Create stub doc
+        } catch (e) {
+          if (isTombstone404(e)) {
+            // Server has a tombstone — do not resurrect; delete locally and bail out
+            await this.handleRemoteDelete(docId);
+            return;
+          }
+          // Doc not found (missing, not deleted) — create stub doc
           const stubResult = await this.client.put({ _id: docId, content: null, mtime: file.mtime });
           rev = stubResult.rev ?? "";
           if (stubResult.rev) this.revMap[docId] = stubResult.rev;
@@ -948,7 +962,11 @@ export class SyncEngine {
           }
           break;
         } catch (e) {
-          if (e instanceof CouchError && e.status === 409 && attempt < MAX_RETRIES - 1) {
+          if (isTombstone404(e)) {
+            // Server cleaned up this doc — delete locally and bail out without retrying
+            await this.handleRemoteDelete(docId);
+            return;
+          } else if (e instanceof CouchError && e.status === 409 && attempt < MAX_RETRIES - 1) {
             // Rev became stale between stub PUT and attachment PUT — refetch and retry
             const fresh = await this.client.get(docId);
             attachmentRev = fresh._rev ?? "";

@@ -1606,6 +1606,83 @@ describe("SyncEngine", () => {
 
       retryEngine.stop();
     });
+
+    it("calls handleRemoteDelete and surfaces no error when putAttachment gets 404 deleted (tombstone)", async () => {
+      // Scenario: iOS client has images/ghost.png locally; server-side cleanup left a tombstone.
+      // putAttachment hits the tombstone and returns 404 {"error":"not_found","reason":"deleted"}.
+      // Expected: local file deleted, revMap entry removed, no error in UI, no retry.
+      const tombStore = new TestStateStore();
+      tombStore.set("vault-sync-revmap", JSON.stringify({ "file/images/ghost.png": "2-tomb" }));
+      const tombEngine = makeEngine(settings, vaultAdapter, tombStore);
+      tombEngine.onStateChange = () => {};
+      const tombErrors: string[] = [];
+      tombEngine.onError = (msg) => tombErrors.push(msg);
+      const tombClient = getClient(tombEngine);
+
+      const { CouchError } = await import("./couch-client");
+      const tombstone404 = new CouchError(404, 'CouchDB 404: {"error":"not_found","reason":"deleted"}');
+      const pngData = new Uint8Array([137, 80, 78, 71]).buffer;
+      vault._addBinaryFile("images/ghost.png", pngData);
+
+      tombClient.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      tombClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      // putAttachment always returns tombstone — covers both the initial fullSync push
+      // and any subsequent handleLocalChange retry after revMap is cleared
+      tombClient.putAttachment = vi.fn().mockRejectedValue(tombstone404);
+      // client.get also returns tombstone — used when revMap entry was cleared by handleRemoteDelete
+      tombClient.get = vi.fn().mockRejectedValue(tombstone404);
+
+      await tombEngine.start();
+
+      const file: VaultFile = { kind: "file", path: "images/ghost.png", mtime: Date.now(), size: pngData.byteLength };
+      tombEngine.handleLocalChange(file);
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Local file should be removed (tombstone wins)
+      expect(vault.getAbstractFileByPath("images/ghost.png")).toBeNull();
+      // No error surfaced to the user
+      expect(tombErrors).toHaveLength(0);
+
+      tombEngine.stop();
+    });
+
+    it("calls handleRemoteDelete and surfaces no error when client.get returns 404 deleted during stub-fetch", async () => {
+      // Scenario: no revMap entry, so pushBinaryFile tries client.get to fetch existing rev.
+      // client.get returns 404 {"error":"not_found","reason":"deleted"} — tombstone.
+      // Expected: stub PUT never called, local file deleted, no error.
+      const stubEngine = makeEngine(settings, vaultAdapter, stateStore);
+      stubEngine.onStateChange = () => {};
+      const stubErrors: string[] = [];
+      stubEngine.onError = (msg) => stubErrors.push(msg);
+      const stubClient = getClient(stubEngine);
+
+      const { CouchError } = await import("./couch-client");
+      const pngData = new Uint8Array([137, 80, 78, 71]).buffer;
+      vault._addBinaryFile("images/erased.png", pngData);
+
+      stubClient.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      stubClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      // get() returns a tombstone 404
+      stubClient.get = vi.fn().mockRejectedValue(
+        new CouchError(404, 'CouchDB 404: {"error":"not_found","reason":"deleted"}'),
+      );
+      stubClient.put = vi.fn(); // should never be called
+
+      await stubEngine.start();
+
+      const file: VaultFile = { kind: "file", path: "images/erased.png", mtime: Date.now(), size: pngData.byteLength };
+      stubEngine.handleLocalChange(file);
+      await new Promise((r) => setTimeout(r, 120));
+
+      // Local file should be removed (tombstone wins)
+      expect(vault.getAbstractFileByPath("images/erased.png")).toBeNull();
+      // Stub PUT was never attempted
+      expect(stubClient.put).not.toHaveBeenCalled();
+      // No error surfaced
+      expect(stubErrors).toHaveLength(0);
+
+      stubEngine.stop();
+    });
   });
 
   describe("handleRemoteDelete - empty parent folder cleanup", () => {
