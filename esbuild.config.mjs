@@ -1,5 +1,5 @@
 import esbuild from "esbuild";
-import { copyFileSync, existsSync } from "fs";
+import { copyFileSync, chmodSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -15,7 +15,8 @@ function deploy() {
   }
 }
 
-const context = await esbuild.context({
+// --- Obsidian plugin build ---
+const pluginContext = await esbuild.context({
   entryPoints: ["src/main.ts"],
   bundle: true,
   external: ["obsidian", "electron", "@codemirror/*", "@lezer/*"],
@@ -34,9 +35,41 @@ const context = await esbuild.context({
   }],
 });
 
+// --- Headless daemon build ---
+const headlessContext = await esbuild.context({
+  entryPoints: ["headless/main.ts"],
+  bundle: true,
+  platform: "node",
+  target: "node18",
+  format: "cjs",
+  outfile: "dist/headless.js",
+  external: ["chokidar"],
+  sourcemap: prod ? false : "inline",
+  treeShaking: true,
+  minify: prod,
+  logLevel: "info",
+  banner: {
+    js: "#!/usr/bin/env node",
+  },
+  plugins: [{
+    name: "chmod-headless",
+    setup(build) {
+      build.onEnd(() => {
+        try {
+          chmodSync("dist/headless.js", 0o755);
+        } catch {
+          // dist may not exist yet in watch mode
+        }
+      });
+    },
+  }],
+});
+
 if (prod) {
-  await context.rebuild();
+  await pluginContext.rebuild();
+  await headlessContext.rebuild();
   process.exit(0);
 } else {
-  await context.watch();
+  await pluginContext.watch();
+  await headlessContext.watch();
 }
