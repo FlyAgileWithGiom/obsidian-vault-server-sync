@@ -6,10 +6,10 @@ import { FilesystemVaultAdapter } from "./VaultAdapter";
 import { JsonStateStore } from "./StateStore";
 import { FetchTransport } from "./FetchTransport";
 import type { VaultSyncSettings, VaultFile, VaultEntry } from "../src/types";
-import { DEFAULT_SETTINGS } from "../src/types";
+import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "../src/types";
 
 const STATE_FILENAME = ".vault-sync-state.json";
-const CONFIG_FILENAME = ".vault-sync-config.json";
+const CONFIG_FILENAME = VAULT_SYNC_CONFIG_FILE;
 
 function loadConfig(vaultRoot: string): VaultSyncSettings {
   const configPath = path.join(vaultRoot, CONFIG_FILENAME);
