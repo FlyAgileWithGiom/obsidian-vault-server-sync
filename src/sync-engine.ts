@@ -1,4 +1,3 @@
-import { TFile, TFolder, TAbstractFile, Vault, normalizePath } from "obsidian";
 import { CouchClient, CouchError } from "./couch-client";
 import type {
   VaultSyncSettings,
@@ -8,6 +7,11 @@ import type {
   SyncState,
   SyncCounts,
   SyncDiagnostics,
+  VaultAdapter,
+  VaultFile,
+  VaultEntry,
+  HttpTransport,
+  StateStore,
 } from "./types";
 
 const REVMAP_KEY = "vault-sync-revmap";
@@ -48,17 +52,16 @@ function docIdToPath(docId: string): string {
 }
 
 /**
- * Bidirectional sync engine between Obsidian vault and CouchDB.
+ * Bidirectional sync engine between a vault and CouchDB.
  *
  * Design decisions for mobile-first:
  * - Long-poll changes feed instead of continuous replication (battery friendly)
  * - Debounced local writes to batch rapid edits
- * - Stores rev map in localStorage to survive plugin reloads without re-fetching
- * - All network calls go through CouchClient (fetch-based, no PouchDB)
+ * - Stores rev map in StateStore to survive plugin reloads without re-fetching
+ * - All network calls go through CouchClient (transport-injected, no PouchDB)
  */
 export class SyncEngine {
   private client: CouchClient;
-  private vault: Vault;
   private revMap: RevMap = {};
   private lastSeq: string | number = 0;
   private changesPollTimer: ReturnType<typeof setTimeout> | null = null;
@@ -85,11 +88,16 @@ export class SyncEngine {
 
   constructor(
     private settings: VaultSyncSettings,
-    vault: Vault,
+    private vault: VaultAdapter,
+    private store: StateStore,
+    transport: HttpTransport,
   ) {
-    this.client = new CouchClient(settings);
-    this.vault = vault;
+    this.client = new CouchClient(settings, transport);
     this.loadPersistedState();
+  }
+
+  private normalizePath(path: string): string {
+    return this.vault.normalizePath(path);
   }
 
   updateSettings(settings: VaultSyncSettings): void {
@@ -133,9 +141,9 @@ export class SyncEngine {
 
   private loadPersistedState(): void {
     try {
-      const stored = localStorage.getItem(REVMAP_KEY);
+      const stored = this.store.get(REVMAP_KEY);
       if (stored) this.revMap = JSON.parse(stored);
-      const seq = localStorage.getItem(SEQ_KEY);
+      const seq = this.store.get(SEQ_KEY);
       if (seq) this.lastSeq = JSON.parse(seq);
     } catch {
       // Corrupted state, start fresh
@@ -146,10 +154,10 @@ export class SyncEngine {
 
   private persistState(): void {
     try {
-      localStorage.setItem(REVMAP_KEY, JSON.stringify(this.revMap));
-      localStorage.setItem(SEQ_KEY, JSON.stringify(this.lastSeq));
+      this.store.set(REVMAP_KEY, JSON.stringify(this.revMap));
+      this.store.set(SEQ_KEY, JSON.stringify(this.lastSeq));
     } catch {
-      // localStorage full or unavailable, non-critical
+      // Store full or unavailable, non-critical
     }
   }
 
@@ -219,7 +227,7 @@ export class SyncEngine {
       // Fetch remote rev index (no content) -- lightweight, ~15K rows with just id+rev
       const remoteIndex = await this.client.allDocs({
         startkey: DOC_PREFIX,
-        endkey: `${DOC_PREFIX}\uffff`,
+        endkey: `${DOC_PREFIX}￿`,
       });
       const remoteRevs = new Map<string, string>();
       for (const row of remoteIndex.rows) {
@@ -241,7 +249,7 @@ export class SyncEngine {
    * Uses rev index (no content) to determine what needs pushing.
    */
   private async pushAllLocal(remoteRevs: Map<string, string>): Promise<void> {
-    const files = this.vault.getFiles().filter((f) => !this.isExcluded(f.path) && f.stat.size <= MAX_FILE_SIZE);
+    const files = this.vault.getFiles().filter((f) => !this.isExcluded(f.path) && f.size <= MAX_FILE_SIZE);
 
     const batch: CouchDoc[] = [];
 
@@ -264,8 +272,8 @@ export class SyncEngine {
           await this.pushBinaryFile(file);
           await this.yield();
         } else {
-          const content = await this.vault.cachedRead(file);
-          batch.push({ _id: docId, content, mtime: file.stat.mtime });
+          const content = await this.vault.readText(file);
+          batch.push({ _id: docId, content, mtime: file.mtime });
 
           // Flush in small chunks to avoid nginx 413
           if (batch.length >= 10) {
@@ -508,12 +516,12 @@ export class SyncEngine {
     const path = docIdToPath(docId);
     if (this.isExcluded(path)) return;
 
-    const normalized = normalizePath(path);
+    const normalized = this.normalizePath(path);
 
     this.trackRecentRemotePath(normalized);
 
-    const existing = this.vault.getAbstractFileByPath(normalized);
-    if (existing instanceof TFile) {
+    const existing = this.vault.getEntryByPath(normalized);
+    if (existing && existing.kind === "file") {
       await this.vault.modifyBinary(existing, data);
     } else if (!existing) {
       try {
@@ -521,8 +529,8 @@ export class SyncEngine {
         await this.vault.createBinary(normalized, data);
       } catch (e) {
         if ((e as Error).message?.includes("already exists")) {
-          const file = this.vault.getAbstractFileByPath(normalized);
-          if (file instanceof TFile) {
+          const file = this.vault.getEntryByPath(normalized);
+          if (file && file.kind === "file") {
             await this.vault.modifyBinary(file, data);
           }
         } else {
@@ -622,37 +630,37 @@ export class SyncEngine {
     // Skip docs with null/undefined content (corrupted or binary)
     if (typeof doc.content !== "string") return;
 
-    const normalized = normalizePath(path);
-    const existing = this.vault.getAbstractFileByPath(normalized);
+    const normalized = this.normalizePath(path);
+    const existing = this.vault.getEntryByPath(normalized);
 
     // Track path to suppress echo events from async vault notifications
     this.trackRecentRemotePath(normalized);
 
-    if (existing instanceof TFile) {
+    if (existing && existing.kind === "file") {
       // Compare mtime: overwrite if remote is newer.
       // When mtime is missing/0 (external tool update), fall back to content comparison.
       const remoteMtime = doc.mtime || 0;
-      const localMtime = existing.stat.mtime || 0;
+      const localMtime = existing.mtime || 0;
       if (remoteMtime > localMtime) {
-        await this.vault.modify(existing, doc.content);
+        await this.vault.modifyText(existing, doc.content);
       } else if (!remoteMtime || remoteMtime === localMtime) {
         // No mtime or same mtime: apply if content actually differs
-        const localContent = await this.vault.cachedRead(existing);
+        const localContent = await this.vault.readText(existing);
         if (localContent !== doc.content) {
-          await this.vault.modify(existing, doc.content);
+          await this.vault.modifyText(existing, doc.content);
         }
       }
     } else if (!existing) {
       // New file from remote - ensure parent directories exist
       try {
         await this.ensureParentDirs(normalized);
-        await this.vault.create(normalized, doc.content);
+        await this.vault.createText(normalized, doc.content);
       } catch (e) {
         if ((e as Error).message?.includes("already exists")) {
           // Race condition: file appeared between check and create, use modify
-          const file = this.vault.getAbstractFileByPath(normalized);
-          if (file instanceof TFile) {
-            await this.vault.modify(file, doc.content);
+          const file = this.vault.getEntryByPath(normalized);
+          if (file && file.kind === "file") {
+            await this.vault.modifyText(file, doc.content);
           }
         } else {
           throw e;
@@ -664,10 +672,10 @@ export class SyncEngine {
   private async handleRemoteDelete(docId: string): Promise<void> {
     const path = docIdToPath(docId);
     if (this.isExcluded(path)) return;
-    const normalized = normalizePath(path);
-    const file = this.vault.getAbstractFileByPath(normalized);
-    if (file instanceof TFile) {
-      await this.vault.delete(file);
+    const normalized = this.normalizePath(path);
+    const file = this.vault.getEntryByPath(normalized);
+    if (file && file.kind === "file") {
+      await this.vault.deleteFile(file);
       await this.cleanupEmptyParents(normalized);
     }
     delete this.revMap[docId];
@@ -676,11 +684,11 @@ export class SyncEngine {
   private async cleanupEmptyParents(filePath: string): Promise<void> {
     const parts = filePath.split("/");
     for (let i = parts.length - 2; i >= 0; i--) {
-      const dirPath = normalizePath(parts.slice(0, i + 1).join("/"));
-      const dir = this.vault.getAbstractFileByPath(dirPath);
-      if (!dir || !(dir instanceof TFolder)) break;
-      if (dir.children.length === 0) {
-        await this.vault.delete(dir);
+      const dirPath = this.normalizePath(parts.slice(0, i + 1).join("/"));
+      const dir = this.vault.getEntryByPath(dirPath);
+      if (!dir || dir.kind !== "folder") break;
+      if (await this.vault.isDirectoryEmpty(dirPath)) {
+        await this.vault.deleteDirectory(dir);
       } else {
         break;
       }
@@ -694,24 +702,24 @@ export class SyncEngine {
     let current = "";
     for (let i = 0; i < parts.length - 1; i++) {
       current = current ? `${current}/${parts[i]}` : parts[i];
-      const normalized = normalizePath(current);
-      if (!this.vault.getAbstractFileByPath(normalized)) {
-        await this.vault.createFolder(normalized);
+      const normalized = this.normalizePath(current);
+      if (!this.vault.getEntryByPath(normalized)) {
+        await this.vault.createDirectory(normalized);
       }
     }
   }
 
-  // --- Local change handlers (called by plugin event listeners) ---
+  // --- Local change handlers (called by plugin event listeners or filesystem watcher) ---
 
   /**
    * Called when a local file is modified/created.
    * Debounces writes to batch rapid edits (e.g., typing).
    */
-  handleLocalChange(file: TAbstractFile): void {
+  handleLocalChange(file: VaultEntry): void {
     if (!this.running || this.applyingRemote) return;
-    if (!(file instanceof TFile)) return;
+    if (file.kind !== "file") return;
     if (this.isExcluded(file.path)) return;
-    if (file.stat.size > MAX_FILE_SIZE) return; // TODO: chunk large files
+    if (file.size > MAX_FILE_SIZE) return; // TODO: chunk large files
     if (this.recentRemotePaths.has(file.path)) return; // Suppress echo from remote apply
 
     // Cancel any pending debounce for this file
@@ -729,9 +737,9 @@ export class SyncEngine {
   }
 
   /** Called when a local file is deleted */
-  async handleLocalDelete(file: TAbstractFile): Promise<void> {
+  async handleLocalDelete(file: VaultEntry): Promise<void> {
     if (!this.running || this.applyingRemote) return;
-    if (!(file instanceof TFile)) return;
+    if (file.kind !== "file") return;
     if (this.isExcluded(file.path)) return;
 
     const docId = pathToDocId(file.path);
@@ -756,9 +764,9 @@ export class SyncEngine {
   }
 
   /** Called when a local file is renamed */
-  async handleLocalRename(file: TAbstractFile, oldPath: string): Promise<void> {
+  async handleLocalRename(file: VaultEntry, oldPath: string): Promise<void> {
     if (!this.running || this.applyingRemote) return;
-    if (!(file instanceof TFile)) return;
+    if (file.kind !== "file") return;
 
     // Delete old doc
     const oldDocId = pathToDocId(oldPath);
@@ -782,7 +790,7 @@ export class SyncEngine {
 
   // --- Push single file ---
 
-  private async pushFile(file: TFile): Promise<void> {
+  private async pushFile(file: VaultFile): Promise<void> {
     const key = file.path;
     // Serialize pushes per file to prevent concurrent 409 conflicts
     const prev = this.pushLocks.get(key) ?? Promise.resolve();
@@ -799,14 +807,14 @@ export class SyncEngine {
     await next;
   }
 
-  private async pushTextFile(file: TFile): Promise<void> {
+  private async pushTextFile(file: VaultFile): Promise<void> {
     try {
       const docId = pathToDocId(file.path);
-      const content = await this.vault.cachedRead(file);
+      const content = await this.vault.readText(file);
       const doc: CouchDoc = {
         _id: docId,
         content,
-        mtime: file.stat.mtime,
+        mtime: file.mtime,
       };
 
       // Include rev if we have one (update) or fetch it (avoid conflict)
@@ -829,7 +837,7 @@ export class SyncEngine {
         }
       } catch (e) {
         if (e instanceof CouchError && e.status === 409) {
-          await this.resolveConflict(docId, content, file.stat.mtime);
+          await this.resolveConflict(docId, content, file.mtime);
         } else {
           throw e;
         }
@@ -839,7 +847,7 @@ export class SyncEngine {
     }
   }
 
-  private async pushBinaryFile(file: TFile): Promise<void> {
+  private async pushBinaryFile(file: VaultFile): Promise<void> {
     try {
       const docId = pathToDocId(file.path);
       const data = await this.vault.readBinary(file);
@@ -853,7 +861,7 @@ export class SyncEngine {
           rev = remote._rev ?? "";
         } catch {
           // Create stub doc
-          const stubResult = await this.client.put({ _id: docId, content: null, mtime: file.stat.mtime });
+          const stubResult = await this.client.put({ _id: docId, content: null, mtime: file.mtime });
           rev = stubResult.rev ?? "";
           if (stubResult.rev) this.revMap[docId] = stubResult.rev;
         }
@@ -893,7 +901,7 @@ export class SyncEngine {
    */
   private async resolveConflict(
     docId: string,
-    localContent: string,
+    localContent: string | null,
     localMtime: number,
   ): Promise<void> {
     const MAX_RETRIES = 3;
@@ -931,12 +939,12 @@ export class SyncEngine {
         }
       } else {
         // Remote is newer - apply remote content locally
-        const normalized = normalizePath(docIdToPath(docId));
-        const existing = this.vault.getAbstractFileByPath(normalized);
-        if (existing instanceof TFile) {
+        const normalized = this.normalizePath(docIdToPath(docId));
+        const existing = this.vault.getEntryByPath(normalized);
+        if (existing && existing.kind === "file" && typeof remote.content === "string") {
           this.applyingRemote = true;
           try {
-            await this.vault.modify(existing, remote.content);
+            await this.vault.modifyText(existing, remote.content);
           } finally {
             this.applyingRemote = false;
           }

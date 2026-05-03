@@ -13,7 +13,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
   couchDbUser: "",
   couchDbPassword: "",
   syncDebounceMs: 500,
-  excludePatterns: [".trash/"],
+  excludePatterns: [".trash/", ".vault-sync-state.json"],
 };
 
 export type SyncState = "idle" | "syncing" | "ok" | "error" | "offline" | "not-configured";
@@ -86,4 +86,47 @@ export interface SyncDiagnostics {
   pullApplied: number;
   pendingPushCount: number;
   lastError: string | null;
+}
+
+// --- Portable abstractions (used by both Obsidian plugin and headless daemon) ---
+
+export type VaultFile = { kind: "file"; path: string; mtime: number; size: number };
+export type VaultFolder = { kind: "folder"; path: string };
+export type VaultEntry = VaultFile | VaultFolder;
+
+export interface VaultAdapter {
+  getFiles(): VaultFile[];
+  getEntryByPath(path: string): VaultEntry | null;
+  readText(file: VaultFile): Promise<string>;
+  readBinary(file: VaultFile): Promise<ArrayBuffer>;
+  modifyText(file: VaultFile, content: string): Promise<void>;
+  modifyBinary(file: VaultFile, data: ArrayBuffer): Promise<void>;
+  createText(path: string, content: string): Promise<VaultFile>;
+  createBinary(path: string, data: ArrayBuffer): Promise<VaultFile>;
+  createDirectory(path: string): Promise<void>;
+  deleteFile(file: VaultFile): Promise<void>;
+  deleteDirectory(dir: VaultFolder): Promise<void>;
+  isDirectoryEmpty(path: string): Promise<boolean>;
+  normalizePath(path: string): string;
+}
+
+export interface HttpResponse {
+  status: number;
+  text(): Promise<string>;
+  json<T>(): Promise<T>;
+  arrayBuffer(): Promise<ArrayBuffer>;
+}
+
+export interface HttpTransport {
+  request(options: {
+    url: string;
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string | ArrayBuffer;
+  }): Promise<HttpResponse>;
+}
+
+export interface StateStore {
+  get(key: string): string | null;
+  set(key: string, value: string): void;
 }

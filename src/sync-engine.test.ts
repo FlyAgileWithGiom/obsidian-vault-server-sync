@@ -1,8 +1,17 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { SyncEngine } from "./sync-engine";
 import { CouchClient } from "./couch-client";
-import { Vault, TFile, TFolder } from "./__mocks__/obsidian";
-import type { VaultSyncSettings, CouchDoc, CouchChangeRow } from "./types";
+import { Vault, TFile } from "./__mocks__/obsidian";
+import type {
+  VaultSyncSettings,
+  CouchDoc,
+  VaultAdapter,
+  VaultFile,
+  VaultFolder,
+  VaultEntry,
+  StateStore,
+  HttpTransport,
+} from "./types";
 
 // Mock CouchClient so we control all network behavior
 vi.mock("./couch-client", () => {
@@ -31,13 +40,104 @@ vi.mock("./couch-client", () => {
   };
 });
 
-// Mock localStorage
-const localStorageMock: Record<string, string> = {};
-vi.stubGlobal("localStorage", {
-  getItem: vi.fn((key: string) => localStorageMock[key] ?? null),
-  setItem: vi.fn((key: string, value: string) => { localStorageMock[key] = value; }),
-  removeItem: vi.fn((key: string) => { delete localStorageMock[key]; }),
-});
+// --- Test adapters ---
+
+/** Wraps the mock Vault to implement VaultAdapter */
+class TestVaultAdapter implements VaultAdapter {
+  constructor(private vault: Vault) {}
+
+  getFiles(): VaultFile[] {
+    return this.vault.getFiles().map((f) => ({
+      kind: "file" as const,
+      path: f.path,
+      mtime: f.stat.mtime,
+      size: f.stat.size,
+    }));
+  }
+
+  getEntryByPath(path: string): VaultEntry | null {
+    const entry = this.vault.getAbstractFileByPath(path);
+    if (!entry) return null;
+    if (entry instanceof TFile) {
+      return { kind: "file", path: entry.path, mtime: entry.stat.mtime, size: entry.stat.size };
+    }
+    // Must be TFolder
+    return { kind: "folder", path: entry.path };
+  }
+
+  async readText(file: VaultFile): Promise<string> {
+    const tf = this.vault.getAbstractFileByPath(file.path);
+    if (!(tf instanceof TFile)) return "";
+    return this.vault.cachedRead(tf);
+  }
+
+  async readBinary(file: VaultFile): Promise<ArrayBuffer> {
+    const tf = this.vault.getAbstractFileByPath(file.path);
+    if (!(tf instanceof TFile)) return new ArrayBuffer(0);
+    return this.vault.readBinary(tf);
+  }
+
+  async modifyText(file: VaultFile, content: string): Promise<void> {
+    const tf = this.vault.getAbstractFileByPath(file.path);
+    if (tf instanceof TFile) await this.vault.modify(tf, content);
+  }
+
+  async modifyBinary(file: VaultFile, data: ArrayBuffer): Promise<void> {
+    const tf = this.vault.getAbstractFileByPath(file.path);
+    if (tf instanceof TFile) await this.vault.modifyBinary(tf, data);
+  }
+
+  async createText(path: string, content: string): Promise<VaultFile> {
+    const tf = await this.vault.create(path, content);
+    return { kind: "file", path: tf.path, mtime: tf.stat.mtime, size: tf.stat.size };
+  }
+
+  async createBinary(path: string, data: ArrayBuffer): Promise<VaultFile> {
+    const tf = await this.vault.createBinary(path, data);
+    return { kind: "file", path: tf.path, mtime: tf.stat.mtime, size: tf.stat.size };
+  }
+
+  async createDirectory(path: string): Promise<void> {
+    await this.vault.createFolder(path);
+  }
+
+  async deleteFile(file: VaultFile): Promise<void> {
+    const tf = this.vault.getAbstractFileByPath(file.path);
+    if (tf instanceof TFile) await this.vault.delete(tf);
+  }
+
+  async deleteDirectory(dir: VaultFolder): Promise<void> {
+    const entry = this.vault.getAbstractFileByPath(dir.path);
+    if (entry && !(entry instanceof TFile)) await this.vault.delete(entry as never);
+  }
+
+  /**
+   * Check emptiness via the mock Vault's folder.children list.
+   * In tests, _addFolder() explicitly controls the children list so this is authoritative.
+   */
+  async isDirectoryEmpty(path: string): Promise<boolean> {
+    const entry = this.vault.getAbstractFileByPath(path);
+    if (!entry || entry instanceof TFile) return true;
+    // TFolder has children property
+    return (entry as { children: unknown[] }).children.length === 0;
+  }
+
+  normalizePath(path: string): string {
+    return path.replace(/\\/g, "/").replace(/\/+/g, "/");
+  }
+}
+
+/** Map-backed StateStore for testing */
+class TestStateStore implements StateStore {
+  private store = new Map<string, string>();
+  get(key: string): string | null { return this.store.get(key) ?? null; }
+  set(key: string, value: string): void { this.store.set(key, value); }
+}
+
+/** No-op transport — CouchClient is fully mocked so this is never called */
+const noopTransport: HttpTransport = {
+  request: vi.fn().mockResolvedValue({ status: 200, text: async () => "{}", json: async () => ({}), arrayBuffer: async () => new ArrayBuffer(0) }),
+};
 
 function makeSettings(overrides: Partial<VaultSyncSettings> = {}): VaultSyncSettings {
   return {
@@ -60,18 +160,28 @@ function getClient(engine: SyncEngine): ReturnType<typeof vi.fn> & Record<string
 
 describe("SyncEngine", () => {
   let vault: Vault;
+  let vaultAdapter: TestVaultAdapter;
+  let stateStore: TestStateStore;
   let settings: VaultSyncSettings;
   let engine: SyncEngine;
   let stateChanges: string[];
   let errors: string[];
 
+  function makeEngine(s = settings, v = vaultAdapter, st = stateStore): SyncEngine {
+    const e = new SyncEngine(s, v, st, noopTransport);
+    e.onStateChange = (state) => stateChanges.push(state);
+    e.onError = (msg) => errors.push(msg);
+    return e;
+  }
+
   beforeEach(() => {
     vi.clearAllMocks();
-    Object.keys(localStorageMock).forEach(k => delete localStorageMock[k]);
 
     vault = new Vault();
+    vaultAdapter = new TestVaultAdapter(vault);
+    stateStore = new TestStateStore();
     settings = makeSettings();
-    engine = new SyncEngine(settings, vault as any);
+    engine = makeEngine();
     stateChanges = [];
     errors = [];
     engine.onStateChange = (state) => stateChanges.push(state);
@@ -182,10 +292,9 @@ describe("SyncEngine", () => {
       vault._addFile("notes/old.md", "local content", 1000);
 
       // Pre-populate revMap to simulate a previous sync
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/old.md": "1-r" });
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = (state) => stateChanges.push(state);
-      engine2.onError = (msg) => errors.push(msg);
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({ "file/notes/old.md": "1-r" }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
 
       const client2 = getClient(engine2);
       // allDocs returns same rev as in revMap
@@ -259,10 +368,9 @@ describe("SyncEngine", () => {
       vault._addFile("notes/shared.md", "old local", 1000);
 
       // Pre-populate revMap so push is skipped (rev matches)
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/shared.md": "1-r" });
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = (state) => stateChanges.push(state);
-      engine2.onError = (msg) => errors.push(msg);
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({ "file/notes/shared.md": "1-r" }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
 
       const client = getClient(engine2);
       // allDocs returns newer rev (2-r vs 1-r in revMap) -> triggers pull
@@ -390,10 +498,9 @@ describe("SyncEngine", () => {
       // the doc should still be applied to the vault
       vault._addFile("notes/external.md", "old content", 1000);
 
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/external.md": "1-old" });
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = () => {};
-      engine2.onError = () => {};
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({ "file/notes/external.md": "1-old" }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
 
       const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
@@ -420,10 +527,9 @@ describe("SyncEngine", () => {
     it("applies remote doc when mtime is 0 (external tool update)", async () => {
       vault._addFile("notes/zero-mtime.md", "old content", 1000);
 
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/zero-mtime.md": "1-old" });
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = () => {};
-      engine2.onError = () => {};
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({ "file/notes/zero-mtime.md": "1-old" }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
 
       const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
@@ -450,10 +556,9 @@ describe("SyncEngine", () => {
     it("applies remote doc when mtime equals local but content differs", async () => {
       vault._addFile("notes/same-mtime.md", "local version", 5000);
 
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/notes/same-mtime.md": "1-old" });
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = () => {};
-      engine2.onError = () => {};
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({ "file/notes/same-mtime.md": "1-old" }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
 
       const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
@@ -537,13 +642,13 @@ describe("SyncEngine", () => {
     it("deletes local files that were deleted on remote", async () => {
       // File exists locally and in revMap (was synced before)
       vault._addFile("notes/deleted-remote.md", "old content", 1000);
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({
+
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
         "file/notes/deleted-remote.md": "1-old",
         "file/notes/still-exists.md": "1-a",
-      });
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = () => {};
-      engine2.onError = () => {};
+      }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
 
       const client = getClient(engine2);
       // Remote only has still-exists.md -- deleted-remote.md was deleted on remote
@@ -565,9 +670,9 @@ describe("SyncEngine", () => {
 
   describe("local change handlers", () => {
     it("ignores changes when not running", () => {
-      const file = new TFile("notes/test.md", 1000);
+      const file: VaultFile = { kind: "file", path: "notes/test.md", mtime: 1000, size: 0 };
       // Should not throw, just silently return
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
     });
 
     it("ignores excluded files", async () => {
@@ -576,8 +681,8 @@ describe("SyncEngine", () => {
       client.changes.mockResolvedValue({ last_seq: "0", results: [] });
       await engine.start();
 
-      const file = new TFile(".obsidian/config.json", 1000);
-      engine.handleLocalChange(file as any);
+      const file: VaultFile = { kind: "file", path: ".obsidian/config.json", mtime: 1000, size: 0 };
+      engine.handleLocalChange(file);
 
       // Wait for debounce
       await new Promise((r) => setTimeout(r, 100));
@@ -593,14 +698,15 @@ describe("SyncEngine", () => {
 
       await engine.start();
 
-      const file = vault._addFile("notes/typing.md", "version1", 1000);
+      vault._addFile("notes/typing.md", "version1", 1000);
+      const file: VaultFile = { kind: "file", path: "notes/typing.md", mtime: 1000, size: 0 };
 
       // Simulate rapid typing (3 changes in quick succession)
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 10));
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 10));
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
 
       // Wait for debounce to fire (settings.syncDebounceMs = 50)
       await new Promise((r) => setTimeout(r, 120));
@@ -618,15 +724,16 @@ describe("SyncEngine", () => {
       await engine.start();
 
       // Manually set a rev in the engine's revMap via a push first
-      const file = vault._addFile("notes/gone.md", "content", 1000);
+      vault._addFile("notes/gone.md", "content", 1000);
+      const file: VaultFile = { kind: "file", path: "notes/gone.md", mtime: 1000, size: 0 };
       client.get.mockRejectedValue(new Error("not found"));
       client.put.mockResolvedValue({ ok: true, id: "file/notes/gone.md", rev: "1-a" });
 
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 100));
 
       // Now delete
-      await engine.handleLocalDelete(file as any);
+      await engine.handleLocalDelete(file);
 
       expect(client.delete).toHaveBeenCalledWith("file/notes/gone.md", "1-a");
     });
@@ -640,10 +747,11 @@ describe("SyncEngine", () => {
       await engine.start();
 
       // Push a file so revMap has it
-      const file = vault._addFile("notes/already-gone.md", "content", 1000);
+      vault._addFile("notes/already-gone.md", "content", 1000);
+      const file: VaultFile = { kind: "file", path: "notes/already-gone.md", mtime: 1000, size: 0 };
       client.get.mockRejectedValue(new Error("not found"));
       client.put.mockResolvedValue({ ok: true, id: "file/notes/already-gone.md", rev: "1-a" });
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 100));
 
       // Remote delete returns 404 (already deleted)
@@ -652,7 +760,7 @@ describe("SyncEngine", () => {
       const errorSpy = vi.fn();
       engine.onError = errorSpy;
 
-      await engine.handleLocalDelete(file as any);
+      await engine.handleLocalDelete(file);
 
       // Should NOT show an error notification
       expect(errorSpy).not.toHaveBeenCalled();
@@ -669,16 +777,18 @@ describe("SyncEngine", () => {
       await engine.start();
 
       // Simulate: engine knows about the old path
-      const file = vault._addFile("notes/renamed.md", "content", 1000);
+      vault._addFile("notes/renamed.md", "content", 1000);
+      const renamedFile: VaultFile = { kind: "file", path: "notes/renamed.md", mtime: 1000, size: 0 };
       // Manually push old file first so revMap has it
       client.put.mockResolvedValue({ ok: true, id: "file/notes/original.md", rev: "1-old" });
-      const oldFile = vault._addFile("notes/original.md", "content", 1000);
-      engine.handleLocalChange(oldFile as any);
+      vault._addFile("notes/original.md", "content", 1000);
+      const oldFile: VaultFile = { kind: "file", path: "notes/original.md", mtime: 1000, size: 0 };
+      engine.handleLocalChange(oldFile);
       await new Promise((r) => setTimeout(r, 100));
 
       // Now rename
       client.put.mockResolvedValue({ ok: true, id: "file/notes/renamed.md", rev: "1-new" });
-      await engine.handleLocalRename(file as any, "notes/original.md");
+      await engine.handleLocalRename(renamedFile, "notes/original.md");
 
       expect(client.delete).toHaveBeenCalledWith("file/notes/original.md", "1-old");
       expect(client.put).toHaveBeenCalledWith(
@@ -722,8 +832,9 @@ describe("SyncEngine", () => {
       // Simulate what happens: remote doc is applied, which triggers vault.modify,
       // which would normally trigger handleLocalChange
       // The applyingRemote flag prevents the echo
-      const file = vault._addFile("notes/remote.md", "remote content", 5000);
-      engine.handleLocalChange(file as any);
+      vault._addFile("notes/remote.md", "remote content", 5000);
+      const file: VaultFile = { kind: "file", path: "notes/remote.md", mtime: 5000, size: 0 };
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 100));
 
       // put() should not have been called for this file during remote apply
@@ -734,7 +845,7 @@ describe("SyncEngine", () => {
   });
 
   describe("persistence", () => {
-    it("persists revMap and lastSeq to localStorage", async () => {
+    it("persists revMap and lastSeq to StateStore", async () => {
       const client = getClient(engine);
       client.get.mockRejectedValue(new Error("not found"));
       client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/a.md", rev: "1-x" }]);
@@ -744,36 +855,31 @@ describe("SyncEngine", () => {
       vault._addFile("a.md", "content", 1000);
       await engine.start();
 
-      expect(localStorage.setItem).toHaveBeenCalledWith(
-        "vault-sync-revmap",
-        expect.any(String)
-      );
-      expect(localStorage.setItem).toHaveBeenCalledWith(
-        "vault-sync-last-seq",
-        expect.any(String)
-      );
+      expect(stateStore.get("vault-sync-revmap")).not.toBeNull();
+      expect(stateStore.get("vault-sync-last-seq")).not.toBeNull();
     });
 
-    it("restores revMap from localStorage on construction", () => {
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "a.md": "1-abc" });
-      localStorageMock["vault-sync-last-seq"] = JSON.stringify("42");
+    it("restores revMap from StateStore on construction", () => {
+      const preloadedStore = new TestStateStore();
+      preloadedStore.set("vault-sync-revmap", JSON.stringify({ "a.md": "1-abc" }));
+      preloadedStore.set("vault-sync-last-seq", JSON.stringify("42"));
 
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = () => {};
-      engine2.onError = () => {};
+      // Just constructing the engine reads from the store
+      const engine2 = makeEngine(settings, vaultAdapter, preloadedStore);
+      engine2.stop();
 
-      // Verify by checking that localStorage.getItem was called
-      expect(localStorage.getItem).toHaveBeenCalledWith("vault-sync-revmap");
-      expect(localStorage.getItem).toHaveBeenCalledWith("vault-sync-last-seq");
+      // Verify the engine loaded the state (indirectly, by checking getDiagnostics)
+      const diag = engine2.getDiagnostics();
+      expect(diag.revMapSize).toBe(1);
     });
 
-    it("handles corrupted localStorage gracefully", () => {
-      localStorageMock["vault-sync-revmap"] = "not-valid-json{{{";
-      localStorageMock["vault-sync-last-seq"] = "also-broken";
+    it("handles corrupted StateStore gracefully", () => {
+      const badStore = new TestStateStore();
+      badStore.set("vault-sync-revmap", "not-valid-json{{{");
+      badStore.set("vault-sync-last-seq", "also-broken");
 
       // Should not throw
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = () => {};
+      const engine2 = makeEngine(settings, vaultAdapter, badStore);
       engine2.stop();
     });
   });
@@ -787,7 +893,8 @@ describe("SyncEngine", () => {
       await engine.start();
 
       // Simulate a file that already has a rev (was synced before)
-      const file = vault._addFile("notes/conflict.md", "local version", 3000);
+      vault._addFile("notes/conflict.md", "local version", 3000);
+      const file: VaultFile = { kind: "file", path: "notes/conflict.md", mtime: 3000, size: 0 };
       // First put fails with 409 (stale rev)
       const { CouchError } = await import("./couch-client");
       client.put
@@ -801,7 +908,7 @@ describe("SyncEngine", () => {
         mtime: 2000,
       });
 
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 100));
 
       // Should have re-pushed local content with remote's _rev
@@ -822,7 +929,8 @@ describe("SyncEngine", () => {
 
       await engine.start();
 
-      const file = vault._addFile("notes/conflict.md", "old local", 1000);
+      vault._addFile("notes/conflict.md", "old local", 1000);
+      const file: VaultFile = { kind: "file", path: "notes/conflict.md", mtime: 1000, size: 0 };
       const { CouchError } = await import("./couch-client");
       client.put.mockRejectedValueOnce(new CouchError(409, "conflict"));
       // Remote is newer
@@ -833,7 +941,7 @@ describe("SyncEngine", () => {
         mtime: 5000,
       });
 
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 100));
 
       // Should have applied remote content to vault
@@ -847,7 +955,8 @@ describe("SyncEngine", () => {
 
       await engine.start();
 
-      const file = vault._addFile("notes/conflict.md", "local", 1000);
+      vault._addFile("notes/conflict.md", "local", 1000);
+      const file: VaultFile = { kind: "file", path: "notes/conflict.md", mtime: 1000, size: 0 };
       const { CouchError } = await import("./couch-client");
       client.put.mockRejectedValueOnce(new CouchError(409, "conflict"));
       client.get.mockResolvedValue({
@@ -857,12 +966,12 @@ describe("SyncEngine", () => {
         mtime: 5000,
       });
 
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 100));
 
       // Verify no .sync-conflict file was created
       const allFiles = vault.getFiles();
-      const conflictFiles = allFiles.filter((f: any) => f.path.includes("sync-conflict"));
+      const conflictFiles = allFiles.filter((f) => f.path.includes("sync-conflict"));
       expect(conflictFiles).toHaveLength(0);
     });
 
@@ -873,7 +982,8 @@ describe("SyncEngine", () => {
 
       await engine.start();
 
-      const file = vault._addFile("notes/double-conflict.md", "latest local", 5000);
+      vault._addFile("notes/double-conflict.md", "latest local", 5000);
+      const file: VaultFile = { kind: "file", path: "notes/double-conflict.md", mtime: 5000, size: 0 };
       const { CouchError } = await import("./couch-client");
 
       // Initial push → 409
@@ -905,7 +1015,7 @@ describe("SyncEngine", () => {
           mtime: 4000,
         });
 
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 100));
 
       // Should have succeeded on third put with the fresh rev
@@ -926,7 +1036,8 @@ describe("SyncEngine", () => {
 
       await engine.start();
 
-      const file = vault._addFile("notes/same.md", "same content", 2000);
+      vault._addFile("notes/same.md", "same content", 2000);
+      const file: VaultFile = { kind: "file", path: "notes/same.md", mtime: 2000, size: 0 };
       const { CouchError } = await import("./couch-client");
       client.put.mockRejectedValueOnce(new CouchError(409, "conflict"));
       // Remote has identical content
@@ -937,7 +1048,7 @@ describe("SyncEngine", () => {
         mtime: 1000,
       });
 
-      engine.handleLocalChange(file as any);
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 100));
 
       // put should have been called only once (the initial failed attempt)
@@ -1090,10 +1201,9 @@ describe("SyncEngine", () => {
       const newData = new Uint8Array([4, 5, 6]).buffer;
       vault._addBinaryFile("images/photo.png", oldData);
 
-      localStorageMock["vault-sync-revmap"] = JSON.stringify({ "file/images/photo.png": "1-old" });
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = () => {};
-      engine2.onError = () => {};
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({ "file/images/photo.png": "1-old" }));
+      const engine2 = makeEngine(settings, vaultAdapter, storeWithRevMap);
 
       const client = getClient(engine2);
       client.allDocs.mockResolvedValue({
@@ -1248,8 +1358,8 @@ describe("SyncEngine", () => {
 
       await engine.start();
 
-      // All 3 revs must be persisted in localStorage (revMap)
-      const saved = JSON.parse(localStorageMock["vault-sync-revmap"] ?? "{}");
+      // All 3 revs must be persisted in StateStore
+      const saved = JSON.parse(stateStore.get("vault-sync-revmap") ?? "{}");
       expect(saved["file/images/img1.png"]).toBe("1-aaa");
       expect(saved["file/images/img2.png"]).toBe("1-bbb");
       expect(saved["file/images/img3.png"]).toBe("1-ccc");
@@ -1290,8 +1400,9 @@ describe("SyncEngine", () => {
 
       await engine.start();
 
-      const file = vault._addBinaryFile("images/icon.png", pngData);
-      engine.handleLocalChange(file as any);
+      vault._addBinaryFile("images/icon.png", pngData);
+      const file: VaultFile = { kind: "file", path: "images/icon.png", mtime: Date.now(), size: pngData.byteLength };
+      engine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 120));
 
       expect(client.putAttachment).toHaveBeenCalledWith(
@@ -1393,10 +1504,9 @@ describe("SyncEngine", () => {
     // Helper: set up engine with a pre-populated revMap (simulates previously synced files),
     // then trigger fullSync where the remote no longer has those docs → handleRemoteDelete fires.
     function makeEngineWithRevMap(revMap: Record<string, string>): { engine2: SyncEngine; client2: ReturnType<typeof vi.fn> & Record<string, ReturnType<typeof vi.fn>> } {
-      localStorageMock["vault-sync-revmap"] = JSON.stringify(revMap);
-      const engine2 = new SyncEngine(settings, vault as any);
-      engine2.onStateChange = () => {};
-      engine2.onError = () => {};
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify(revMap));
+      const engine2 = makeEngine(settings, vaultAdapter, store);
       const client2 = getClient(engine2);
       return { engine2, client2 };
     }
@@ -1405,7 +1515,7 @@ describe("SyncEngine", () => {
       // folder/file-to-delete.md is synced; folder/ has another file remaining
       vault._addFile("folder/file-to-delete.md", "bye", 1000);
       const siblingFile = new TFile("folder/sibling.md");
-      const folder = vault._addFolder("folder", [siblingFile]);
+      vault._addFolder("folder", [siblingFile]);
 
       const { engine2, client2 } = makeEngineWithRevMap({
         "file/folder/file-to-delete.md": "1-old",

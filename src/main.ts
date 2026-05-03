@@ -1,6 +1,9 @@
 import { Notice, Plugin } from "obsidian";
 import { CouchClient } from "./couch-client";
 import { SyncEngine } from "./sync-engine";
+import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
+import { ObsidianStateStore } from "./ObsidianStateStore";
+import { ObsidianTransport } from "./ObsidianTransport";
 import { VaultSyncSettingTab } from "./settings-tab";
 import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
@@ -33,7 +36,10 @@ export default class VaultSyncPlugin extends Plugin {
       await this.saveSettings();
     }
 
-    this.syncEngine = new SyncEngine(this.settings, this.app.vault);
+    const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
+    const stateStore = new ObsidianStateStore();
+    const transport = new ObsidianTransport();
+    this.syncEngine = new SyncEngine(this.settings, vaultAdapter, stateStore, transport);
     this.syncEngine.onStateChange = (state) => this.updateState(state);
     this.syncEngine.onCountsChange = (counts) => this.updateCounts(counts);
     this.syncEngine.onError = (msg) => this.handleSyncError(msg);
@@ -196,7 +202,7 @@ export default class VaultSyncPlugin extends Plugin {
 
   /** Public: called from settings tab */
   async testConnection(): Promise<boolean> {
-    const client = new CouchClient(this.settings);
+    const client = new CouchClient(this.settings, new ObsidianTransport());
     return client.ping();
   }
 

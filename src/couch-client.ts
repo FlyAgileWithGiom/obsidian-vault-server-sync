@@ -1,22 +1,32 @@
-import { requestUrl } from "obsidian";
 import type {
   CouchDoc,
   CouchBulkResult,
   CouchChangesResult,
   CouchAllDocsResult,
   VaultSyncSettings,
+  HttpTransport,
 } from "./types";
 
+function base64(str: string): string {
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(str, "utf8").toString("base64");
+  }
+  return btoa(str);
+}
+
 /**
- * Lightweight CouchDB client using Obsidian's requestUrl API.
- * requestUrl bypasses CORS restrictions in Electron/mobile.
+ * Lightweight CouchDB client.
+ * Transport is injected so this class works in both Obsidian (requestUrl) and Node (fetch).
  */
 export class CouchClient {
   private baseUrl: string;
   private authHeader: string | null = null;
   private cancelled = false;
 
-  constructor(private settings: VaultSyncSettings) {
+  constructor(
+    private settings: VaultSyncSettings,
+    private transport: HttpTransport,
+  ) {
     this.baseUrl = this.buildBaseUrl(settings);
     this.authHeader = this.buildAuth(settings);
   }
@@ -27,7 +37,7 @@ export class CouchClient {
 
   private buildAuth(s: VaultSyncSettings): string | null {
     if (s.couchDbUser && s.couchDbPassword) {
-      return `Basic ${btoa(`${s.couchDbUser}:${s.couchDbPassword}`)}`;
+      return `Basic ${base64(`${s.couchDbUser}:${s.couchDbPassword}`)}`;
     }
     return null;
   }
@@ -49,18 +59,18 @@ export class CouchClient {
     };
     if (this.authHeader) headers["Authorization"] = this.authHeader;
 
-    const resp = await requestUrl({
+    const resp = await this.transport.request({
       url,
       method: options.method || "GET",
       headers,
       body: options.body,
-      throw: false,
     });
 
     if (resp.status >= 400) {
-      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${resp.text}`);
+      const text = await resp.text();
+      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${text}`);
     }
-    return resp.json;
+    return resp.json<T>();
   }
 
   async ping(): Promise<boolean> {
@@ -140,7 +150,7 @@ export class CouchClient {
 
   /**
    * Poll changes feed using normal feed with short timeout (not longpoll).
-   * Uses requestUrl for CORS compatibility. Polling loop in SyncEngine provides near-realtime.
+   * Polling loop in SyncEngine provides near-realtime.
    */
   async changes(since: string | number = 0, options: {
     timeout?: number;
@@ -162,22 +172,24 @@ export class CouchClient {
     const url = `${this.baseUrl}/${encodeURIComponent(docId)}/${encodeURIComponent(attName)}`;
     const headers: Record<string, string> = {};
     if (this.authHeader) headers["Authorization"] = this.authHeader;
-    const resp = await requestUrl({ url, method: "GET", headers, throw: false });
+    const resp = await this.transport.request({ url, method: "GET", headers });
     if (resp.status >= 400) {
-      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${resp.text}`);
+      const text = await resp.text();
+      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${text}`);
     }
-    return resp.arrayBuffer;
+    return resp.arrayBuffer();
   }
 
   async putAttachment(docId: string, attName: string, rev: string, data: ArrayBuffer, contentType: string): Promise<CouchBulkResult> {
     const url = `${this.baseUrl}/${encodeURIComponent(docId)}/${encodeURIComponent(attName)}?rev=${encodeURIComponent(rev)}`;
     const headers: Record<string, string> = { "Content-Type": contentType };
     if (this.authHeader) headers["Authorization"] = this.authHeader;
-    const resp = await requestUrl({ url, method: "PUT", headers, body: data as unknown as string, throw: false });
+    const resp = await this.transport.request({ url, method: "PUT", headers, body: data });
     if (resp.status >= 400) {
-      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${resp.text}`);
+      const text = await resp.text();
+      throw new CouchError(resp.status, `CouchDB ${resp.status}: ${text}`);
     }
-    return resp.json as CouchBulkResult;
+    return resp.json<CouchBulkResult>();
   }
 
   cancelChanges(): void {
