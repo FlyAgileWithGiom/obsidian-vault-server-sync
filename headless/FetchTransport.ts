@@ -9,6 +9,7 @@ export class FetchTransport implements HttpTransport {
     method?: string;
     headers?: Record<string, string>;
     body?: string | ArrayBuffer;
+    timeoutMs?: number;
   }): Promise<HttpResponse> {
     const init: RequestInit = {
       method: options.method || "GET",

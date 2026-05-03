@@ -1703,6 +1703,116 @@ describe("SyncEngine", () => {
     });
   });
 
+  describe("binary file sync - metadata chunk", () => {
+    function makeBinaryAllDocsRow(id: string, rev: string) {
+      return {
+        id,
+        key: id,
+        value: { rev },
+        doc: {
+          _id: id, _rev: rev, content: null, mtime: 0,
+          _attachments: { "data.bin": { content_type: "image/png", length: 4, stub: true } },
+        },
+      };
+    }
+
+    it("chunks allDocsByKeys at META_BATCH_SIZE boundary (1001 docs → 3 calls)", async () => {
+      // 1001 binary docIds: with META_BATCH_SIZE=500, expect chunks [0-499], [500-999], [1000]
+      const docIds = Array.from({ length: 1001 }, (_, i) => `file/images/img${i}.png`);
+      const revs = docIds.map((_, i) => `1-${i}`);
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
+      });
+
+      // allDocsByKeys returns the chunk's docs on each call
+      client.allDocsByKeys.mockImplementation((keys: string[]) => {
+        return Promise.resolve({
+          total_rows: keys.length,
+          rows: keys.map((id) => makeBinaryAllDocsRow(id, revs[docIds.indexOf(id)])),
+        });
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      client.getAttachment = vi.fn().mockResolvedValue(new ArrayBuffer(4));
+
+      await engine.start();
+
+      // allDocsByKeys should be called 3 times: [0..499], [500..999], [1000]
+      expect(client.allDocsByKeys).toHaveBeenCalledTimes(3);
+      expect(client.allDocsByKeys.mock.calls[0][0]).toHaveLength(500);
+      expect(client.allDocsByKeys.mock.calls[1][0]).toHaveLength(500);
+      expect(client.allDocsByKeys.mock.calls[2][0]).toHaveLength(1);
+      // All 1001 files should have been written to vault
+      expect(client.getAttachment).toHaveBeenCalledTimes(1001);
+    });
+
+    it("partial metadata chunk failure: skips failed chunk docs, applies successful chunk", async () => {
+      // 600 docIds: first chunk of 500 fails, second chunk of 100 succeeds.
+      // META_BATCH_SIZE=500, so 600 docs → 2 chunks: [0..499] fails, [500..599] succeeds.
+      const firstChunkIds = Array.from({ length: 500 }, (_, i) => `file/images/fail${i}.png`);
+      const secondChunkIds = Array.from({ length: 100 }, (_, i) => `file/images/ok${i}.png`);
+      const docIds = [...firstChunkIds, ...secondChunkIds];
+      const revs = docIds.map((_, i) => `1-${i}`);
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
+      });
+
+      // First chunk of 500 throws timeout; second chunk of 100 succeeds
+      let callCount = 0;
+      client.allDocsByKeys.mockImplementation((keys: string[]) => {
+        callCount++;
+        if (callCount === 1) {
+          return Promise.reject(new Error("DOMException [TimeoutError]: The operation was aborted due to timeout"));
+        }
+        return Promise.resolve({
+          total_rows: keys.length,
+          rows: keys.map((id) => makeBinaryAllDocsRow(id, revs[docIds.indexOf(id)])),
+        });
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      client.getAttachment = vi.fn().mockResolvedValue(new ArrayBuffer(4));
+
+      await engine.start();
+
+      // Must not throw — engine should survive partial metadata failure
+      // Only the second chunk's docs (secondChunkIds) have metadata, so only those download
+      expect(client.getAttachment).toHaveBeenCalledTimes(secondChunkIds.length);
+      // Engine should not enter error state due to metadata chunk failure
+      expect(stateChanges).not.toContain("error");
+    });
+
+    it("failCount rate limiting: 5 failing binary downloads emit at most 3 errors", async () => {
+      const docIds = ["a", "b", "c", "d", "e"].map(n => `file/images/${n}.png`);
+      const revs = docIds.map((_, i) => `1-${i}`);
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => ({ id, key: id, value: { rev: revs[i] } })),
+      });
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: docIds.length,
+        rows: docIds.map((id, i) => makeBinaryAllDocsRow(id, revs[i])),
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      // All 5 downloads fail
+      const { CouchError } = await import("./couch-client");
+      client.getAttachment = vi.fn().mockRejectedValue(new CouchError(500, "Server Error"));
+
+      await engine.start();
+
+      // With 5 failures, errors emitted must be capped at 3
+      expect(errors.length).toBeLessThanOrEqual(3);
+      expect(errors.length).toBeGreaterThan(0);
+    });
+  });
+
   describe("memory management", () => {
     it("stop() clears recentRemotePaths timers so they do not fire after stop", async () => {
       const client = getClient(engine);

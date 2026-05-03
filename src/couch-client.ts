@@ -50,7 +50,7 @@ export class CouchClient {
 
   private async request<T>(
     path: string,
-    options: { method?: string; body?: string } = {}
+    options: { method?: string; body?: string; timeoutMs?: number } = {}
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
     const headers: Record<string, string> = {
@@ -64,6 +64,7 @@ export class CouchClient {
       method: options.method || "GET",
       headers,
       body: options.body,
+      timeoutMs: options.timeoutMs,
     });
 
     if (resp.status >= 400) {
@@ -130,13 +131,15 @@ export class CouchClient {
   /**
    * Fetch specific docs by keys using POST _all_docs (avoids N+1 individual GETs).
    * CouchDB supports POST with {"keys": [...]} body for batch retrieval.
+   * Pass timeoutMs to override the default 30s transport timeout for large key sets.
    */
-  async allDocsByKeys(keys: string[]): Promise<CouchAllDocsResult> {
+  async allDocsByKeys(keys: string[], timeoutMs?: number): Promise<CouchAllDocsResult> {
     return this.request<CouchAllDocsResult>(
       "/_all_docs?include_docs=true",
       {
         method: "POST",
         body: JSON.stringify({ keys }),
+        timeoutMs,
       }
     );
   }

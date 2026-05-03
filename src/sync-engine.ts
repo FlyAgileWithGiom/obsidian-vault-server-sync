@@ -23,6 +23,10 @@ const ATTACHMENT_NAME = "data.bin";
 const PARALLEL_BINARY_PULLS = 5;
 const BINARY_PULL_RETRIES = 3;
 const BINARY_PULL_TIMEOUT_MS = 120_000;
+// Chunk size for binary metadata pre-fetch (POST _all_docs). A single POST with
+// 7000+ keys timed out (30s default) on slow CouchDB connections — see GitHub #15.
+const META_BATCH_SIZE = 500;
+const META_TIMEOUT_MS = 60_000;
 
 const CONTENT_TYPE_MAP: Record<string, string> = {
   png: "image/png",
@@ -259,7 +263,9 @@ export class SyncEngine {
     // Phase 1: collect files not present in the remote allDocs index
     const unknownFiles = files.filter((f) => !remoteRevs.has(pathToDocId(f.path)));
 
-    // Phase 2: batch-check tombstones for all unknown files in a single request
+    // Phase 2: batch-check tombstones for all unknown files in a single request.
+    // This is bounded by local file count (not remote); if local file count grows
+    // very large, consider applying the same META_BATCH_SIZE chunking here too.
     const tombstoneIds = new Set<string>();
     const existingIds = new Set<string>();
     if (unknownFiles.length > 0) {
@@ -488,13 +494,22 @@ export class SyncEngine {
   }
 
   private async pullBinaryDocs(docIds: string[], remoteRevs: Map<string, string>): Promise<void> {
-    // Batch-fetch doc metadata to determine which docs have attachments.
-    // Orphan docs (metadata-only, no _attachments) are skipped without any HTTP request.
-    const metaResult = await this.client.allDocsByKeys(docIds);
+    // Batch-fetch doc metadata in chunks to avoid a single huge POST that times out
+    // on slow CouchDB connections with 7000+ keys (GitHub #15).
     const hasAttachment = new Set<string>();
-    for (const row of metaResult.rows) {
-      if (!row.error && row.doc?._attachments?.[ATTACHMENT_NAME]) {
-        hasAttachment.add(row.id);
+    for (let offset = 0; offset < docIds.length; offset += META_BATCH_SIZE) {
+      const chunk = docIds.slice(offset, offset + META_BATCH_SIZE);
+      try {
+        const metaResult = await this.client.allDocsByKeys(chunk, META_TIMEOUT_MS);
+        for (const row of metaResult.rows) {
+          if (!row.error && row.doc?._attachments?.[ATTACHMENT_NAME]) {
+            hasAttachment.add(row.id);
+          }
+        }
+      } catch (e) {
+        // Metadata chunk failed (e.g. timeout) — skip those docs, don't abort full pull.
+        console.warn(`[vault-sync] Binary metadata chunk [${offset}..${offset + chunk.length - 1}] failed: ${(e as Error).message}`);
+        // Docs in the failed chunk will remain unsynced; they will be re-attempted on next sync.
       }
     }
 
@@ -515,6 +530,7 @@ export class SyncEngine {
     }
 
     // Download attachments in parallel batches of PARALLEL_BINARY_PULLS
+    let failCount = 0;
     for (let batchStart = 0; batchStart < toDownload.length; batchStart += PARALLEL_BINARY_PULLS) {
       const batch = toDownload.slice(batchStart, batchStart + PARALLEL_BINARY_PULLS);
       const results = await Promise.allSettled(
@@ -546,8 +562,12 @@ export class SyncEngine {
           this.pullApplied++;
         } else {
           const docId = batch[j];
+          failCount++;
           this.pullSkipped++;
-          this.setError(`Binary pull ${docId.slice(0, 40)}: ${(result.reason as Error).message?.slice(0, 80)}`);
+          // Rate-limit error reporting to avoid flooding the UI with 7000+ error events
+          if (failCount <= 3) {
+            this.setError(`Binary pull ${docId.slice(0, 40)}: ${(result.reason as Error).message?.slice(0, 80)}`);
+          }
         }
         this.pullFetched++;
         this.pullCount--;
@@ -556,6 +576,9 @@ export class SyncEngine {
 
       await this.yield();
       if (batchStart % 50 === 0 && batchStart > 0) this.persistState();
+    }
+    if (failCount > 0) {
+      console.warn(`[vault-sync] Binary pull complete with ${failCount} failures out of ${toDownload.length}`);
     }
   }
 
