@@ -78,28 +78,35 @@ export default class VaultSyncPlugin extends Plugin {
       callback: () => this.forceFullSync(),
     });
 
-    // Register vault events for local change tracking
+    // Register vault events for local change tracking.
+    // Convert raw TAbstractFile → VaultEntry before delegating so syncEngine
+    // receives the `kind` discriminator it requires (bug: raw TAbstractFile has
+    // no `kind`, causing all local-change handlers to silently return).
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        this.syncEngine.handleLocalChange(file);
+        const entry = vaultAdapter.getEntryByPath(file.path);
+        if (entry) this.syncEngine.handleLocalChange(entry);
       })
     );
 
     this.registerEvent(
       this.app.vault.on("create", (file) => {
-        this.syncEngine.handleLocalChange(file);
+        const entry = vaultAdapter.getEntryByPath(file.path);
+        if (entry) this.syncEngine.handleLocalChange(entry);
       })
     );
 
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
-        this.syncEngine.handleLocalDelete(file);
+        const entry = vaultAdapter.getEntryByPath(file.path);
+        if (entry) this.syncEngine.handleLocalDelete(entry);
       })
     );
 
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        this.syncEngine.handleLocalRename(file, oldPath);
+        const entry = vaultAdapter.getEntryByPath(file.path);
+        if (entry) this.syncEngine.handleLocalRename(entry, oldPath);
       })
     );
 

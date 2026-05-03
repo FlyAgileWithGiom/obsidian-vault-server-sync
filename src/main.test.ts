@@ -1,6 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { Plugin, Vault } from "./__mocks__/obsidian";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { Plugin, Vault, TFile } from "./__mocks__/obsidian";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
+import { SyncEngine } from "./sync-engine";
 
 // Import the plugin class — obsidian is aliased to the mock via vitest.config.ts
 import VaultSyncPlugin from "./main";
@@ -14,6 +15,9 @@ vi.mock("./sync-engine", () => ({
     stop: vi.fn(),
     clearState: vi.fn(),
     updateSettings: vi.fn(),
+    handleLocalChange: vi.fn(),
+    handleLocalDelete: vi.fn(),
+    handleLocalRename: vi.fn(),
     onStateChange: null,
     onCountsChange: null,
     onError: null,
@@ -26,6 +30,10 @@ vi.mock("./couch-client", () => ({
   CouchClient: vi.fn().mockImplementation(() => ({
     ping: vi.fn().mockResolvedValue(true),
   })),
+}));
+
+vi.mock("./settings-tab", () => ({
+  VaultSyncSettingTab: vi.fn().mockImplementation(() => ({})),
 }));
 
 /**
@@ -43,8 +51,22 @@ function makePlugin(): VaultSyncPlugin {
   // loadData / saveData come from Plugin base; mock them directly
   plugin.loadData = vi.fn().mockResolvedValue({});
   plugin.saveData = vi.fn().mockResolvedValue(undefined);
-  // Initialize settings field (mirrors class field declaration)
+  // Initialize all class fields (Object.create skips class field initializers)
   plugin.settings = { ...DEFAULT_SETTINGS };
+  const p = plugin as unknown as {
+    syncState: string;
+    syncCounts: { pendingPush: number; pendingPull: number };
+    diagnosticsListeners: Set<() => void>;
+    startupTimer: null;
+    ribbonEl: null;
+    statusBarEl: null;
+  };
+  p.syncState = "idle";
+  p.syncCounts = { pendingPush: 0, pendingPull: 0 };
+  p.diagnosticsListeners = new Set();
+  p.startupTimer = null;
+  p.ribbonEl = null;
+  p.statusBarEl = null;
   return plugin;
 }
 
@@ -200,5 +222,63 @@ describe("DEFAULT_SETTINGS.excludePatterns", () => {
 
   it("includes .vault-sync-state.json", () => {
     expect(DEFAULT_SETTINGS.excludePatterns).toContain(".vault-sync-state.json");
+  });
+});
+
+// ---- vault event handler tests ----
+
+/** Minimal DOM element stub — avoids jsdom dependency in node test env */
+function makeEl() {
+  return {
+    dataset: {} as Record<string, string>,
+    setAttribute: vi.fn(),
+    className: "",
+    addClass: vi.fn(),
+    setText: vi.fn(),
+  };
+}
+
+describe("vault event handlers", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("wraps TFile in VaultEntry(kind:'file') before passing to handleLocalChange on vault modify", async () => {
+    const plugin = makePlugin();
+    // vault.getName() is called in onload() to derive the DB name
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => "test-vault";
+    // Register a file so vaultAdapter.getEntryByPath can resolve it
+    plugin.app.vault._addFile("test.md", "hello");
+
+    // Stub DOM methods that onload() calls (node env has no document)
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeEl());
+
+    // Capture vault.on callbacks so we can fire them manually
+    const capturedHandlers: Record<string, (...args: unknown[]) => void> = {};
+    plugin.app.vault.on = vi.fn(
+      (event: string, cb: (...args: unknown[]) => void) => {
+        capturedHandlers[event] = cb;
+        return { unload: () => {} };
+      }
+    ) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    // Get the SyncEngine instance created inside onload()
+    const syncEngineInstance = vi.mocked(SyncEngine).mock.results.at(-1)!.value;
+
+    // Simulate Obsidian firing the "modify" event with a raw TFile (no `kind` property)
+    const tfile = new TFile("test.md");
+    capturedHandlers["modify"]!(tfile);
+
+    // The handler must have converted the TFile to a proper VaultEntry before delegating
+    expect(syncEngineInstance.handleLocalChange).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "file", path: "test.md" })
+    );
   });
 });
