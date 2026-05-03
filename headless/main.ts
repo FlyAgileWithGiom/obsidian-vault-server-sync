@@ -1,6 +1,5 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
-import chokidar from "chokidar";
 import { SyncEngine } from "../src/sync-engine";
 import { FilesystemVaultAdapter } from "./VaultAdapter";
 import { JsonStateStore } from "./StateStore";
@@ -27,6 +26,74 @@ function loadConfig(vaultRoot: string): VaultSyncSettings {
     }, null, 2));
     process.exit(1);
   }
+}
+
+const DEBOUNCE_MS = 100;
+
+export function createWatcher(
+  absVaultRoot: string,
+  excludePatterns: string[],
+  engine: Pick<SyncEngine, "handleLocalChange" | "handleLocalDelete">,
+): fs.FSWatcher {
+  const debounce = new Map<string, ReturnType<typeof setTimeout>>();
+  // macOS FSEvents emits a spurious event with rawFilename === basename(vaultRoot)
+  const vaultRootBasename = path.basename(absVaultRoot);
+
+  const watcher = fs.watch(absVaultRoot, { recursive: true, persistent: true });
+
+  watcher.on("change", (eventType: string, rawFilename: string | Buffer | null) => {
+    if (!rawFilename) return;
+    const rel = typeof rawFilename === "string" ? rawFilename : rawFilename.toString("utf-8");
+
+    // Skip spurious self-referential events for the vault root directory itself
+    if (rel === vaultRootBasename) return;
+
+    const filePath = path.join(absVaultRoot, rel);
+
+    if (excludePatterns.some((p) => rel === p || rel.startsWith(p + path.sep))) return;
+
+    const existing = debounce.get(rel);
+    if (existing) clearTimeout(existing);
+    debounce.set(rel, setTimeout(() => {
+      debounce.delete(rel);
+      handleFsEvent(filePath, rel, engine);
+    }, DEBOUNCE_MS));
+  });
+
+  watcher.on("error", (error: Error) => {
+    console.error("[vault-sync] Watcher error:", error);
+  });
+
+  return watcher;
+}
+
+function handleFsEvent(
+  filePath: string,
+  rel: string,
+  engine: Pick<SyncEngine, "handleLocalChange" | "handleLocalDelete">,
+): void {
+  let stat: ReturnType<typeof fs.statSync> | null = null;
+  try {
+    stat = fs.statSync(filePath);
+  } catch {
+    // Path no longer exists → delete event
+  }
+
+  if (!stat) {
+    const file: VaultEntry = { kind: "file", path: rel, mtime: 0, size: 0 };
+    engine.handleLocalDelete(file);
+    return;
+  }
+
+  if (stat.isDirectory()) return;
+
+  const vaultFile: VaultFile = {
+    kind: "file",
+    path: rel,
+    mtime: stat.mtimeMs,
+    size: stat.size,
+  };
+  engine.handleLocalChange(vaultFile);
 }
 
 async function main(): Promise<void> {
@@ -62,52 +129,7 @@ async function main(): Promise<void> {
     ...settings.excludePatterns,
   ];
 
-  const watcher = chokidar.watch(absVaultRoot, {
-    ignoreInitial: true,
-    persistent: true,
-    ignored: (filePath: string) => {
-      const rel = path.relative(absVaultRoot, filePath);
-      return excludePatterns.some((p) => rel === p || rel.startsWith(p + path.sep));
-    },
-  });
-
-  function toVaultFile(filePath: string): VaultFile {
-    const rel = path.relative(absVaultRoot, filePath);
-    let stat: fs.Stats | null = null;
-    try {
-      stat = fs.statSync(filePath);
-    } catch {
-      // File deleted or unreadable
-    }
-    return {
-      kind: "file",
-      path: rel,
-      mtime: stat ? stat.mtimeMs : 0,
-      size: stat ? stat.size : 0,
-    };
-  }
-
-  watcher.on("add", (filePath) => {
-    engine.handleLocalChange(toVaultFile(filePath));
-  });
-
-  watcher.on("change", (filePath) => {
-    engine.handleLocalChange(toVaultFile(filePath));
-  });
-
-  watcher.on("unlink", (filePath) => {
-    const rel = path.relative(absVaultRoot, filePath);
-    const file: VaultEntry = { kind: "file", path: rel, mtime: 0, size: 0 };
-    engine.handleLocalDelete(file);
-  });
-
-  watcher.on("rename", (oldPath: string, newPath: string) => {
-    if (newPath) {
-      const newFile = toVaultFile(newPath);
-      const oldRel = path.relative(absVaultRoot, oldPath);
-      engine.handleLocalRename(newFile, oldRel);
-    }
-  });
+  const watcher = createWatcher(absVaultRoot, excludePatterns, engine);
 
   // Graceful shutdown
   function shutdown(signal: string): void {
@@ -123,7 +145,15 @@ async function main(): Promise<void> {
   console.log("[vault-sync] Daemon running. Press Ctrl+C to stop.");
 }
 
-main().catch((e) => {
-  console.error("[vault-sync] Fatal error:", e);
-  process.exit(1);
-});
+// Only auto-run when executed as the entry point (dist/headless.js or headless/main.ts),
+// not when imported by the test runner.
+const isEntryPoint =
+  process.argv[1] != null &&
+  (process.argv[1].endsWith("headless.js") || process.argv[1].endsWith("headless/main.ts"));
+
+if (isEntryPoint) {
+  main().catch((e) => {
+    console.error("[vault-sync] Fatal error:", e);
+    process.exit(1);
+  });
+}

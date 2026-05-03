@@ -24,7 +24,13 @@
     <key>SoftResourceLimits</key>
     <dict>
         <key>NumberOfFiles</key>
-        <integer>10240</integer>
+        <integer>32768</integer>
+    </dict>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>32768</integer>
     </dict>
 
     <key>StandardOutPath</key>

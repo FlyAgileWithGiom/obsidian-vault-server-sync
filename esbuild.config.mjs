@@ -43,7 +43,6 @@ const headlessContext = await esbuild.context({
   target: "node18",
   format: "cjs",
   outfile: "dist/headless.js",
-  external: ["chokidar"],
   sourcemap: prod ? false : "inline",
   treeShaking: true,
   minify: prod,
