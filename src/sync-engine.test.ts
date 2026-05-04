@@ -1707,7 +1707,11 @@ describe("SyncEngine", () => {
     });
 
     it("retries putAttachment with fresh rev when 409 conflict occurs", async () => {
-      // Pre-populate revMap so engine skips stub-creation and goes straight to putAttachment
+      // Pre-populate revMap so engine skips stub-creation and goes straight to putAttachment.
+      // File must exist in vault before start() so reconcileLocalDeletes does not tombstone it.
+      const jpegData = new Uint8Array([0xff, 0xd8, 0xff]).buffer;
+      vault._addBinaryFile("images/conflict.jpeg", jpegData);
+
       const conflictStore = new TestStateStore();
       conflictStore.set("vault-sync-revmap", JSON.stringify({ "file/images/conflict.jpeg": "1-stale" }));
       const conflictEngine = makeEngine(settings, vaultAdapter, conflictStore);
@@ -1715,7 +1719,6 @@ describe("SyncEngine", () => {
       conflictEngine.onError = (msg) => errors.push(msg);
       const conflictClient = getClient(conflictEngine);
 
-      const jpegData = new Uint8Array([0xff, 0xd8, 0xff]).buffer;
       conflictClient.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       conflictClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
 
@@ -1733,8 +1736,6 @@ describe("SyncEngine", () => {
       });
 
       await conflictEngine.start();
-
-      vault._addBinaryFile("images/conflict.jpeg", jpegData);
       const file: VaultFile = { kind: "file", path: "images/conflict.jpeg", mtime: Date.now(), size: jpegData.byteLength };
       conflictEngine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 120));
@@ -1757,6 +1758,10 @@ describe("SyncEngine", () => {
     });
 
     it("surfaces error via setError when all binary 409 retries are exhausted", async () => {
+      // File must exist in vault before start() so reconcileLocalDeletes does not tombstone it.
+      const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+      vault._addBinaryFile("images/persistent.jpeg", jpegData);
+
       const retryStore = new TestStateStore();
       retryStore.set("vault-sync-revmap", JSON.stringify({ "file/images/persistent.jpeg": "1-stale" }));
       const retryEngine = makeEngine(settings, vaultAdapter, retryStore);
@@ -1765,7 +1770,6 @@ describe("SyncEngine", () => {
       retryEngine.onError = (msg) => retryErrors.push(msg);
       const retryClient = getClient(retryEngine);
 
-      const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
       retryClient.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
       retryClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
 
@@ -1782,8 +1786,6 @@ describe("SyncEngine", () => {
       });
 
       await retryEngine.start();
-
-      vault._addBinaryFile("images/persistent.jpeg", jpegData);
       const file: VaultFile = { kind: "file", path: "images/persistent.jpeg", mtime: Date.now(), size: jpegData.byteLength };
       retryEngine.handleLocalChange(file);
       await new Promise((r) => setTimeout(r, 120));
@@ -2152,9 +2154,9 @@ describe("SyncEngine", () => {
         ])
       );
 
-      // revMap should be cleared for the tombstoned entry
+      // After tombstoning, the entry moves to tombstoned state (permanent); no known entries remain
       const diagnostics = eng.getDiagnostics();
-      expect(diagnostics.revMapSize).toBe(0);
+      expect(diagnostics.knownRevMapSize).toBe(0);
       eng.stop();
     });
 
@@ -2172,7 +2174,7 @@ describe("SyncEngine", () => {
       await eng.start();
 
       expect(client.delete).toHaveBeenCalledWith("file/notes/gone.md", "1-rev");
-      expect(eng.getDiagnostics().revMapSize).toBe(0);
+      expect(eng.getDiagnostics().knownRevMapSize).toBe(0);
       eng.stop();
     });
 
@@ -2192,7 +2194,7 @@ describe("SyncEngine", () => {
 
       // No error should be emitted for 404
       expect(errors).toHaveLength(0);
-      expect(eng.getDiagnostics().revMapSize).toBe(0);
+      expect(eng.getDiagnostics().knownRevMapSize).toBe(0);
       eng.stop();
     });
 
@@ -2463,6 +2465,217 @@ describe("SyncEngine", () => {
 
       // File MUST be updated — Trou B guard passed because revMap entry exists
       expect(vault._getContent("notes/known-doc.md")).toBe("updated by another device");
+      eng.stop();
+    });
+  });
+
+  describe("revMap state transitions", () => {
+    it("migration shape B: { rev, mtime, lastSeenInFs } loads as known entry", () => {
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/shape-b.md": { rev: "1-rev", mtime: 5000, lastSeenInFs: 12345 },
+      }));
+      // Engine constructor calls loadPersistedState() synchronously — migration happens here
+      const eng = makeEngine(settings, vaultAdapter, store);
+      eng.stop();
+
+      const diag = eng.getDiagnostics();
+      expect(diag.revMapSize).toBe(1);
+      expect(diag.knownRevMapSize).toBe(1);
+      // In-memory revMap is the migration result — accessible via @ts-expect-error
+      // @ts-expect-error -- accessing private for test
+      const entry = eng.revMap["file/notes/shape-b.md"];
+      expect(entry).toMatchObject({ state: "known", rev: "1-rev", mtime: 5000 });
+    });
+
+    it("migration shape A: string rev loads as known entry with mtime: 0", () => {
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/shape-a.md": "1-rev",
+      }));
+      // Engine constructor calls loadPersistedState() synchronously — migration happens here
+      const eng = makeEngine(settings, vaultAdapter, store);
+      eng.stop();
+
+      const diag = eng.getDiagnostics();
+      expect(diag.revMapSize).toBe(1);
+      expect(diag.knownRevMapSize).toBe(1);
+      // @ts-expect-error -- accessing private for test
+      const entry = eng.revMap["file/notes/shape-a.md"];
+      expect(entry).toMatchObject({ state: "known", rev: "1-rev", mtime: 0 });
+    });
+
+    it("local delete known → tombstoned with tombstonedAt set", async () => {
+      vault._addFile("notes/to-delete.md", "content", 1000);
+
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/to-delete.md": { state: "known", rev: "1-r", mtime: 1000 },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      // Remote has the doc at same rev (no pull needed, no reconcile delete)
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/to-delete.md", key: "file/notes/to-delete.md", value: { rev: "1-r" } }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      client.delete = vi.fn().mockResolvedValue({ ok: true, id: "file/notes/to-delete.md", rev: "2-tomb" });
+
+      await eng.start();
+
+      // Now trigger the local delete (simulates user deleting the file)
+      const file: VaultEntry = { kind: "file", path: "notes/to-delete.md", mtime: 1000, size: 10 };
+      await eng.handleLocalDelete(file);
+
+      const saved = JSON.parse(store.get("vault-sync-revmap") ?? "{}");
+      expect(saved["file/notes/to-delete.md"]).toMatchObject({
+        state: "tombstoned",
+        rev: "2-tomb",
+      });
+      expect(typeof saved["file/notes/to-delete.md"].tombstonedAt).toBe("number");
+      eng.stop();
+    });
+
+    it("remote delete known → tombstoned", async () => {
+      vault._addFile("notes/remote-del.md", "content", 1000);
+
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/remote-del.md": { state: "known", rev: "1-r", mtime: 1000 },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      // Remote allDocs returns empty — the doc was deleted remotely
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      const saved = JSON.parse(store.get("vault-sync-revmap") ?? "{}");
+      expect(saved["file/notes/remote-del.md"]).toMatchObject({ state: "tombstoned" });
+      // File should be deleted from vault
+      expect(vault.getAbstractFileByPath("notes/remote-del.md")).toBeNull();
+      eng.stop();
+    });
+
+    it("tombstone permanence regression: handleLocalChange on tombstoned path → no push", async () => {
+      // A doc is tombstoned. A local change event fires (e.g., FS race condition).
+      // The push must NOT happen — tombstone is permanent until forceFullSync.
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/tombstoned.md": { state: "tombstoned", rev: "2-tomb", tombstonedAt: Date.now() },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+      client.put = vi.fn().mockResolvedValue({ ok: true, id: "file/notes/tombstoned.md", rev: "3-new" });
+
+      await eng.start();
+
+      vault._addFile("notes/tombstoned.md", "resurrected content", Date.now());
+      const file: VaultEntry = { kind: "file", path: "notes/tombstoned.md", mtime: Date.now(), size: 20 };
+      eng.handleLocalChange(file);
+      await new Promise((r) => setTimeout(r, 120));
+
+      // put must NOT have been called — tombstone blocks push
+      expect(client.put).not.toHaveBeenCalled();
+      // Entry must remain tombstoned — permanence guarantee
+      const saved = JSON.parse(store.get("vault-sync-revmap") ?? "{}");
+      expect(saved["file/notes/tombstoned.md"]).toMatchObject({ state: "tombstoned" });
+      eng.stop();
+    });
+
+    it("first observation via changes feed → orphan state (no FS write)", async () => {
+      // No revMap entry and no local file — doc appears in changes feed for first time.
+      // Expected: recorded as orphan, no file written to vault.
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes
+        .mockResolvedValueOnce({ last_seq: "1", results: [] })
+        .mockResolvedValueOnce({
+          last_seq: "2",
+          results: [{
+            seq: "2",
+            id: "file/notes/agent-doc.md",
+            changes: [{ rev: "1-a" }],
+            deleted: false,
+            doc: { _id: "file/notes/agent-doc.md", _rev: "1-a", content: "agent content", mtime: 1000 },
+          }],
+        });
+
+      await engine.start();
+      // @ts-expect-error -- accessing private for test
+      await engine.pollChanges();
+
+      // File must NOT be in vault (Trou B guard via orphan state)
+      expect(vault.getAbstractFileByPath("notes/agent-doc.md")).toBeNull();
+
+      // Entry must be recorded as orphan
+      const diag = engine.getDiagnostics();
+      expect(diag.knownRevMapSize).toBe(0);
+      expect(diag.revMapSize).toBe(1);
+    });
+
+    it("binary orphan: no attachment in metadata → state: 'orphan', no mtime field", async () => {
+      // A binary doc exists in DB but has no attachment (e.g., stub only).
+      // Expected: recorded as orphan with no mtime field.
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify({
+        "file/images/stub.png": { state: "known", rev: "0-old", mtime: 0 },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      client.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/stub.png", key: "file/images/stub.png", value: { rev: "1-new" } }],
+      });
+      // allDocsByKeys returns doc without _attachments — binary orphan
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: "file/images/stub.png",
+          key: "file/images/stub.png",
+          value: { rev: "1-new" },
+          doc: { _id: "file/images/stub.png", _rev: "1-new", content: null, mtime: 0 },
+        }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      const saved = JSON.parse(store.get("vault-sync-revmap") ?? "{}");
+      const entry = saved["file/images/stub.png"];
+      expect(entry).toMatchObject({ state: "orphan", rev: "1-new" });
+      expect("mtime" in entry).toBe(false);
+      eng.stop();
+    });
+
+    it("reconcileLocalDeletes skips tombstoned entries", async () => {
+      // File is already tombstoned (no FS presence expected). reconcileLocalDeletes must
+      // NOT try to delete it again on CouchDB — tombstone is permanent.
+      const store = new TestStateStore();
+      store.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/already-tombstoned.md": { state: "tombstoned", rev: "2-tomb", tombstonedAt: Date.now() },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, store);
+      const client = getClient(eng);
+
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await eng.start();
+
+      // bulkDocs must not have been called with a _deleted doc for the tombstoned entry
+      const deleteCalls = (client.bulkDocs.mock.calls as unknown[][]).filter(
+        (args) => Array.isArray(args[0]) && (args[0] as CouchDoc[]).some((d: CouchDoc) => d._deleted)
+      );
+      expect(deleteCalls).toHaveLength(0);
       eng.stop();
     });
   });

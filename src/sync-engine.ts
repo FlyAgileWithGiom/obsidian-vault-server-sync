@@ -134,10 +134,12 @@ export class SyncEngine {
   }
 
   getDiagnostics(): SyncDiagnostics {
+    const entries = Object.values(this.revMap);
     return {
       running: this.running,
       state: this.currentState,
-      revMapSize: Object.keys(this.revMap).length,
+      revMapSize: entries.length,
+      knownRevMapSize: entries.filter((e) => e.state === "known").length,
       lastSeq: this.lastSeq,
       pullProgress: this.pullTotal > 0
         ? { fetched: this.pullFetched, total: this.pullTotal }
@@ -167,15 +169,27 @@ export class SyncEngine {
     try {
       const stored = this.store.get(REVMAP_KEY);
       if (stored) {
-        const raw = JSON.parse(stored) as Record<string, RevMapEntry | string>;
-        // Migrate legacy string-valued entries (old format: { docId: revString })
-        // to the new RevMapEntry shape. mtime:0 means "unknown, treat as changed" for Trou A.
-        // Expected one-time burst on first run after migration: 409→resolveConflict handles
-        // redundant pushes when file content is identical.
+        const raw = JSON.parse(stored) as Record<string, unknown>;
+        // Migrate stored entries from any prior format:
+        //   Shape A (legacy): string  "1-rev"          → { state: "known", rev, mtime: 0 }
+        //   Shape B (previous): { rev, mtime, lastSeenInFs }   → { state: "known", rev, mtime }
+        //   Shape C (current): { state, rev, ... }     → pass through (idempotent)
+        // mtime:0 for migrated entries means "unknown, treat as changed" (Trou A).
+        const migrated: RevMap = {};
         for (const [id, val] of Object.entries(raw)) {
-          if (typeof val === "string") raw[id] = { rev: val, mtime: 0, lastSeenInFs: 0 };
+          if (typeof val === "string") {
+            // Shape A
+            migrated[id] = { state: "known", rev: val, mtime: 0 };
+          } else if (val !== null && typeof val === "object" && !("state" in val)) {
+            // Shape B
+            const b = val as { rev: string; mtime: number };
+            migrated[id] = { state: "known", rev: b.rev, mtime: b.mtime ?? 0 };
+          } else {
+            // Shape C — already a discriminated union entry
+            migrated[id] = val as RevMapEntry;
+          }
         }
-        this.revMap = raw as RevMap;
+        this.revMap = migrated;
       }
       const seq = this.store.get(SEQ_KEY);
       if (seq) this.lastSeq = JSON.parse(seq);
@@ -193,6 +207,11 @@ export class SyncEngine {
     } catch {
       // Store full or unavailable, non-critical
     }
+  }
+
+  /** Transition any entry to tombstoned state. Tombstone is permanent until forceFullSync(). */
+  private markTombstoned(docId: string, rev: string): void {
+    this.revMap[docId] = { state: "tombstoned", rev, tombstonedAt: Date.now() };
   }
 
   // --- Lifecycle ---
@@ -294,13 +313,15 @@ export class SyncEngine {
   private async reconcileLocalDeletes(remoteRevs: Map<string, string>): Promise<void> {
     const toDelete: { docId: string; rev: string }[] = [];
 
-    for (const docId of Object.keys(this.revMap)) {
+    for (const [docId, entry] of Object.entries(this.revMap)) {
+      // Skip already-tombstoned entries — they are permanently removed from FS
+      if (entry.state === "tombstoned") continue;
       const path = docIdToPath(docId);
       const normalizedPath = this.normalizePath(path);
       if (this.isExcluded(normalizedPath)) continue;
-      const entry = this.vault.getEntryByPath(normalizedPath);
-      if (entry !== null) continue; // File still present — nothing to do
-      toDelete.push({ docId, rev: this.revMap[docId].rev });
+      const fsEntry = this.vault.getEntryByPath(normalizedPath);
+      if (fsEntry !== null) continue; // File still present — nothing to do
+      toDelete.push({ docId, rev: entry.rev });
     }
 
     if (toDelete.length === 0) return;
@@ -323,8 +344,8 @@ export class SyncEngine {
         try {
           const results = await this.client.bulkDocs(batch);
           for (const result of results) {
-            if (result.ok) {
-              delete this.revMap[result.id];
+            if (result.ok && result.rev) {
+              this.markTombstoned(result.id, result.rev);
               remoteRevs.delete(result.id);
             } else if (result.error) {
               // Row-level error — skip silently, will retry next sync
@@ -335,14 +356,14 @@ export class SyncEngine {
           for (const { docId, rev } of chunk) {
             try {
               const result = await this.client.delete(docId, rev);
-              if (result.ok) {
-                delete this.revMap[docId];
+              if (result.ok && result.rev) {
+                this.markTombstoned(docId, result.rev);
                 remoteRevs.delete(docId);
               }
             } catch (e) {
               if (e instanceof CouchError && e.status === 404) {
-                // Already gone — clear local state (mirrors handleLocalDelete lines 836-838)
-                delete this.revMap[docId];
+                // Already gone — tombstone with prior rev (best available)
+                this.markTombstoned(docId, rev);
                 remoteRevs.delete(docId);
               } else {
                 this.setError(`reconcileLocalDeletes: failed to delete ${docId}: ${(e as Error).message}`);
@@ -404,8 +425,17 @@ export class SyncEngine {
       if (remoteRevs.has(docId)) {
         // Trou A fix: skip push only when file has not changed since last sync.
         // mtime:0 means migration default (unknown mtime) — treat as changed → push.
-        const known = this.revMap[docId];
-        if (known && known.mtime > 0 && file.mtime <= known.mtime) {
+        const entry = this.revMap[docId];
+        // Tombstoned entries: the file was deleted locally; delete remotely instead of pushing
+        if (entry?.state === "tombstoned") {
+          await this.handleRemoteDelete(docId);
+          continue;
+        }
+        // Orphan entries: skip push (no FS file to push from)
+        if (entry?.state === "orphan") {
+          continue;
+        }
+        if (entry?.state === "known" && entry.mtime > 0 && file.mtime <= entry.mtime) {
           continue; // Not changed since last sync
         }
         // Fall through: file modified (or mtime unknown after migration) → push it.
@@ -461,7 +491,7 @@ export class SyncEngine {
       for (const result of results) {
         if (result.ok && result.rev) {
           const localDoc = batch.find((d) => d._id === result.id);
-          this.revMap[result.id] = { rev: result.rev, mtime: localDoc?.mtime ?? 0, lastSeenInFs: Date.now() };
+          this.revMap[result.id] = { state: "known", rev: result.rev, mtime: localDoc?.mtime ?? 0 };
         } else if (result.error === "conflict") {
           const localDoc = batch.find((d) => d._id === result.id);
           if (localDoc) {
@@ -476,7 +506,7 @@ export class SyncEngine {
         try {
           const result = await this.client.put(doc);
           if (result.ok && result.rev) {
-            this.revMap[result.id] = { rev: result.rev, mtime: doc.mtime ?? 0, lastSeenInFs: Date.now() };
+            this.revMap[result.id] = { state: "known", rev: result.rev, mtime: doc.mtime ?? 0 };
           }
         } catch (putErr) {
           if (putErr instanceof CouchError && putErr.status === 409) {
@@ -521,10 +551,13 @@ export class SyncEngine {
     for (const [docId, rev] of remoteRevs) {
       if (docId.startsWith("_design/")) continue;
       if (this.revMap[docId]?.rev === rev) continue;
+      const entry = this.revMap[docId];
       // Trou B: doc exists in DB but has no revMap entry → agent-created doc, skip pull.
       // Without a revMap entry we have no evidence this device ever synced this doc to FS.
       // First-device onboarding (empty state): seed via rsync or forceFullSync({ bypassOrphanGuard: true }).
-      if (!this.revMap[docId] && !opts.bypassOrphanGuard) continue;
+      if (!entry && !opts.bypassOrphanGuard) continue;
+      // Skip tombstoned and orphan entries — they have no FS representation to pull to.
+      if (entry?.state === "tombstoned" || entry?.state === "orphan") continue;
       if (this.isBinaryDoc(docId)) {
         binaryToPull.push(docId);
       } else {
@@ -555,10 +588,12 @@ export class SyncEngine {
       }
     }
 
-    // Detect remote deletions: files in revMap but not in remote index
+    // Detect remote deletions: only known entries not present in remote index trigger handleRemoteDelete.
+    // Tombstoned entries are already removed from remote; orphans have no FS file to delete.
     this.applyingRemote = true;
     try {
-      for (const docId of Object.keys(this.revMap)) {
+      for (const [docId, entry] of Object.entries(this.revMap)) {
+        if (entry.state !== "known") continue;
         if (!remoteRevs.has(docId)) {
           await this.handleRemoteDelete(docId);
         }
@@ -599,7 +634,7 @@ export class SyncEngine {
           try {
             await this.applyRemoteDoc(doc);
             if (doc._rev) {
-              this.revMap[doc._id] = { rev: doc._rev, mtime: doc.mtime ?? 0, lastSeenInFs: Date.now() };
+              this.revMap[doc._id] = { state: "known", rev: doc._rev, mtime: doc.mtime ?? 0 };
               this.pullApplied++;
             }
           } catch (e) {
@@ -648,10 +683,10 @@ export class SyncEngine {
     const toDownload: string[] = [];
     for (const docId of docIds) {
       if (!hasAttachment.has(docId)) {
-        // Orphan: record rev so we don't re-fetch on next sync.
-        // mtime:0 and lastSeenInFs:0 because no FS file was written.
+        // Binary orphan: doc exists in DB but has no attachment data.
+        // Record as orphan state — no mtime field because no FS file was written.
         const rev = remoteRevs.get(docId);
-        if (rev) this.revMap[docId] = { rev, mtime: 0, lastSeenInFs: 0 };
+        if (rev) this.revMap[docId] = { state: "orphan", rev };
         this.pullSkipped++;
         this.pullFetched++;
         this.pullCount--;
@@ -690,9 +725,8 @@ export class SyncEngine {
           const { docId, data } = result.value;
           await this.applyRemoteBinary(docId, data);
           const rev = remoteRevs.get(docId);
-          // mtime not easily available here (binary doc metadata not fetched with content);
-          // use 0 as placeholder. lastSeenInFs set because file was written to FS.
-          if (rev) this.revMap[docId] = { rev, mtime: 0, lastSeenInFs: Date.now() };
+          // mtime not easily available here (binary doc metadata not fetched with content); use 0.
+          if (rev) this.revMap[docId] = { state: "known", rev, mtime: 0 };
           this.pullApplied++;
         } else {
           const docId = batch[j];
@@ -799,16 +833,34 @@ export class SyncEngine {
       for (const change of changes) {
         if (change.id.startsWith("_design/")) continue;
 
+        const newRev = change.changes[0]?.rev ?? "";
+        const existing = this.revMap[change.id];
+
         if (change.deleted) {
-          await this.handleRemoteDelete(change.id);
+          // Skip tombstoned entries — already recorded as deleted
+          if (existing?.state !== "tombstoned") {
+            await this.handleRemoteDelete(change.id);
+          }
         } else {
-          // Trou B guard for incremental sync: skip agent-created docs (no revMap entry).
-          // This mirrors the pullAllRemote guard and prevents writing arbitrary DB content to FS.
-          if (!this.revMap[change.id]) {
+          const entryState = existing?.state;
+
+          if (entryState === "tombstoned") {
+            // Tombstoned path: do not apply content. Just update the stored rev.
+            if (newRev) this.revMap[change.id] = { state: "tombstoned", rev: newRev, tombstonedAt: (existing as { tombstonedAt: number }).tombstonedAt };
             this.pullCount--;
             this.emitCounts();
             continue;
           }
+
+          if (!existing) {
+            // First observation via changes feed — record as orphan (Trou B guard: no FS write).
+            if (newRev) this.revMap[change.id] = { state: "orphan", rev: newRev };
+            this.pullCount--;
+            this.emitCounts();
+            continue;
+          }
+
+          // Known or orphan entry: apply content and transition to known
           if (change.doc) {
             if (this.isBinaryDoc(change.id)) {
               const data = await this.client.getAttachment(change.id, ATTACHMENT_NAME, BINARY_PULL_TIMEOUT_MS);
@@ -817,17 +869,17 @@ export class SyncEngine {
               await this.applyRemoteDoc(change.doc);
             }
           }
+
+          // Transition to known after successful apply
+          if (newRev) {
+            this.revMap[change.id] = {
+              state: "known",
+              rev: newRev,
+              mtime: change.doc?.mtime ?? (existing.state === "known" ? existing.mtime : 0),
+            };
+          }
         }
 
-        // Update rev map
-        if (change.changes.length > 0) {
-          const existing = this.revMap[change.id];
-          this.revMap[change.id] = {
-            rev: change.changes[0].rev,
-            mtime: change.doc?.mtime ?? existing?.mtime ?? 0,
-            lastSeenInFs: change.deleted ? (existing?.lastSeenInFs ?? 0) : Date.now(),
-          };
-        }
         this.pullCount--;
         this.emitCounts();
       }
@@ -896,7 +948,8 @@ export class SyncEngine {
       await this.vault.deleteFile(file);
       await this.cleanupEmptyParents(normalized);
     }
-    delete this.revMap[docId];
+    const existing = this.revMap[docId];
+    this.markTombstoned(docId, existing?.rev ?? "");
   }
 
   private async cleanupEmptyParents(filePath: string): Promise<void> {
@@ -969,12 +1022,12 @@ export class SyncEngine {
     try {
       const result = await this.client.delete(docId, rev);
       if (result.ok) {
-        delete this.revMap[docId];
+        this.markTombstoned(docId, result.rev ?? rev);
         this.persistState();
       }
     } catch (e) {
       if (e instanceof CouchError && e.status === 404) {
-        delete this.revMap[docId];
+        this.markTombstoned(docId, rev);
         this.persistState();
       } else {
         this.setError(`Failed to delete remote ${file.path}: ${(e as Error).message}`);
@@ -992,10 +1045,11 @@ export class SyncEngine {
     const oldRev = this.revMap[oldDocId]?.rev;
     if (oldRev) {
       try {
-        await this.client.delete(oldDocId, oldRev);
-        delete this.revMap[oldDocId];
+        const result = await this.client.delete(oldDocId, oldRev);
+        this.markTombstoned(oldDocId, result.rev ?? oldRev);
       } catch {
-        // Best effort delete of old path
+        // Best effort delete of old path — tombstone with prior rev
+        this.markTombstoned(oldDocId, oldRev);
       }
     }
 
@@ -1033,6 +1087,13 @@ export class SyncEngine {
   private async pushTextFile(file: VaultFile): Promise<void> {
     try {
       const docId = pathToDocId(file.path);
+
+      // Tombstoned path: do not push content; instead propagate the delete to FS
+      if (this.revMap[docId]?.state === "tombstoned") {
+        await this.handleRemoteDelete(docId);
+        return;
+      }
+
       const content = await this.vault.readText(file);
       const doc: CouchDoc = {
         _id: docId,
@@ -1062,7 +1123,7 @@ export class SyncEngine {
       try {
         const result = await this.client.put(doc);
         if (result.ok && result.rev) {
-          this.revMap[docId] = { rev: result.rev, mtime: file.mtime, lastSeenInFs: Date.now() };
+          this.revMap[docId] = { state: "known", rev: result.rev, mtime: file.mtime };
           this.persistState();
         }
       } catch (e) {
@@ -1080,6 +1141,13 @@ export class SyncEngine {
   private async pushBinaryFile(file: VaultFile): Promise<void> {
     try {
       const docId = pathToDocId(file.path);
+
+      // Tombstoned path: do not push content; instead propagate the delete to FS
+      if (this.revMap[docId]?.state === "tombstoned") {
+        await this.handleRemoteDelete(docId);
+        return;
+      }
+
       const data = await this.vault.readBinary(file);
       const contentType = contentTypeForPath(file.path);
 
@@ -1099,7 +1167,7 @@ export class SyncEngine {
           // Doc not found (missing, not deleted) — create stub doc
           const stubResult = await this.client.put({ _id: docId, content: null, mtime: file.mtime });
           rev = stubResult.rev ?? "";
-          if (stubResult.rev) this.revMap[docId] = { rev: stubResult.rev, mtime: file.mtime, lastSeenInFs: Date.now() };
+          if (stubResult.rev) this.revMap[docId] = { state: "known", rev: stubResult.rev, mtime: file.mtime };
         }
       }
 
@@ -1109,7 +1177,7 @@ export class SyncEngine {
         try {
           const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, attachmentRev, data, contentType);
           if (result.ok && result.rev) {
-            this.revMap[docId] = { rev: result.rev, mtime: file.mtime, lastSeenInFs: Date.now() };
+            this.revMap[docId] = { state: "known", rev: result.rev, mtime: file.mtime };
             this.persistState();
           }
           break;
@@ -1122,7 +1190,12 @@ export class SyncEngine {
             // Rev became stale between stub PUT and attachment PUT — refetch and retry
             const fresh = await this.client.get(docId);
             attachmentRev = fresh._rev ?? "";
-            this.revMap[docId] = { rev: attachmentRev, mtime: this.revMap[docId]?.mtime ?? 0, lastSeenInFs: this.revMap[docId]?.lastSeenInFs ?? 0 };
+            const curEntry: RevMapEntry | undefined = this.revMap[docId];
+            this.revMap[docId] = {
+              state: "known",
+              rev: attachmentRev,
+              mtime: curEntry?.state === "known" ? curEntry.mtime : 0,
+            };
           } else {
             throw e;
           }
@@ -1147,9 +1220,10 @@ export class SyncEngine {
     const MAX_RETRIES = 3;
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       const remote = await this.client.get(docId);
-      // Preserve existing mtime/lastSeenInFs on initial fetch (rev updated after resolution)
+      // Update rev on initial fetch; keep existing mtime until resolution determines the winner
       const existing = this.revMap[docId];
-      this.revMap[docId] = { rev: remote._rev!, mtime: remote.mtime ?? existing?.mtime ?? 0, lastSeenInFs: existing?.lastSeenInFs ?? 0 };
+      const existingMtime = existing?.state === "known" ? existing.mtime : 0;
+      this.revMap[docId] = { state: "known", rev: remote._rev!, mtime: remote.mtime ?? existingMtime };
 
       if (remote.content === localContent) {
         // Same content, no real conflict - just update rev
@@ -1168,7 +1242,7 @@ export class SyncEngine {
         try {
           const result = await this.client.put(doc);
           if (result.ok && result.rev) {
-            this.revMap[docId] = { rev: result.rev, mtime: localMtime, lastSeenInFs: Date.now() };
+            this.revMap[docId] = { state: "known", rev: result.rev, mtime: localMtime };
           }
           this.persistState();
           return;
@@ -1182,11 +1256,11 @@ export class SyncEngine {
       } else {
         // Remote is newer - apply remote content locally
         const normalized = this.normalizePath(docIdToPath(docId));
-        const existing = this.vault.getEntryByPath(normalized);
-        if (existing && existing.kind === "file" && typeof remote.content === "string") {
+        const existingFile = this.vault.getEntryByPath(normalized);
+        if (existingFile && existingFile.kind === "file" && typeof remote.content === "string") {
           this.applyingRemote = true;
           try {
-            await this.vault.modifyText(existing, remote.content);
+            await this.vault.modifyText(existingFile, remote.content);
           } finally {
             this.applyingRemote = false;
           }

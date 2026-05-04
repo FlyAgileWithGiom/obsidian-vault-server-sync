@@ -33,13 +33,12 @@ export interface SyncCounts {
   pendingPull: number;
 }
 
-export interface RevMapEntry {
-  rev: string;
-  mtime: number;        // file.mtime at last successful push/pull; 0 until first sync
-  lastSeenInFs: number; // timestamp (ms) of last confirmed FS presence; 0 if never seen
-}
+export type RevMapEntry =
+  | { state: "known"; rev: string; mtime: number }
+  | { state: "tombstoned"; rev: string; tombstonedAt: number }
+  | { state: "orphan"; rev: string };
 
-/** Tracks known revision and mtime for each doc to detect remote changes and skip unchanged files */
+/** Tracks known revision and state for each doc to detect remote changes and skip unchanged files */
 export interface RevMap {
   [docId: string]: RevMapEntry;
 }
@@ -96,7 +95,8 @@ export interface CouchAllDocsResult {
 export interface SyncDiagnostics {
   running: boolean;
   state: SyncState;
-  revMapSize: number;
+  revMapSize: number;       // total entries (known + tombstoned + orphan)
+  knownRevMapSize: number;  // entries with state: "known" only
   lastSeq: string | number;
   pullProgress: { fetched: number; total: number } | null;
   pullSkipped: number;
