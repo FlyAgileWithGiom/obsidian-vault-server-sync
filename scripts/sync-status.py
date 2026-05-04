@@ -13,7 +13,18 @@ import json
 import os
 import subprocess
 import sys
+import unicodedata
 from datetime import datetime, timezone
+
+
+def nfc(s: str) -> str:
+    """Normalize string to NFC for comparison.
+
+    macOS HFS+/APFS stores filenames in NFD; CouchDB stores docIds in NFC
+    (since mac-vault-sync 1.5.2). Without normalizing, the same logical path
+    appears as both FS-only AND DB-only orphan in the diff.
+    """
+    return unicodedata.normalize("NFC", s)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -182,12 +193,21 @@ def print_report(vault: str) -> None:
     all_revmap_ids = known_ids | tombstoned_ids | orphan_ids
 
     fs_files = list_fs_files(vault, exclude_patterns)
-    fs_ids = {f"file/{p}" for p in fs_files}
+    # NFC-normalize FS ids so comparison with DB (which stores NFC) is accurate
+    # on macOS where filenames are stored in NFD on disk.
+    fs_ids = {nfc(f"file/{p}") for p in fs_files}
 
     db_result = query_db(config)
     db_rows = db_result.get("rows", [])
-    db_doc_ids = {r["id"] for r in db_rows if not r["id"].startswith("_")}
-    db_live_ids = {r["id"] for r in db_rows if not r["id"].startswith("_") and not r.get("value", {}).get("deleted")}
+    db_doc_ids = {nfc(r["id"]) for r in db_rows if not r["id"].startswith("_")}
+    db_live_ids = {nfc(r["id"]) for r in db_rows if not r["id"].startswith("_") and not r.get("value", {}).get("deleted")}
+
+    # NFC-normalize revMap ids too — they may be in either form depending on
+    # when the entry was written (pre/post 1.5.2). Comparison must be NFC.
+    known_ids = {nfc(k) for k in known_ids}
+    tombstoned_ids = {nfc(k) for k in tombstoned_ids}
+    orphan_ids = {nfc(k) for k in orphan_ids}
+    all_revmap_ids = known_ids | tombstoned_ids | orphan_ids
 
     # Divergence
     fs_only = sorted(fs_ids - db_doc_ids)
