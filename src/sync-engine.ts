@@ -47,14 +47,22 @@ function contentTypeForPath(path: string): string {
   return CONTENT_TYPE_MAP[ext] ?? "application/octet-stream";
 }
 
-/** Convert a vault file path to a CouchDB doc ID */
+/**
+ * Convert a vault file path to a CouchDB doc ID.
+ * Always produces NFC-normalized output so the same logical path always
+ * yields the same docId regardless of the source platform's encoding
+ * (macOS HFS+/APFS stores filenames in NFD, most other platforms NFC).
+ * Without this, "Productivité" pushed from Mac (NFD) and "Productivité"
+ * pushed from iOS (NFC) become two distinct docs.
+ */
 function pathToDocId(path: string): string {
-  return `${DOC_PREFIX}${path}`;
+  return `${DOC_PREFIX}${path.normalize("NFC")}`;
 }
 
-/** Convert a CouchDB doc ID back to a vault file path */
+/** Convert a CouchDB doc ID back to a vault file path (NFC-normalized) */
 function docIdToPath(docId: string): string {
-  return docId.startsWith(DOC_PREFIX) ? docId.slice(DOC_PREFIX.length) : docId;
+  const raw = docId.startsWith(DOC_PREFIX) ? docId.slice(DOC_PREFIX.length) : docId;
+  return raw.normalize("NFC");
 }
 
 /**
