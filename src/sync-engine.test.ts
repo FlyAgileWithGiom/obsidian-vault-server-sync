@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { SyncEngine } from "./sync-engine";
+import { SyncEngine, lwwWinner } from "./sync-engine";
 import { CouchClient } from "./couch-client";
 import { Vault, TFile } from "./__mocks__/obsidian";
 import type {
@@ -2678,5 +2678,35 @@ describe("SyncEngine", () => {
       expect(deleteCalls).toHaveLength(0);
       eng.stop();
     });
+  });
+});
+
+describe("lwwWinner", () => {
+  it("returns local when mtimes are equal (already have it, no need to fetch)", () => {
+    expect(lwwWinner(1000, 1000)).toBe("local");
+  });
+
+  it("returns local when local mtime is newer", () => {
+    expect(lwwWinner(2000, 1000)).toBe("local");
+  });
+
+  it("returns remote when remote mtime is newer", () => {
+    expect(lwwWinner(1000, 2000)).toBe("remote");
+  });
+
+  it("returns local when remote mtime is 0 (unknown) and local is known", () => {
+    // mtime 0 means unknown/missing; a known local mtime wins
+    expect(lwwWinner(1000, 0)).toBe("local");
+  });
+
+  it("returns local when both mtimes are 0 (both unknown)", () => {
+    // Equal, so local wins by default
+    expect(lwwWinner(0, 0)).toBe("local");
+  });
+
+  it("handles very large mtime values without overflow concerns", () => {
+    const farFuture = Number.MAX_SAFE_INTEGER;
+    expect(lwwWinner(farFuture, farFuture - 1)).toBe("local");
+    expect(lwwWinner(farFuture - 1, farFuture)).toBe("remote");
   });
 });

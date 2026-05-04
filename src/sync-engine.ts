@@ -1,3 +1,54 @@
+/**
+ * SYNC ENGINE — Ownership rules and design contract
+ * ====================================================
+ *
+ * This is a point-to-point sync between two endpoints:
+ *   - LOCAL  : the vault filesystem (Mac via headless daemon, OR Obsidian app)
+ *   - REMOTE : a CouchDB database (vault-{slug})
+ *
+ * There is exactly ONE sync engine instance per LOCAL endpoint. Other clients
+ * (iOS plugin, agents writing directly to CouchDB via vault-server-mcp) are
+ * not modeled here — they are seen as remote changes via the changes feed.
+ *
+ * STATE MODEL — RevMap entries are a discriminated union (see types.ts):
+ *
+ *   known       Doc exists on both sides, last sync agreed on rev + mtime.
+ *   tombstoned  Doc was deleted (locally or remotely) and confirmed in DB.
+ *               PERMANENT until forceFullSync() — no phase resurrects it.
+ *   orphan      Doc exists only in DB (e.g. agent-created), never observed
+ *               on FS. Never auto-pulled to FS unless forceFullSync().
+ *
+ * STATE TRANSITIONS:
+ *   absent      → known       on first push or pull of a new file
+ *   absent      → orphan      on changes-feed observation of unknown DB doc
+ *   absent      → orphan      on binary metadata fetch with no attachment
+ *   orphan      → known       on explicit pull (forceFullSync, or rev change)
+ *   known       → tombstoned  on local delete (chokidar / reconcile)
+ *   known       → tombstoned  on remote delete (changes feed _deleted)
+ *   tombstoned  → tombstoned  permanent until forceFullSync clears state
+ *
+ * OWNERSHIP RULES per scenario:
+ *
+ *   File modified locally   → LOCAL is canonical, push to REMOTE
+ *   File modified remotely  → REMOTE is canonical, pull to LOCAL
+ *   Both modified (rev/mtime conflict) → LWW by mtime (lwwWinner function)
+ *   File deleted locally    → propagate tombstone to REMOTE
+ *   File deleted remotely   → delete from LOCAL (handleRemoteDelete)
+ *   Doc in DB, never on FS  → orphan, do NOT pull (agent-first workflow)
+ *   Doc tombstoned           → permanent, no phase resurrects it
+ *
+ * PHASES of fullSync (in strict order):
+ *   1. reconcileLocalDeletes : known entries with no FS file → tombstoned
+ *   2. pushAllLocal          : push files to DB, skip tombstoned/orphan
+ *   3. pullAllRemote         : pull rev-mismatched known entries from DB
+ *   4. pullBinaryDocs        : fetch binary attachments
+ *   5. polling (changes feed): incremental updates after fullSync
+ *
+ * The architecture review (planning/sync-architecture-review-2026-05-04.md)
+ * documents the rationale and the bugs that this design dissolves
+ * (Trous A/B/C/D and S14/S15).
+ */
+
 import { CouchClient, CouchError } from "./couch-client";
 import type {
   VaultSyncSettings,
@@ -58,6 +109,16 @@ function contentTypeForPath(path: string): string {
  */
 function pathToDocId(path: string): string {
   return `${DOC_PREFIX}${path.normalize("NFC")}`;
+}
+
+/**
+ * Last-write-wins decision by mtime. Returns "local" or "remote" indicating
+ * which side wins the conflict. Equal mtime defaults to "local" (we already
+ * have it, no need to fetch). Zero mtime (unknown) is treated as the oldest
+ * possible value, so a non-zero mtime on the other side wins.
+ */
+export function lwwWinner(localMtime: number, remoteMtime: number): "local" | "remote" {
+  return localMtime >= remoteMtime ? "local" : "remote";
 }
 
 /** Convert a CouchDB doc ID back to a vault file path (NFC-normalized) */
@@ -911,7 +972,7 @@ export class SyncEngine {
       // When mtime is missing/0 (external tool update), fall back to content comparison.
       const remoteMtime = doc.mtime || 0;
       const localMtime = existing.mtime || 0;
-      if (remoteMtime > localMtime) {
+      if (lwwWinner(localMtime, remoteMtime) === "remote") {
         await this.vault.modifyText(existing, doc.content);
       } else if (!remoteMtime || remoteMtime === localMtime) {
         // No mtime or same mtime: apply if content actually differs
@@ -1231,7 +1292,7 @@ export class SyncEngine {
         return;
       }
 
-      if (localMtime >= remote.mtime) {
+      if (lwwWinner(localMtime, remote.mtime ?? 0) === "local") {
         // Local is newer (or equal mtime) - push local content over remote
         const doc: CouchDoc = {
           _id: docId,
