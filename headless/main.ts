@@ -10,11 +10,37 @@ import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "../src/types";
 const STATE_FILENAME = ".vault-sync-state.json";
 const CONFIG_FILENAME = VAULT_SYNC_CONFIG_FILE;
 
+/**
+ * Patterns that must ALWAYS be excluded from sync regardless of user config.
+ * Critical: `.git/` and `.DS_Store` were leaking into CouchDB before because
+ * they weren't in the user's `excludePatterns`. The watcher excludes them
+ * separately (in headless/main.ts watcher setup) but pushAllLocal/pullAllRemote
+ * use settings.excludePatterns, so they have to be there too.
+ */
+const ALWAYS_EXCLUDED = [
+  ".git/",
+  ".DS_Store",
+  ".vault-sync.json",
+  ".vault-sync-state.json",
+  ".obsidian/",
+  ".trash/",
+];
+
 function loadConfig(vaultRoot: string): VaultSyncSettings {
   const configPath = path.join(vaultRoot, CONFIG_FILENAME);
   try {
     const raw = fs.readFileSync(configPath, "utf-8");
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    const userConfig = JSON.parse(raw);
+    const merged = { ...DEFAULT_SETTINGS, ...userConfig };
+    // Ensure ALWAYS_EXCLUDED patterns are in excludePatterns even if user
+    // didn't list them. Avoids the bug where .git/ was silently synced.
+    const userPatterns = merged.excludePatterns ?? [];
+    const combined = [...userPatterns];
+    for (const p of ALWAYS_EXCLUDED) {
+      if (!combined.includes(p)) combined.push(p);
+    }
+    merged.excludePatterns = combined;
+    return merged;
   } catch {
     console.error(`[vault-sync] Config not found at ${configPath}`);
     console.error(`[vault-sync] Create ${CONFIG_FILENAME} in your vault root with:`);
