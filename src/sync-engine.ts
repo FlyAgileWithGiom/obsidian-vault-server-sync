@@ -194,6 +194,14 @@ export class SyncEngine {
   private pullApplied = 0;
   private lastError: string | null = null;
   private currentState: SyncState = "idle";
+  /**
+   * True once at least one incremental poll has completed successfully after start().
+   * Destructive remote operations (delete) are gated on this flag to prevent pushing
+   * local deletes to the server while the changes feed is in error state — we cannot
+   * know whether the remote has a more recent revision until the feed recovers.
+   * Reset to false on stop() and each time the feed enters error state.
+   */
+  private feedAlive = false;
   /** Files skipped due to recoverable read errors (EAGAIN, EACCES, EIO, ENOENT). Cleared on successful read. */
   private unsyncableFiles: Map<string, { reason: string; firstSeen: number; retryAfter: number }> = new Map();
 
@@ -327,6 +335,10 @@ export class SyncEngine {
       console.log("[vault-sync] DB ensured, starting fullSync");
       await this.fullSync();
       console.log("[vault-sync] fullSync complete, starting polling");
+      // fullSync confirmed the connection is alive and lastSeq is current —
+      // treat it as an initial feed check-in so that FS events between fullSync
+      // completion and the first incremental poll are not silently dropped.
+      this.feedAlive = true;
       this.setState("ok");
       this.startPolling();
     } catch (e) {
@@ -339,6 +351,7 @@ export class SyncEngine {
 
   stop(): void {
     this.running = false;
+    this.feedAlive = false;
     this.client.cancelChanges();
     if (this.changesPollTimer) {
       clearTimeout(this.changesPollTimer);
@@ -927,6 +940,7 @@ export class SyncEngine {
 
       this.lastSeq = result.last_seq;
       this.persistState();
+      this.feedAlive = true;
       this.setState("ok");
 
       // Poll again after interval (normal feed, not longpoll)
@@ -940,6 +954,7 @@ export class SyncEngine {
       const msg = (e as Error).message || "";
       if (msg.includes("aborted") || msg.includes("AbortError")) return;
 
+      this.feedAlive = false;
       this.setState("offline");
       this.setError(`Changes feed error: ${msg}`);
 
@@ -1144,6 +1159,14 @@ export class SyncEngine {
     if (!this.running || this.applyingRemote) return;
     if (file.kind !== "file") return;
     if (this.isExcluded(file.path)) return;
+    // Gate destructive remote operations on feed liveness. If the changes feed has
+    // not completed a successful poll since the last error, we cannot know whether
+    // the server has a more recent revision. Skip the delete until the feed recovers
+    // — the next fullSync (on daemon restart) will reconcile any missed deletes.
+    if (!this.feedAlive) {
+      this.setError(`Skipped remote delete for ${file.path}: changes feed not yet recovered`);
+      return;
+    }
 
     const docId = pathToDocId(file.path);
     const entry = this.revMap[docId];

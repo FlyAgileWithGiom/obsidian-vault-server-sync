@@ -168,7 +168,9 @@ export class CouchClient {
     });
     if (options.limit) params.set("limit", String(options.limit));
 
-    return this.request<CouchChangesResult>(`/_changes?${params.toString()}`);
+    return this.request<CouchChangesResult>(`/_changes?${params.toString()}`, {
+      timeoutMs: options.timeout,
+    });
   }
 
   async getAttachment(docId: string, attName: string, timeoutMs = 120_000): Promise<ArrayBuffer> {
