@@ -1970,6 +1970,129 @@ describe("SyncEngine", () => {
     });
   });
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Changes-feed reconnection and destructive-op gating (bug: 2026-05-05)
+  // ─────────────────────────────────────────────────────────────────────────
+  //
+  // Incident: after a Mac-sleep network blip the changes feed errored, the
+  // daemon reported "State: ok" on the very next (empty) retry, then ran for
+  // 13 hours pushing destructive local deletes to the server while never
+  // receiving a single server-side change (↓0 forever).
+  //
+  // Root causes:
+  //   H4 (confirmed): handleLocalDelete has no gating on feed health — deletes
+  //       propagate to remote even while the feed is in error state.
+  //   H5 (confirmed): changes() silently drops the timeout option and does not
+  //       forward it as timeoutMs to request() — so the caller's 25 000 ms
+  //       intent is ignored; a half-open TCP socket hangs until the transport's
+  //       30 s default fires instead.
+  //
+  // Tests below are the TDD RED phase: they fail on current main.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  describe("changes-feed reconnection and destructive-op gating", () => {
+    it("Test A — after a poll failure, a successful retry delivers server changes", async () => {
+      // Documents that the retry loop works: changes ARE observed after a transient error.
+      // This is the GOOD PATH — it should pass both before and after the fix.
+      vault._addFile("notes/existing.md", "original", 1000);
+
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/existing.md": { state: "known", rev: "1-r", mtime: 1000 },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, storeWithRevMap);
+      const cli = getClient(eng);
+
+      cli.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/notes/existing.md", key: "file/notes/existing.md", value: { rev: "1-r" } }],
+      });
+      cli.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+      // Poll sequence:
+      //   1st call (end of fullSync): success → sets lastSeq
+      //   2nd call (first poll): FAIL — simulates the Mac-sleep blip
+      //   3rd call (5s retry): success — returns a server change
+      cli.changes
+        .mockResolvedValueOnce({ last_seq: "5", results: [] })
+        .mockRejectedValueOnce(new Error("fetch failed"))
+        .mockResolvedValue({
+          last_seq: "6",
+          results: [{
+            seq: "6",
+            id: "file/notes/existing.md",
+            changes: [{ rev: "2-r" }],
+            doc: { _id: "file/notes/existing.md", _rev: "2-r", content: "updated after blip", mtime: 2000 },
+          }],
+        });
+
+      await eng.start();
+      // Wait long enough for the 5s retry to fire and a subsequent poll
+      // (3s first poll interval + 5s retry backoff = 8s, plus some margin)
+      await new Promise((r) => setTimeout(r, 9000));
+
+      // The server change MUST have been applied despite the transient error
+      expect(vault._getContent("notes/existing.md")).toBe("updated after blip");
+      eng.stop();
+    }, 15000);
+
+    it("Test B — handleLocalDelete must NOT push while the feed is in error state", async () => {
+      // H4 bug: deletes propagate to remote even when the feed has never recovered.
+      // The engine has no way of knowing if remote has a newer rev — destructive ops
+      // must be blocked until at least one successful poll confirms feed liveness.
+      vault._addFile("notes/to-delete.md", "content", 1000);
+
+      const storeWithRevMap = new TestStateStore();
+      storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+        "file/notes/to-delete.md": { state: "known", rev: "1-r", mtime: 1000 },
+      }));
+      const eng = makeEngine(settings, vaultAdapter, storeWithRevMap);
+      const cli = getClient(eng);
+
+      cli.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      // First changes call (end of fullSync): success
+      // All subsequent poll calls: always fail (feed never recovers)
+      cli.changes
+        .mockResolvedValueOnce({ last_seq: "5", results: [] })
+        .mockRejectedValue(new Error("fetch failed"));
+
+      await eng.start();
+      // Let the first poll (3s interval) fire and fail
+      await new Promise((r) => setTimeout(r, 3500));
+
+      const deleteFile: VaultEntry = { kind: "file", path: "notes/to-delete.md", mtime: 1000, size: 0 };
+      await eng.handleLocalDelete(deleteFile);
+
+      // Feed is in error state — destructive remote delete MUST NOT have been sent
+      expect(cli.delete).not.toHaveBeenCalled();
+      eng.stop();
+    }, 10000);
+
+    it("Test C — currentState stays offline while every poll attempt fails", async () => {
+      // Once a poll fails, the engine must remain in "offline" until a poll succeeds.
+      // Going "ok" on an empty-result retry is acceptable; going "ok" while still
+      // failing is not. This test verifies the basic offline-while-failing invariant.
+      const eng = makeEngine(settings, vaultAdapter, stateStore);
+      const cli = getClient(eng);
+
+      cli.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      // First changes call (end of fullSync): success
+      // All subsequent polls: always fail
+      cli.changes
+        .mockResolvedValueOnce({ last_seq: "3", results: [] })
+        .mockRejectedValue(new Error("fetch failed"));
+
+      await eng.start();
+      // Wait for the first poll (3s) to fail; give the retry (5s) time to also fail
+      await new Promise((r) => setTimeout(r, 9500));
+
+      // While every poll is failing, state must NOT be "ok"
+      const diag = eng.getDiagnostics();
+      expect(diag.state).not.toBe("ok");
+      eng.stop();
+    }, 15000);
+  });
+
   describe("ghost directory cleanup - handleLocalDelete", () => {
     // Helper: build engine with pre-populated revMap so handleLocalDelete sees a known rev.
     function makeEngineWithRevMap(revMap: Record<string, string>): { eng: SyncEngine; cli: ReturnType<typeof vi.fn> & Record<string, ReturnType<typeof vi.fn>> } {

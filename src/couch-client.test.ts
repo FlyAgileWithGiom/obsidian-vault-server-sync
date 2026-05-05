@@ -215,6 +215,28 @@ describe("CouchClient", () => {
     });
   });
 
+  describe("changes", () => {
+    it("includes since, feed=normal, and include_docs in query string", async () => {
+      const { transport, mock } = makeTransport(200, { last_seq: "5", results: [] });
+      await new CouchClient(makeSettings(), transport).changes("3", { include_docs: true });
+      const url = mock.mock.calls[0][0].url;
+      expect(url).toContain("since=3");
+      expect(url).toContain("feed=normal");
+      expect(url).toContain("include_docs=true");
+    });
+
+    it("forwards timeout option as timeoutMs to the transport request", async () => {
+      // Bug (2026-05-05): changes() accepted options.timeout but dropped it.
+      // The caller (SyncEngine.pollChanges) passes timeout: 25000 expecting the
+      // HTTP request to abort after 25 s on a half-open TCP connection; that was
+      // silently ignored, leaving the transport's 30 s default in charge instead.
+      const { transport, mock } = makeTransport(200, { last_seq: "5", results: [] });
+      await new CouchClient(makeSettings(), transport).changes("0", { timeout: 25000 });
+      const call = mock.mock.calls[0][0];
+      expect(call.timeoutMs).toBe(25000);
+    });
+  });
+
   describe("putAttachment", () => {
     it("PUTs attachment with correct URL, Content-Type, and body", async () => {
       const { transport, mock } = makeTransport(200, { ok: true, id: "file/image.png", rev: "2-xyz" });
