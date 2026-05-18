@@ -15,6 +15,7 @@ vi.mock("./sync-engine", () => ({
     stop: vi.fn(),
     clearState: vi.fn(),
     forceFullSync: vi.fn().mockResolvedValue(undefined),
+    resumeFullSync: vi.fn().mockResolvedValue(undefined),
     updateSettings: vi.fn(),
     handleLocalChange: vi.fn(),
     handleLocalDelete: vi.fn(),
@@ -391,6 +392,34 @@ describe("VaultSyncPlugin.forceFullSync", () => {
     expect(syncEngineInstance.forceFullSync).toHaveBeenCalled();
     // Must NOT silently fall back to a plain start() — that path skips remote pulls on empty revMap.
     expect(syncEngineInstance.start).not.toHaveBeenCalled();
+  });
+});
+
+describe("VaultSyncPlugin.resumeFullSync", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("delegates to syncEngine.resumeFullSync (non-destructive, preserves revMap)", async () => {
+    const plugin = makePlugin();
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => "test-vault";
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    const syncEngineInstance = vi.mocked(SyncEngine).mock.results.at(-1)!.value;
+
+    await plugin.resumeFullSync();
+
+    expect(syncEngineInstance.resumeFullSync).toHaveBeenCalled();
+    // Must NOT call forceFullSync (which would clear revMap)
+    expect(syncEngineInstance.forceFullSync).not.toHaveBeenCalled();
   });
 });
 

@@ -133,8 +133,28 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName("Resume sync")
+      .setDesc("Continue an interrupted sync without losing progress (recommended after network errors)")
+      .addButton((btn) =>
+        btn.setButtonText("Resume sync").onClick(async () => {
+          btn.setButtonText("Syncing...");
+          btn.setDisabled(true);
+          try {
+            await this.plugin.resumeFullSync();
+            btn.setButtonText("Done");
+          } catch {
+            btn.setButtonText("Error");
+          }
+          setTimeout(() => {
+            btn.setButtonText("Resume sync");
+            btn.setDisabled(false);
+          }, 2000);
+        })
+      );
+
+    new Setting(containerEl)
       .setName("Force full sync")
-      .setDesc("Re-sync all files (push local, pull remote)")
+      .setDesc("Reset all sync state and re-fetch everything (destructive — use only after DB swap or to re-evaluate orphans/tombstones)")
       .addButton((btn) =>
         btn.setButtonText("Full sync").onClick(async () => {
           btn.setButtonText("Syncing...");

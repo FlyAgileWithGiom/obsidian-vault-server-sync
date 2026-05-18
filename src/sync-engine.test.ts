@@ -3483,6 +3483,261 @@ describe("planFullSync (dry-run)", () => {
   });
 });
 
+describe("resumeFullSync (non-destructive)", () => {
+  let vault: Vault;
+  let vaultAdapter: TestVaultAdapter;
+  let stateStore: TestStateStore;
+  let settings: VaultSyncSettings;
+  let engine: SyncEngine;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vault = new Vault();
+    vaultAdapter = new TestVaultAdapter(vault);
+    stateStore = new TestStateStore();
+    settings = makeSettings();
+    engine = new SyncEngine(settings, vaultAdapter, stateStore, noopTransport);
+  });
+
+  afterEach(() => {
+    engine.stop();
+  });
+
+  it("partial-pull recovery: pulls only remote-only docs, not already-known ones", async () => {
+    // PR #30 v2 scenario: 3 docs are already known in revMap with matching revs,
+    // 2 more exist in remote with no revMap entry (they were added while sync was interrupted).
+    // resumeFullSync must pull the 2 new docs without re-fetching the 3 known ones.
+    const client = getClient(engine);
+
+    // Pre-populate revMap: 3 docs already known with matching revs
+    stateStore.set("vault-sync-revmap", JSON.stringify({
+      "file/notes/a.md": { state: "known", rev: "1-aaa", mtime: 1000, lastSeenInFs: 1000 },
+      "file/notes/b.md": { state: "known", rev: "1-bbb", mtime: 1000, lastSeenInFs: 1000 },
+      "file/notes/c.md": { state: "known", rev: "1-ccc", mtime: 1000, lastSeenInFs: 1000 },
+    }));
+    // Add the 3 known files to the vault FS so reconcileLocalDeletes doesn't tombstone them
+    vault._addFile("notes/a.md", "content a", 1000);
+    vault._addFile("notes/b.md", "content b", 1000);
+    vault._addFile("notes/c.md", "content c", 1000);
+
+    const eng = new SyncEngine(settings, vaultAdapter, stateStore, noopTransport);
+    const c = getClient(eng);
+
+    // Remote has all 5 docs: 3 known (same rev) + 2 new
+    c.allDocs.mockResolvedValue({
+      total_rows: 5,
+      rows: [
+        { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "1-aaa" } },
+        { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "1-bbb" } },
+        { id: "file/notes/c.md", key: "file/notes/c.md", value: { rev: "1-ccc" } },
+        { id: "file/notes/new1.md", key: "file/notes/new1.md", value: { rev: "1-n1" } },
+        { id: "file/notes/new2.md", key: "file/notes/new2.md", value: { rev: "1-n2" } },
+      ],
+    });
+    // allDocsByKeys returns the 2 new docs when pulled
+    c.allDocsByKeys.mockResolvedValue({
+      total_rows: 2,
+      rows: [
+        {
+          id: "file/notes/new1.md",
+          key: "file/notes/new1.md",
+          value: { rev: "1-n1" },
+          doc: { _id: "file/notes/new1.md", _rev: "1-n1", content: "new1 content", mtime: 2000 },
+        },
+        {
+          id: "file/notes/new2.md",
+          key: "file/notes/new2.md",
+          value: { rev: "1-n2" },
+          doc: { _id: "file/notes/new2.md", _rev: "1-n2", content: "new2 content", mtime: 2000 },
+        },
+      ],
+    });
+    c.changes.mockResolvedValue({ last_seq: "10", results: [] });
+
+    await eng.resumeFullSync();
+
+    // The 2 new docs must be written to FS
+    expect(vault._getContent("notes/new1.md")).toBe("new1 content");
+    expect(vault._getContent("notes/new2.md")).toBe("new2 content");
+
+    // allDocsByKeys must only have been called for the 2 new docs (not the 3 known ones).
+    // The 3 known docs have matching revs so pullAllRemote skips them (rev match).
+    const allDocsByKeysCalls = c.allDocsByKeys.mock.calls;
+    // Flatten all keys requested across all calls
+    const allRequestedKeys = allDocsByKeysCalls.flatMap((call: string[][]) => call[0]);
+    expect(allRequestedKeys).not.toContain("file/notes/a.md");
+    expect(allRequestedKeys).not.toContain("file/notes/b.md");
+    expect(allRequestedKeys).not.toContain("file/notes/c.md");
+
+    eng.stop();
+  });
+
+  it("tombstone permanence preserved: tombstoned doc not pulled on resumeFullSync", async () => {
+    // revMap has 1 entry state:"tombstoned". Remote has the same docId at a newer rev.
+    // resumeFullSync must NOT pull it to FS and must leave the entry tombstoned.
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/notes/deleted.md": { state: "tombstoned", rev: "1-old", tombstonedAt: 999 },
+    }));
+    const eng = new SyncEngine(settings, vaultAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    c.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: "file/notes/deleted.md", key: "file/notes/deleted.md", value: { rev: "2-new" } }],
+    });
+    c.allDocsByKeys.mockResolvedValue({
+      total_rows: 1,
+      rows: [{
+        id: "file/notes/deleted.md",
+        key: "file/notes/deleted.md",
+        value: { rev: "2-new" },
+        doc: { _id: "file/notes/deleted.md", _rev: "2-new", content: "resurrected", mtime: 9999 },
+      }],
+    });
+    c.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+    await eng.resumeFullSync();
+
+    // File must NOT be written to FS
+    expect(vault._getContent("notes/deleted.md")).toBeUndefined();
+
+    // revMap entry must remain tombstoned
+    const saved = JSON.parse(store.get("vault-sync-revmap") ?? "{}");
+    expect(saved["file/notes/deleted.md"]?.state).toBe("tombstoned");
+
+    eng.stop();
+  });
+
+  it("force contrast: forceFullSync WOULD pull a tombstoned doc (tombstone cleared by clearState)", async () => {
+    // Contrast test — locks the invariant that forceFullSync re-evaluates tombstones.
+    // After clearState(), the tombstoned entry is gone; pullAllRemote sees the doc as
+    // unknown (no entry) but bypassOrphanGuard=true lets it through → gets pulled.
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/notes/deleted.md": { state: "tombstoned", rev: "1-old", tombstonedAt: 999 },
+    }));
+    const eng = new SyncEngine(settings, vaultAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    c.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: "file/notes/deleted.md", key: "file/notes/deleted.md", value: { rev: "2-new" } }],
+    });
+    c.allDocsByKeys.mockResolvedValue({
+      total_rows: 1,
+      rows: [{
+        id: "file/notes/deleted.md",
+        key: "file/notes/deleted.md",
+        value: { rev: "2-new" },
+        doc: { _id: "file/notes/deleted.md", _rev: "2-new", content: "resurrected", mtime: 9999 },
+      }],
+    });
+    c.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+    await eng.forceFullSync();
+
+    // forceFullSync clears state first → tombstone gone → doc IS pulled
+    expect(vault._getContent("notes/deleted.md")).toBe("resurrected");
+
+    eng.stop();
+  });
+
+  it("orphan protection preserved: orphan doc not pulled on resumeFullSync", async () => {
+    // revMap has 1 entry state:"orphan". Remote has the same docId.
+    // resumeFullSync must NOT pull it to FS and must leave the entry as orphan.
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/notes/agent-created.md": { state: "orphan", rev: "1-o" },
+    }));
+    const eng = new SyncEngine(settings, vaultAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    c.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: "file/notes/agent-created.md", key: "file/notes/agent-created.md", value: { rev: "1-o" } }],
+    });
+    c.allDocsByKeys.mockResolvedValue({
+      total_rows: 1,
+      rows: [{
+        id: "file/notes/agent-created.md",
+        key: "file/notes/agent-created.md",
+        value: { rev: "1-o" },
+        doc: { _id: "file/notes/agent-created.md", _rev: "1-o", content: "agent content", mtime: 5000 },
+      }],
+    });
+    c.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+    await eng.resumeFullSync();
+
+    // File must NOT be written to FS
+    expect(vault._getContent("notes/agent-created.md")).toBeUndefined();
+
+    // revMap entry must remain orphan
+    const saved = JSON.parse(store.get("vault-sync-revmap") ?? "{}");
+    expect(saved["file/notes/agent-created.md"]?.state).toBe("orphan");
+
+    eng.stop();
+  });
+
+  it("lastSeq not cleared: resumes from prior seq and updates to new server seq", async () => {
+    // Pre-set lastSeq to some value (simulating interrupted prior sync).
+    // resumeFullSync must NOT clear lastSeq mid-way; it should end with the new server seq.
+    const store = new TestStateStore();
+    store.set("vault-sync-last-seq", "42");
+    const eng = new SyncEngine(settings, vaultAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    c.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "99", results: [] });
+
+    await eng.resumeFullSync();
+
+    // lastSeq must be updated to the new seq (99), not reset to 0.
+    // The store persists JSON.stringify(lastSeq), so "99" becomes '"99"' on disk.
+    const savedSeq = JSON.parse(store.get("vault-sync-last-seq") ?? "0");
+    expect(savedSeq).toBe("99");
+
+    eng.stop();
+  });
+
+  it("idempotent on fully-synced state: no pulls, no pushes when revMap matches remote", async () => {
+    // revMap fully matches remote (all known, all revs match).
+    // resumeFullSync must produce no pulls and no pushes.
+    vault._addFile("notes/synced.md", "synced content", 1000);
+
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/notes/synced.md": { state: "known", rev: "1-xyz", mtime: 1000, lastSeenInFs: 1000 },
+    }));
+    const eng = new SyncEngine(settings, vaultAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    // Remote matches exactly: same rev
+    c.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: "file/notes/synced.md", key: "file/notes/synced.md", value: { rev: "1-xyz" } }],
+    });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "50", results: [] });
+
+    await eng.resumeFullSync();
+
+    // No content writes (no pull)
+    // bulkDocs must not have been called with content (only tombstone deletes go through bulkDocs)
+    expect(c.bulkDocs).not.toHaveBeenCalled();
+    // allDocsByKeys should not be called for pull (no rev mismatches) —
+    // it may be called once for the push tombstone batch check (empty result)
+    const pullCalls = (c.allDocsByKeys.mock.calls as string[][][]).filter(
+      (call) => call[0]?.includes("file/notes/synced.md")
+    );
+    expect(pullCalls.length).toBe(0);
+
+    eng.stop();
+  });
+});
+
 describe("lwwWinner", () => {
   it("returns local when mtimes are equal (already have it, no need to fetch)", () => {
     expect(lwwWinner(1000, 1000)).toBe("local");

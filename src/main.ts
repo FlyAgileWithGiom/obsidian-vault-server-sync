@@ -73,6 +73,12 @@ export default class VaultSyncPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: "resume-sync",
+      name: "Resume sync",
+      callback: () => this.resumeFullSync(),
+    });
+
+    this.addCommand({
       id: "force-full-sync",
       name: "Force full sync",
       callback: () => this.forceFullSync(),
@@ -209,6 +215,11 @@ export default class VaultSyncPlugin extends Plugin {
       this.startSync();
       new Notice("Vault Sync starting...");
     }
+  }
+
+  /** Public: called from settings tab and resume-sync command */
+  async resumeFullSync(): Promise<void> {
+    await this.syncEngine.resumeFullSync();
   }
 
   /** Public: called from settings tab */
