@@ -213,11 +213,10 @@ export default class VaultSyncPlugin extends Plugin {
 
   /** Public: called from settings tab */
   async forceFullSync(): Promise<void> {
-    // Stop any running sync first to avoid race conditions
-    this.syncEngine.stop();
-    // Reset and restart from scratch
-    this.syncEngine.clearState();
-    await this.startSync();
+    // Delegate end-to-end to the engine — it owns stop/clearState/ensureDb/
+    // fullSync({bypassOrphanGuard:true})/poll lifecycle. Routing through a
+    // plain start() here drops the bypass flag and leaves revMap empty.
+    await this.syncEngine.forceFullSync();
   }
 
   /** Public: diagnostics for settings tab observability on mobile */

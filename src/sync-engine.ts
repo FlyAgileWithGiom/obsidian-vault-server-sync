@@ -366,10 +366,30 @@ export class SyncEngine {
   }
 
   async forceFullSync(): Promise<void> {
+    // Owns its full lifecycle so callers can invoke this whether the engine is
+    // running or stopped without losing the bypassOrphanGuard flag (a previous
+    // bug had the plugin do stop+clearState+start, which silently dropped the
+    // bypass and left the revMap empty on first-device onboarding).
+    this.stop();
     this.clearState();
-    // bypassOrphanGuard: true — empty revMap after clearState() must not skip all pulls.
-    // Bypass is for seed/restore; in normal operation the guard remains active.
-    await this.fullSync({ bypassOrphanGuard: true });
+    if (!this.client.isConfigured()) {
+      this.setState("not-configured");
+      return;
+    }
+    this.running = true;
+    this.setState("syncing");
+    try {
+      await this.client.ensureDb();
+      // bypassOrphanGuard: true — empty revMap after clearState() must not skip all pulls.
+      // Bypass is for seed/restore; in normal operation the guard remains active.
+      await this.fullSync({ bypassOrphanGuard: true });
+      this.setState("ok");
+      this.startPolling();
+    } catch (e) {
+      this.running = false;
+      this.setState("error");
+      this.setError(`Force full sync failed: ${(e as Error).message}`);
+    }
   }
 
   async fullSync(opts: { bypassOrphanGuard?: boolean } = {}): Promise<void> {
