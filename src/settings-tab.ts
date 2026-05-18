@@ -6,18 +6,15 @@ import type { SyncDiagnostics, FullSyncPlan } from "./types";
  * Settings tab for Vault Sync plugin.
  * Provides CouchDB connection configuration and sync behavior options.
  */
-// How long (ms) to coalesce rapid onDiagnosticsChange bursts before re-rendering.
-// Per-doc engine events arrive in batches of ~20; 250 ms throttle keeps UI at ~4 fps
-// max while ensuring the final state always reaches the screen.
-const RENDER_THROTTLE_MS = 250;
-
 export class VaultSyncSettingTab extends PluginSettingTab {
   private diagnosticsEl: HTMLElement | null = null;
   // Cached <pre> element — reused across renders to avoid DOM teardown on mobile.
   private diagnosticsPre: HTMLElement | null = null;
   private unsubDiagnostics: (() => void) | null = null;
-  // Trailing-edge throttle timer for the diagnostics subscription handler.
-  private diagnosticsThrottleTimer: ReturnType<typeof setTimeout> | null = null;
+  // rAF-based coalescing flag: true while a requestAnimationFrame render is queued.
+  // Paint-driven coalescing aligns with the browser render cycle and fires reliably
+  // on iOS WKWebView where setTimeout can stall during engine bursts.
+  private renderRafPending = false;
   private previewEl: HTMLElement | null = null;
 
   constructor(app: App, private plugin: VaultSyncPlugin) {
@@ -25,12 +22,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   }
 
   hide(): void {
-    // Clear the throttle timer so a pending render doesn't fire after tab close.
-    if (this.diagnosticsThrottleTimer) {
-      clearTimeout(this.diagnosticsThrottleTimer);
-      this.diagnosticsThrottleTimer = null;
-    }
-    // Clean up live update subscription when settings tab is closed
+    // Discard any queued rAF render so it doesn't fire after tab close.
+    // The rAF callback captures renderRafPending by closure; resetting the flag
+    // causes the callback to exit early even if the browser fires it late.
+    this.renderRafPending = false;
+    // Clean up live update subscription when settings tab is closed.
     if (this.unsubDiagnostics) {
       this.unsubDiagnostics();
       this.unsubDiagnostics = null;
@@ -43,6 +39,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     // containerEl.empty() destroys the previous <pre>; reset so renderDiagnostics
     // rebuilds the full DOM structure on next call.
     this.diagnosticsPre = null;
+    // Defensive reset: if iOS resume-from-background skipped hide(), a stale
+    // renderRafPending=true would permanently gate the next handler invocation.
+    this.renderRafPending = false;
 
     containerEl.createEl("h2", { text: "Vault Sync Settings" });
 
@@ -218,15 +217,17 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
     // Subscribe to live updates while settings tab is open.
     // The engine fires onDiagnosticsChange per-doc during pulls (~20 events/batch).
-    // Throttle to RENDER_THROTTLE_MS so bursts collapse to a single render; trailing
-    // edge ensures the final state always reaches the DOM.
+    // Coalesce bursts with requestAnimationFrame so at most one render executes per
+    // paint frame. rAF is more reliable than setTimeout on iOS WKWebView, where
+    // timers can stall during heavy engine activity.
     if (this.unsubDiagnostics) this.unsubDiagnostics();
     const handler = () => {
-      if (this.diagnosticsThrottleTimer) return;
-      this.diagnosticsThrottleTimer = setTimeout(() => {
-        this.diagnosticsThrottleTimer = null;
+      if (this.renderRafPending) return;
+      this.renderRafPending = true;
+      requestAnimationFrame(() => {
+        this.renderRafPending = false;
         this.renderDiagnostics();
-      }, RENDER_THROTTLE_MS);
+      });
     };
     this.plugin.subscribeDiagnostics(handler);
     this.unsubDiagnostics = () => this.plugin.unsubscribeDiagnostics(handler);
@@ -247,6 +248,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     if (d.lastError) {
       lines.push(`Last error: ${d.lastError}`);
     }
+    // Render timestamp — empirical proof that renders are firing on the device.
+    // If this value doesn't update during sync, the render path is broken upstream.
+    lines.push(`Last render: ${new Date().toLocaleTimeString()}`);
     return lines.join("\n");
   }
 
@@ -329,11 +333,14 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     const d = this.plugin.getDiagnostics();
     const text = this.formatDiagnostics(d);
 
-    if (this.diagnosticsPre) {
-      // Fast path: element already exists — just update the text, no DOM teardown.
+    if (this.diagnosticsPre && this.diagnosticsPre.parentElement === this.diagnosticsEl) {
+      // Fast path: element exists and is still attached — just update the text.
       this.diagnosticsPre.textContent = text;
       return;
     }
+    // Pre was detached (Obsidian DOM rebuild outside our control, or first render).
+    // Clear the stale reference and fall through to the slow path which rebuilds it.
+    this.diagnosticsPre = null;
 
     // First render after display(): build the full DOM structure and cache the <pre>.
     const pre = this.diagnosticsEl.createEl("pre", {
