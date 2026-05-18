@@ -14,6 +14,7 @@ vi.mock("./sync-engine", () => ({
     start: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn(),
     clearState: vi.fn(),
+    forceFullSync: vi.fn().mockResolvedValue(undefined),
     updateSettings: vi.fn(),
     handleLocalChange: vi.fn(),
     handleLocalDelete: vi.fn(),
@@ -359,6 +360,39 @@ function makeEl() {
     setText: vi.fn(),
   };
 }
+
+describe("VaultSyncPlugin.forceFullSync", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("delegates to syncEngine.forceFullSync so the orphan guard is bypassed (revMap repopulates from remote)", async () => {
+    // Bug: the previous flow (stop + clearState + startSync) called engine.start(),
+    // which runs fullSync() without bypassOrphanGuard. With revMap freshly cleared,
+    // Trou B (sync-engine.ts:683) skips every remote doc and revMap stays at 0
+    // tracked while lastSeq still advances — matching the diagnostics the user
+    // reported after pressing "Full sync" on a fresh vault.
+    const plugin = makePlugin();
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => "test-vault";
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    const syncEngineInstance = vi.mocked(SyncEngine).mock.results.at(-1)!.value;
+
+    await plugin.forceFullSync();
+
+    expect(syncEngineInstance.forceFullSync).toHaveBeenCalled();
+    // Must NOT silently fall back to a plain start() — that path skips remote pulls on empty revMap.
+    expect(syncEngineInstance.start).not.toHaveBeenCalled();
+  });
+});
 
 describe("vault event handlers", () => {
   beforeEach(() => {
