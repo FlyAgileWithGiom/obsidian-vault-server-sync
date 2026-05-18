@@ -34,6 +34,8 @@ class MockHTMLElement {
   // Track child elements appended
   children: MockHTMLElement[] = [];
   style = new MockStyle();
+  // DOM parentElement reference — set when added as child, cleared when removed
+  parentElement: MockHTMLElement | null = null;
 
   // Tracks all createEl calls made on this element
   private _createElCalls: { tag: string; opts?: { cls?: string; text?: string } }[] = [];
@@ -48,18 +50,23 @@ class MockHTMLElement {
   createEl(tag: string, opts?: { cls?: string; text?: string }): MockHTMLElement {
     this._createElCalls.push({ tag, opts });
     const child = new MockHTMLElement(tag, opts);
+    child.parentElement = this;
     this.children.push(child);
     return child;
   }
 
   /** Obsidian extension: remove all children */
   empty(): void {
+    for (const child of this.children) {
+      child.parentElement = null;
+    }
     this.children = [];
     this.textContent = "";
   }
 
   /** DOM compatibility */
   appendChild(child: MockHTMLElement): MockHTMLElement {
+    child.parentElement = this;
     this.children.push(child);
     return child;
   }
@@ -166,7 +173,33 @@ function makeTab(plugin: VaultSyncPlugin): VaultSyncSettingTab {
   (tab as unknown as { diagnosticsPre: null }).diagnosticsPre = null;
   (tab as unknown as { previewEl: null }).previewEl = null;
   (tab as unknown as { unsubDiagnostics: null }).unsubDiagnostics = null;
+  // rAF-based throttle field (replaces setTimeout-based timer)
+  (tab as unknown as { renderRafPending: boolean }).renderRafPending = false;
   return tab;
+}
+
+// ---------------------------------------------------------------------------
+// rAF mock helpers — vitest node env has no requestAnimationFrame
+// ---------------------------------------------------------------------------
+
+let rafCallbacks: Array<() => void> = [];
+
+function installRafMock(): void {
+  rafCallbacks = [];
+  (global as unknown as Record<string, unknown>).requestAnimationFrame = (cb: () => void) => {
+    rafCallbacks.push(cb);
+    return rafCallbacks.length;
+  };
+}
+
+function flushRaf(): void {
+  const cbs = rafCallbacks;
+  rafCallbacks = [];
+  cbs.forEach((c) => c());
+}
+
+function removeRafMock(): void {
+  delete (global as unknown as Record<string, unknown>).requestAnimationFrame;
 }
 
 // ---------------------------------------------------------------------------
@@ -300,5 +333,182 @@ describe("VaultSyncSettingTab — diagnostics text updates correctly", () => {
     expect(pre!.textContent).toContain("ok");
     expect(pre!.textContent).toContain("42");
     expect(pre!.textContent).toContain("3");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// RED tests — rAF-based diagnostics updates (#39)
+// These tests FAIL with the current setTimeout-based implementation.
+// ---------------------------------------------------------------------------
+
+describe("VaultSyncSettingTab — rAF coalescing (#39)", () => {
+  let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+  let tab: VaultSyncSettingTab;
+
+  beforeEach(() => {
+    installRafMock();
+    settingConstructorCount = 0;
+    plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+    tab = makeTab(plugin);
+    tab.display();
+    // Reset spy count AFTER display() which does the initial render
+    (plugin.getDiagnostics as ReturnType<typeof vi.fn>).mockClear();
+  });
+
+  afterEach(() => {
+    tab.hide();
+    removeRafMock();
+    vi.clearAllTimers();
+  });
+
+  it("50 rapid handler invocations produce exactly one getDiagnostics call after flushRaf", () => {
+    // Fire handler 50 times without flushing rAF
+    for (let i = 0; i < 50; i++) {
+      (plugin as unknown as { _fireListeners: () => void })._fireListeners();
+    }
+    // No render should have happened yet — rAF callback not executed
+    expect(plugin.getDiagnostics).toHaveBeenCalledTimes(0);
+
+    // Flush the rAF — exactly one render expected
+    flushRaf();
+    expect(plugin.getDiagnostics).toHaveBeenCalledTimes(1);
+  });
+
+  it("renderRafPending is false after rAF flush (allows next event to schedule)", () => {
+    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
+    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(true);
+
+    flushRaf();
+    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(false);
+
+    // Triggering another event should schedule a new rAF
+    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
+    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(true);
+  });
+});
+
+describe("VaultSyncSettingTab — state reset on duplicate display() (#39)", () => {
+  let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+  let tab: VaultSyncSettingTab;
+
+  beforeEach(() => {
+    installRafMock();
+    settingConstructorCount = 0;
+    plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+    tab = makeTab(plugin);
+  });
+
+  afterEach(() => {
+    tab.hide();
+    removeRafMock();
+    vi.clearAllTimers();
+  });
+
+  it("second display() resets renderRafPending so next handler can schedule a render", () => {
+    tab.display();
+
+    // Fire handler but do NOT flush — rAF is pending
+    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
+    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(true);
+
+    // iOS resume-from-background: display() called again without hide()
+    // Must reset renderRafPending so the next handler invocation isn't permanently gated
+    tab.display();
+    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(false);
+
+    // A new handler invocation after second display() must be able to schedule a render
+    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
+    flushRaf();
+
+    const pre = (tab as unknown as { diagnosticsPre: MockHTMLElement }).diagnosticsPre;
+    expect(pre).not.toBeNull();
+    expect(pre!.textContent).toBeTruthy();
+  });
+});
+
+describe("VaultSyncSettingTab — detached-pre fallback (#39)", () => {
+  let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+  let tab: VaultSyncSettingTab;
+
+  beforeEach(() => {
+    installRafMock();
+    settingConstructorCount = 0;
+    plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+    tab = makeTab(plugin);
+    tab.display();
+  });
+
+  afterEach(() => {
+    tab.hide();
+    removeRafMock();
+    vi.clearAllTimers();
+  });
+
+  it("orphaned pre is rebuilt and reattached on next render", () => {
+    const diagnosticsEl = (tab as unknown as { diagnosticsEl: MockHTMLElement }).diagnosticsEl!;
+    const preBefore = (tab as unknown as { diagnosticsPre: MockHTMLElement }).diagnosticsPre!;
+
+    // Orphan the cached pre by removing it from diagnosticsEl.children
+    // Also clear parentElement to mirror real DOM behavior when a node is detached.
+    diagnosticsEl.children = diagnosticsEl.children.filter((c) => c !== preBefore);
+    preBefore.parentElement = null;
+    expect(diagnosticsEl.children).not.toContain(preBefore);
+
+    // Trigger a render via handler + rAF flush
+    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
+    flushRaf();
+
+    const preAfter = (tab as unknown as { diagnosticsPre: MockHTMLElement }).diagnosticsPre!;
+    // The pre must be a NEW element (old one was detached)
+    expect(preAfter).not.toBe(preBefore);
+    // And it must be attached to diagnosticsEl
+    expect(diagnosticsEl.children).toContain(preAfter);
+    // Content must reflect latest diagnostics
+    expect(preAfter.textContent).toBeTruthy();
+  });
+});
+
+describe("VaultSyncSettingTab — Last render timestamp in formatDiagnostics (#39)", () => {
+  let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+  let tab: VaultSyncSettingTab;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+    tab = makeTab(plugin);
+  });
+
+  afterEach(() => {
+    tab.hide();
+    vi.useRealTimers();
+  });
+
+  it("formatDiagnostics output contains a Last render timestamp line", () => {
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const output = formatDiagnostics(makeDiagnosticsSnapshot());
+    // Must include a line matching "Last render: HH:MM:SS"
+    expect(output).toMatch(/Last render: \d{1,2}:\d{2}:\d{2}/);
+  });
+
+  it("Last render timestamp changes between successive formatDiagnostics calls at different times", () => {
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    vi.setSystemTime(new Date("2024-01-15T13:42:17Z"));
+    const output1 = formatDiagnostics(makeDiagnosticsSnapshot());
+
+    vi.setSystemTime(new Date("2024-01-15T13:43:00Z"));
+    const output2 = formatDiagnostics(makeDiagnosticsSnapshot());
+
+    // Timestamps must differ when system time advanced
+    const match1 = output1.match(/Last render: (.+)/);
+    const match2 = output2.match(/Last render: (.+)/);
+    expect(match1).not.toBeNull();
+    expect(match2).not.toBeNull();
+    expect(match1![1]).not.toBe(match2![1]);
   });
 });
