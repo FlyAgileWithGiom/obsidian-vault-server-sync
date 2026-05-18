@@ -109,6 +109,50 @@ export interface SyncDiagnostics {
   unsyncableSample: string[];
 }
 
+/**
+ * Dry-run plan produced by SyncEngine.planFullSync().
+ *
+ * Models exactly what forceFullSync() would do (bypass=true) without any writes.
+ * Each count/sample pair mirrors one decision branch in fullSync.
+ *
+ * Assumption: the plan is computed with bypassOrphanGuard=true by default because
+ * the user-facing button routes through forceFullSync, which sets bypass=true after
+ * clearState().  Tests should also cover bypass=false to exercise the guard branch.
+ */
+export interface FullSyncPlan {
+  /** Files on FS not present in remoteRevs — would push as new docs */
+  wouldPushNew: { count: number; sample: string[] };
+  /** Files on FS present in remoteRevs but locally changed since last sync */
+  wouldPushChanged: { count: number; sample: string[] };
+  /** Remote docs whose rev differs from revMap (or no revMap entry when bypass=true) — would pull */
+  wouldPullRevMismatch: { count: number; sample: string[] };
+  /**
+   * Remote docs with no revMap entry when bypassOrphanGuard=false — would be skipped.
+   * When bypass=true this bucket is empty and those docs appear in wouldPullRevMismatch.
+   * A non-zero count here is the diagnostic signal that surfaced the PR #30 bug.
+   */
+  wouldSkipOrphanGuard: { count: number; sample: string[] };
+  /** revMap "known" entries with no FS file — would propagate tombstone to remote */
+  wouldTombstoneLocal: { count: number; sample: string[] };
+  /** revMap "known" entries absent from remoteRevs — would delete local file */
+  wouldPullDelete: { count: number; sample: string[] };
+  /**
+   * Files that the server has tombstoned (detected via allDocsByKeys on unknownFiles).
+   * Would cause local deletion.  Separate from wouldPullDelete because these are
+   * files that *exist locally* but the remote has a tombstone for — the most
+   * surprising action a full sync can take.
+   */
+  wouldDeleteLocalTombstoned: { count: number; sample: string[] };
+  /** revMap entries already in tombstoned state (informational — no action taken) */
+  alreadyTombstoned: number;
+  /** revMap entries already in orphan state (informational — no action taken) */
+  alreadyOrphan: number;
+  /** Files skipped because they exceed MAX_FILE_SIZE (same threshold as fullSync) */
+  oversizeSkipped: number;
+  /** Files skipped because they match excludePatterns (informational) */
+  excludedCount: number;
+}
+
 // --- Portable abstractions (used by both Obsidian plugin and headless daemon) ---
 
 export type VaultFile = { kind: "file"; path: string; mtime: number; size: number };

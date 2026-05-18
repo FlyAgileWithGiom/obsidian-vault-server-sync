@@ -59,6 +59,7 @@ import type {
   SyncState,
   SyncCounts,
   SyncDiagnostics,
+  FullSyncPlan,
   VaultAdapter,
   VaultFile,
   VaultEntry,
@@ -390,6 +391,174 @@ export class SyncEngine {
       this.setState("error");
       this.setError(`Force full sync failed: ${(e as Error).message}`);
     }
+  }
+
+  /**
+   * Dry-run version of forceFullSync: produces a FullSyncPlan describing exactly
+   * what would happen without executing any writes.
+   *
+   * Mirrors the comparison/filtering logic of reconcileLocalDeletes, pushAllLocal,
+   * and pullAllRemote step-by-step.  One network call is unavoidable: fetching the
+   * remote rev index (allDocs) and the tombstone check (allDocsByKeys on unknownFiles)
+   * to accurately categorise wouldDeleteLocalTombstoned.  No writes are performed.
+   *
+   * Default bypassOrphanGuard=true matches what forceFullSync does after clearState().
+   * Pass false to see how the normal incremental path would behave.
+   */
+  async planFullSync(opts: { bypassOrphanGuard?: boolean } = {}): Promise<FullSyncPlan> {
+    const bypass = opts.bypassOrphanGuard !== false; // default true
+
+    // Counters and samples (5 paths each)
+    const plan: FullSyncPlan = {
+      wouldPushNew: { count: 0, sample: [] },
+      wouldPushChanged: { count: 0, sample: [] },
+      wouldPullRevMismatch: { count: 0, sample: [] },
+      wouldSkipOrphanGuard: { count: 0, sample: [] },
+      wouldTombstoneLocal: { count: 0, sample: [] },
+      wouldPullDelete: { count: 0, sample: [] },
+      wouldDeleteLocalTombstoned: { count: 0, sample: [] },
+      alreadyTombstoned: 0,
+      alreadyOrphan: 0,
+      oversizeSkipped: 0,
+      excludedCount: 0,
+    };
+
+    function addSample(bucket: { count: number; sample: string[] }, path: string): void {
+      bucket.count++;
+      if (bucket.sample.length < 5) bucket.sample.push(path);
+    }
+
+    // --- Fetch remote rev index (read-only) ---
+    const remoteIndex = await this.client.allDocs({
+      startkey: DOC_PREFIX,
+      endkey: `${DOC_PREFIX}￿`,
+    });
+    const remoteRevs = new Map<string, string>();
+    for (const row of remoteIndex.rows) {
+      remoteRevs.set(row.id, row.value.rev);
+    }
+
+    // --- Phase 1: mirror reconcileLocalDeletes ---
+    // Counts revMap entries that would be tombstoned (no FS file, not excluded)
+    for (const [docId, entry] of Object.entries(this.revMap)) {
+      if (entry.state === "tombstoned") {
+        plan.alreadyTombstoned++;
+        continue;
+      }
+      if (entry.state === "orphan") {
+        // Orphans are counted in Phase 2; skip here to avoid double-counting
+        continue;
+      }
+      const path = docIdToPath(docId);
+      const normalizedPath = this.normalizePath(path);
+      if (this.isExcluded(normalizedPath)) continue;
+      const fsEntry = this.vault.getEntryByPath(normalizedPath);
+      if (fsEntry === null) {
+        addSample(plan.wouldTombstoneLocal, path);
+      }
+    }
+
+    // Count alreadyOrphan separately (not in reconcileLocalDeletes loop above)
+    for (const entry of Object.values(this.revMap)) {
+      if (entry.state === "orphan") plan.alreadyOrphan++;
+    }
+
+    // --- Phase 2: mirror pushAllLocal ---
+    // Full vault file list (all files, even large/excluded) for counting purposes
+    const allVaultFiles = this.vault.getFiles();
+    for (const file of allVaultFiles) {
+      if (this.isExcluded(file.path)) {
+        plan.excludedCount++;
+        continue;
+      }
+      if (file.size > MAX_FILE_SIZE) {
+        plan.oversizeSkipped++;
+        continue;
+      }
+      const docId = pathToDocId(file.path);
+      if (remoteRevs.has(docId)) {
+        const entry = this.revMap[docId];
+        if (entry?.state === "tombstoned") {
+          // Would call handleRemoteDelete (delete local); tracked in wouldDeleteLocalTombstoned
+          addSample(plan.wouldDeleteLocalTombstoned, file.path);
+          continue;
+        }
+        if (entry?.state === "orphan") {
+          // Already counted in alreadyOrphan, no push
+          continue;
+        }
+        if (entry?.state === "known" && entry.mtime > 0 && file.mtime <= entry.mtime) {
+          continue; // Unchanged since last sync
+        }
+        // Modified or mtime unknown — would push (changed)
+        addSample(plan.wouldPushChanged, file.path);
+      } else {
+        // Not in remoteRevs — potential push-new, but first check for server tombstones.
+        // We defer the allDocsByKeys call to a batch below; for now collect candidates.
+        // (actual categorisation happens after the batch)
+        addSample(plan.wouldPushNew, file.path);
+      }
+    }
+
+    // Tombstone batch check: same allDocsByKeys call as pushAllLocal Phase 2.
+    // For each local file that looks like wouldPushNew, verify the server has no tombstone.
+    // Files with a tombstone shift from wouldPushNew to wouldDeleteLocalTombstoned.
+    if (plan.wouldPushNew.count > 0) {
+      // Reconstruct the unknownFiles list (files not in remoteRevs, non-excluded, non-oversize)
+      const unknownFiles = allVaultFiles.filter(
+        (f) => !this.isExcluded(f.path) && f.size <= MAX_FILE_SIZE && !remoteRevs.has(pathToDocId(f.path))
+      );
+      const unknownDocIds = unknownFiles.map((f) => pathToDocId(f.path));
+      let tombstoneIds: Set<string> = new Set();
+      try {
+        const batchResult = await this.client.allDocsByKeys(unknownDocIds);
+        for (const row of batchResult.rows) {
+          if (row.doc?.deleted) tombstoneIds.add(row.id);
+        }
+      } catch {
+        // Network failure: leave tombstoneIds empty; wouldPushNew counts remain as-is.
+        // The dry-run is best-effort — a failed batch means we can't distinguish
+        // tombstoned files from genuinely new ones for that batch.
+      }
+
+      if (tombstoneIds.size > 0) {
+        // Rebuild wouldPushNew excluding tombstoned files; add them to wouldDeleteLocalTombstoned
+        const newPushNew: { count: number; sample: string[] } = { count: 0, sample: [] };
+        for (const file of unknownFiles) {
+          const docId = pathToDocId(file.path);
+          if (tombstoneIds.has(docId)) {
+            addSample(plan.wouldDeleteLocalTombstoned, file.path);
+          } else {
+            addSample(newPushNew, file.path);
+          }
+        }
+        plan.wouldPushNew = newPushNew;
+      }
+    }
+
+    // --- Phase 3: mirror pullAllRemote ---
+    for (const [docId, rev] of remoteRevs) {
+      if (docId.startsWith("_design/")) continue;
+      if (this.revMap[docId]?.rev === rev) continue;
+      const entry = this.revMap[docId];
+      if (!entry && !bypass) {
+        addSample(plan.wouldSkipOrphanGuard, docIdToPath(docId));
+        continue;
+      }
+      if (entry?.state === "tombstoned" || entry?.state === "orphan") continue;
+      addSample(plan.wouldPullRevMismatch, docIdToPath(docId));
+    }
+
+    // Remote deletions: known entries absent from remoteRevs → would delete local
+    for (const [docId, entry] of Object.entries(this.revMap)) {
+      if (entry.state !== "known") continue;
+      if (!remoteRevs.has(docId)) {
+        const path = docIdToPath(docId);
+        addSample(plan.wouldPullDelete, path);
+      }
+    }
+
+    return plan;
   }
 
   async fullSync(opts: { bypassOrphanGuard?: boolean } = {}): Promise<void> {

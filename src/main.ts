@@ -5,7 +5,7 @@ import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
 import { ObsidianStateStore } from "./ObsidianStateStore";
 import { ObsidianTransport } from "./ObsidianTransport";
 import { VaultSyncSettingTab } from "./settings-tab";
-import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics } from "./types";
+import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics, FullSyncPlan } from "./types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
 import { slugify } from "./slugify";
 
@@ -217,6 +217,15 @@ export default class VaultSyncPlugin extends Plugin {
     // fullSync({bypassOrphanGuard:true})/poll lifecycle. Routing through a
     // plain start() here drops the bypass flag and leaves revMap empty.
     await this.syncEngine.forceFullSync();
+  }
+
+  /**
+   * Public: dry-run preview of what Force full sync would do.
+   * Delegates to the engine with bypassOrphanGuard=true (matching forceFullSync behaviour).
+   * Called from the settings tab "Preview Full sync" button.
+   */
+  async previewFullSync(): Promise<FullSyncPlan> {
+    return this.syncEngine.planFullSync({ bypassOrphanGuard: true });
   }
 
   /** Public: diagnostics for settings tab observability on mobile */
