@@ -438,3 +438,33 @@ describe("vault event handlers", () => {
     );
   });
 });
+
+describe("VaultSyncPlugin.previewFullSync", () => {
+  it("delegates to syncEngine.planFullSync with bypassOrphanGuard=true", async () => {
+    const plugin = makePlugin();
+    const mockPlan = {
+      wouldPushNew: { count: 2, sample: ["a.md", "b.md"] },
+      wouldPushChanged: { count: 0, sample: [] },
+      wouldPullRevMismatch: { count: 1, sample: ["c.md"] },
+      wouldSkipOrphanGuard: { count: 0, sample: [] },
+      wouldTombstoneLocal: { count: 0, sample: [] },
+      wouldPullDelete: { count: 0, sample: [] },
+      wouldDeleteLocalTombstoned: { count: 0, sample: [] },
+      alreadyTombstoned: 0,
+      alreadyOrphan: 0,
+      oversizeSkipped: 0,
+      excludedCount: 1,
+    };
+
+    const planFullSync = vi.fn().mockResolvedValue(mockPlan);
+    // Inject a mock syncEngine with planFullSync
+    (plugin as unknown as { syncEngine: unknown }).syncEngine = {
+      planFullSync,
+    };
+
+    const result = await plugin.previewFullSync();
+
+    expect(planFullSync).toHaveBeenCalledWith({ bypassOrphanGuard: true });
+    expect(result).toBe(mockPlan);
+  });
+});

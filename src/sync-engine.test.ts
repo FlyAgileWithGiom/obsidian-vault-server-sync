@@ -3165,6 +3165,324 @@ describe("robust read errors", () => {
   });
 });
 
+describe("planFullSync (dry-run)", () => {
+  let vault: Vault;
+  let vaultAdapter: TestVaultAdapter;
+  let stateStore: TestStateStore;
+  let settings: VaultSyncSettings;
+
+  // Shared write-method spies checked in every test for zero side effects
+  let writeMethods: string[];
+
+  function makeEngine(overrides: Partial<VaultSyncSettings> = {}): SyncEngine {
+    return new SyncEngine(makeSettings(overrides), vaultAdapter, stateStore, noopTransport);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vault = new Vault();
+    vaultAdapter = new TestVaultAdapter(vault);
+    stateStore = new TestStateStore();
+    settings = makeSettings();
+    writeMethods = ["put", "bulkDocs", "delete", "putAttachment"];
+  });
+
+  /** Assert no write methods were called on the client */
+  function assertNoWrites(engine: SyncEngine): void {
+    const client = getClient(engine);
+    for (const method of writeMethods) {
+      expect(client[method], `${method} must not be called in dry-run`).not.toHaveBeenCalled();
+    }
+    // Vault writes
+    expect(vaultAdapter.modifyText).not.toBeDefined(); // structural check
+  }
+
+  /** Assert that vault write methods were never called */
+  function assertNoVaultWrites(engine: SyncEngine, vaultSpy: { modifyText: ReturnType<typeof vi.fn>; createText: ReturnType<typeof vi.fn>; modifyBinary: ReturnType<typeof vi.fn>; createBinary: ReturnType<typeof vi.fn>; deleteFile: ReturnType<typeof vi.fn> }): void {
+    expect(vaultSpy.modifyText, "modifyText must not be called").not.toHaveBeenCalled();
+    expect(vaultSpy.createText, "createText must not be called").not.toHaveBeenCalled();
+    expect(vaultSpy.modifyBinary, "modifyBinary must not be called").not.toHaveBeenCalled();
+    expect(vaultSpy.createBinary, "createBinary must not be called").not.toHaveBeenCalled();
+    expect(vaultSpy.deleteFile, "deleteFile must not be called").not.toHaveBeenCalled();
+  }
+
+  it("empty vault + empty remote produces all-zero plan", async () => {
+    const engine = makeEngine();
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    const plan = await engine.planFullSync();
+
+    expect(plan.wouldPushNew.count).toBe(0);
+    expect(plan.wouldPushChanged.count).toBe(0);
+    expect(plan.wouldPullRevMismatch.count).toBe(0);
+    expect(plan.wouldSkipOrphanGuard.count).toBe(0);
+    expect(plan.wouldTombstoneLocal.count).toBe(0);
+    expect(plan.wouldPullDelete.count).toBe(0);
+    expect(plan.wouldDeleteLocalTombstoned.count).toBe(0);
+    expect(plan.alreadyTombstoned).toBe(0);
+    expect(plan.alreadyOrphan).toBe(0);
+    expect(plan.oversizeSkipped).toBe(0);
+    expect(plan.excludedCount).toBe(0);
+
+    const client2 = getClient(engine);
+    for (const m of writeMethods) {
+      expect(client2[m]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("local file not on remote is counted in wouldPushNew", async () => {
+    vault._addFile("notes/new.md", "content", 1000);
+
+    const engine = makeEngine();
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    const plan = await engine.planFullSync();
+
+    expect(plan.wouldPushNew.count).toBe(1);
+    expect(plan.wouldPushNew.sample).toContain("notes/new.md");
+
+    for (const m of writeMethods) {
+      expect(getClient(engine)[m]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("local file with newer mtime than revMap entry is counted in wouldPushChanged", async () => {
+    vault._addFile("notes/changed.md", "new content", 2000);
+    stateStore.set(
+      "vault-sync-revmap",
+      JSON.stringify({ "file/notes/changed.md": { state: "known", rev: "1-abc", mtime: 1000 } })
+    );
+    const engine = makeEngine();
+    const client = getClient(engine);
+    // File is in remote (present in allDocs) with same rev as revMap
+    client.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: "file/notes/changed.md", key: "file/notes/changed.md", value: { rev: "1-abc" } }],
+    });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    const plan = await engine.planFullSync();
+
+    expect(plan.wouldPushChanged.count).toBe(1);
+    expect(plan.wouldPushChanged.sample).toContain("notes/changed.md");
+    expect(plan.wouldPushNew.count).toBe(0);
+
+    for (const m of writeMethods) {
+      expect(getClient(engine)[m]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("remote doc with no revMap entry, bypass=true -> wouldPullRevMismatch", async () => {
+    const engine = makeEngine();
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: "file/agent-note.md", key: "file/agent-note.md", value: { rev: "1-zzz" } }],
+    });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    const plan = await engine.planFullSync({ bypassOrphanGuard: true });
+
+    expect(plan.wouldPullRevMismatch.count).toBe(1);
+    expect(plan.wouldPullRevMismatch.sample).toContain("agent-note.md");
+    expect(plan.wouldSkipOrphanGuard.count).toBe(0);
+
+    for (const m of writeMethods) {
+      expect(getClient(engine)[m]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("remote doc with no revMap entry, bypass=false -> wouldSkipOrphanGuard", async () => {
+    const engine = makeEngine();
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: "file/agent-note.md", key: "file/agent-note.md", value: { rev: "1-zzz" } }],
+    });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    const plan = await engine.planFullSync({ bypassOrphanGuard: false });
+
+    expect(plan.wouldSkipOrphanGuard.count).toBe(1);
+    expect(plan.wouldSkipOrphanGuard.sample).toContain("agent-note.md");
+    expect(plan.wouldPullRevMismatch.count).toBe(0);
+
+    for (const m of writeMethods) {
+      expect(getClient(engine)[m]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("revMap known entry with no FS file is counted in wouldTombstoneLocal", async () => {
+    // No files in vault; revMap has a known entry
+    stateStore.set(
+      "vault-sync-revmap",
+      JSON.stringify({ "file/notes/gone.md": { state: "known", rev: "1-abc", mtime: 1000 } })
+    );
+    const engine = makeEngine();
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: "file/notes/gone.md", key: "file/notes/gone.md", value: { rev: "1-abc" } }],
+    });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    const plan = await engine.planFullSync();
+
+    expect(plan.wouldTombstoneLocal.count).toBe(1);
+    expect(plan.wouldTombstoneLocal.sample).toContain("notes/gone.md");
+
+    for (const m of writeMethods) {
+      expect(getClient(engine)[m]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("revMap known entry absent from remote is counted in wouldPullDelete", async () => {
+    stateStore.set(
+      "vault-sync-revmap",
+      JSON.stringify({ "file/notes/deleted-remote.md": { state: "known", rev: "1-abc", mtime: 1000 } })
+    );
+    vault._addFile("notes/deleted-remote.md", "content", 1000);
+    const engine = makeEngine();
+    const client = getClient(engine);
+    // Remote returns empty — doc was deleted remotely
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    const plan = await engine.planFullSync();
+
+    expect(plan.wouldPullDelete.count).toBe(1);
+    expect(plan.wouldPullDelete.sample).toContain("notes/deleted-remote.md");
+
+    for (const m of writeMethods) {
+      expect(getClient(engine)[m]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("files matching excludePatterns are counted in excludedCount, not push counts", async () => {
+    vault._addFile(".obsidian/config.json", "{}", 1000);
+    vault._addFile(".trash/old.md", "old", 1000);
+    vault._addFile("notes/keep.md", "keep", 1000);
+
+    const engine = makeEngine();
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    const plan = await engine.planFullSync();
+
+    // 2 excluded (.obsidian/ and .trash/)
+    expect(plan.excludedCount).toBe(2);
+    // Only notes/keep.md shows as push-new
+    expect(plan.wouldPushNew.count).toBe(1);
+    expect(plan.wouldPushNew.sample).toContain("notes/keep.md");
+
+    for (const m of writeMethods) {
+      expect(getClient(engine)[m]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("sample list is capped at 5 paths per category", async () => {
+    // Add 7 new files — all should be wouldPushNew but sample capped at 5
+    for (let i = 0; i < 7; i++) {
+      vault._addFile(`notes/file${i}.md`, `content ${i}`, 1000 + i);
+    }
+    const engine = makeEngine();
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    const plan = await engine.planFullSync();
+
+    expect(plan.wouldPushNew.count).toBe(7);
+    expect(plan.wouldPushNew.sample.length).toBe(5);
+  });
+
+  /**
+   * Regression test for PR #30 scenario:
+   * - Remote has docs
+   * - revMap is empty (first device onboarding, or after clearState)
+   * - With bypass=false: all remote docs appear in wouldSkipOrphanGuard
+   * - With bypass=true (forceFullSync): all remote docs appear in wouldPullRevMismatch
+   *
+   * This test is proof that planFullSync would have surfaced the PR #30 bug
+   * where forceFullSync silently dropped the bypassOrphanGuard flag.
+   */
+  it("PR #30 regression: empty revMap + remote docs surfaces orphan guard behaviour", async () => {
+    const remoteDocCount = 5;
+    const remoteRows = Array.from({ length: remoteDocCount }, (_, i) => ({
+      id: `file/notes/doc${i}.md`,
+      key: `file/notes/doc${i}.md`,
+      value: { rev: `1-rev${i}` },
+    }));
+
+    const engine = makeEngine();
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({ total_rows: remoteDocCount, rows: remoteRows });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    // bypass=false: all remote docs should be flagged as skipped by orphan guard
+    const planBlocked = await engine.planFullSync({ bypassOrphanGuard: false });
+    expect(planBlocked.wouldSkipOrphanGuard.count).toBe(remoteDocCount);
+    expect(planBlocked.wouldPullRevMismatch.count).toBe(0);
+
+    // bypass=true (forceFullSync default): all remote docs would be pulled
+    const planBypassed = await engine.planFullSync({ bypassOrphanGuard: true });
+    expect(planBypassed.wouldPullRevMismatch.count).toBe(remoteDocCount);
+    expect(planBypassed.wouldSkipOrphanGuard.count).toBe(0);
+
+    // No writes in either case
+    for (const m of writeMethods) {
+      expect(client[m]).not.toHaveBeenCalled();
+    }
+  });
+
+  it("zero side effects: no client writes, no vault writes called", async () => {
+    vault._addFile("notes/a.md", "content a", 1000);
+    vault._addFile("notes/b.md", "content b", 2000);
+
+    const modifyText = vi.fn();
+    const createText = vi.fn();
+    const modifyBinary = vi.fn();
+    const createBinary = vi.fn();
+    const deleteFile = vi.fn();
+
+    const spiedAdapter: VaultAdapter = {
+      getFiles: () => vaultAdapter.getFiles(),
+      getEntryByPath: (p) => vaultAdapter.getEntryByPath(p),
+      readText: (f) => vaultAdapter.readText(f),
+      readBinary: (f) => vaultAdapter.readBinary(f),
+      modifyText,
+      modifyBinary,
+      createText,
+      createBinary,
+      createDirectory: vi.fn(),
+      deleteFile,
+      deleteDirectory: vi.fn(),
+      isDirectoryEmpty: vi.fn().mockResolvedValue(true),
+      normalizePath: (p) => p,
+    };
+
+    const engine = new SyncEngine(settings, spiedAdapter, stateStore, noopTransport);
+    const client = getClient(engine);
+    client.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: "file/notes/remote.md", key: "file/notes/remote.md", value: { rev: "1-x" } }],
+    });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+
+    await engine.planFullSync({ bypassOrphanGuard: true });
+
+    assertNoVaultWrites(engine, { modifyText, createText, modifyBinary, createBinary, deleteFile });
+    for (const m of writeMethods) {
+      expect(client[m]).not.toHaveBeenCalled();
+    }
+  });
+});
+
 describe("lwwWinner", () => {
   it("returns local when mtimes are equal (already have it, no need to fetch)", () => {
     expect(lwwWinner(1000, 1000)).toBe("local");
