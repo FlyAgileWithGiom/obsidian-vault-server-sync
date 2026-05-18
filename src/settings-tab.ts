@@ -6,9 +6,18 @@ import type { SyncDiagnostics, FullSyncPlan } from "./types";
  * Settings tab for Vault Sync plugin.
  * Provides CouchDB connection configuration and sync behavior options.
  */
+// How long (ms) to coalesce rapid onDiagnosticsChange bursts before re-rendering.
+// Per-doc engine events arrive in batches of ~20; 250 ms throttle keeps UI at ~4 fps
+// max while ensuring the final state always reaches the screen.
+const RENDER_THROTTLE_MS = 250;
+
 export class VaultSyncSettingTab extends PluginSettingTab {
   private diagnosticsEl: HTMLElement | null = null;
+  // Cached <pre> element — reused across renders to avoid DOM teardown on mobile.
+  private diagnosticsPre: HTMLElement | null = null;
   private unsubDiagnostics: (() => void) | null = null;
+  // Trailing-edge throttle timer for the diagnostics subscription handler.
+  private diagnosticsThrottleTimer: ReturnType<typeof setTimeout> | null = null;
   private previewEl: HTMLElement | null = null;
 
   constructor(app: App, private plugin: VaultSyncPlugin) {
@@ -16,6 +25,11 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   }
 
   hide(): void {
+    // Clear the throttle timer so a pending render doesn't fire after tab close.
+    if (this.diagnosticsThrottleTimer) {
+      clearTimeout(this.diagnosticsThrottleTimer);
+      this.diagnosticsThrottleTimer = null;
+    }
     // Clean up live update subscription when settings tab is closed
     if (this.unsubDiagnostics) {
       this.unsubDiagnostics();
@@ -26,6 +40,9 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    // containerEl.empty() destroys the previous <pre>; reset so renderDiagnostics
+    // rebuilds the full DOM structure on next call.
+    this.diagnosticsPre = null;
 
     containerEl.createEl("h2", { text: "Vault Sync Settings" });
 
@@ -199,9 +216,18 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     this.diagnosticsEl = containerEl.createEl("div", { cls: "vault-sync-diagnostics" });
     this.renderDiagnostics();
 
-    // Subscribe to live updates while settings tab is open
+    // Subscribe to live updates while settings tab is open.
+    // The engine fires onDiagnosticsChange per-doc during pulls (~20 events/batch).
+    // Throttle to RENDER_THROTTLE_MS so bursts collapse to a single render; trailing
+    // edge ensures the final state always reaches the DOM.
     if (this.unsubDiagnostics) this.unsubDiagnostics();
-    const handler = () => this.renderDiagnostics();
+    const handler = () => {
+      if (this.diagnosticsThrottleTimer) return;
+      this.diagnosticsThrottleTimer = setTimeout(() => {
+        this.diagnosticsThrottleTimer = null;
+        this.renderDiagnostics();
+      }, RENDER_THROTTLE_MS);
+    };
     this.plugin.subscribeDiagnostics(handler);
     this.unsubDiagnostics = () => this.plugin.unsubscribeDiagnostics(handler);
   }
@@ -301,19 +327,27 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   private renderDiagnostics(): void {
     if (!this.diagnosticsEl) return;
     const d = this.plugin.getDiagnostics();
-    this.diagnosticsEl.empty();
+    const text = this.formatDiagnostics(d);
 
+    if (this.diagnosticsPre) {
+      // Fast path: element already exists — just update the text, no DOM teardown.
+      this.diagnosticsPre.textContent = text;
+      return;
+    }
+
+    // First render after display(): build the full DOM structure and cache the <pre>.
     const pre = this.diagnosticsEl.createEl("pre", {
       cls: "vault-sync-diag-pre",
-      text: this.formatDiagnostics(d),
+      text,
     });
     pre.style.userSelect = "text";
     pre.style.webkitUserSelect = "text";
+    this.diagnosticsPre = pre;
 
     new Setting(this.diagnosticsEl)
       .addButton((btn) =>
         btn.setButtonText("Copy").onClick(() => {
-          const text = this.formatDiagnostics(this.plugin.getDiagnostics());
+          const copyText = this.formatDiagnostics(this.plugin.getDiagnostics());
           // Select text in pre element (works on mobile)
           const range = document.createRange();
           range.selectNodeContents(pre);
@@ -324,7 +358,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
           }
           // Try clipboard API, fallback to execCommand
           try {
-            navigator.clipboard.writeText(text).then(
+            navigator.clipboard.writeText(copyText).then(
               () => { btn.setButtonText("Copied!"); },
               () => {
                 document.execCommand("copy");
