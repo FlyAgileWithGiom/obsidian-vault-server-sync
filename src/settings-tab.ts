@@ -1,6 +1,6 @@
 import { App, PluginSettingTab, Setting } from "obsidian";
 import type VaultSyncPlugin from "./main";
-import type { SyncDiagnostics } from "./types";
+import type { SyncDiagnostics, FullSyncPlan } from "./types";
 
 /**
  * Settings tab for Vault Sync plugin.
@@ -9,6 +9,7 @@ import type { SyncDiagnostics } from "./types";
 export class VaultSyncSettingTab extends PluginSettingTab {
   private diagnosticsEl: HTMLElement | null = null;
   private unsubDiagnostics: (() => void) | null = null;
+  private previewEl: HTMLElement | null = null;
 
   constructor(app: App, private plugin: VaultSyncPlugin) {
     super(app, plugin);
@@ -151,6 +152,28 @@ export class VaultSyncSettingTab extends PluginSettingTab {
         })
       );
 
+    new Setting(containerEl)
+      .setName("Preview Full sync (dry-run)")
+      .setDesc("Show what Force full sync would do, without changing anything")
+      .addButton((btn) =>
+        btn.setButtonText("Preview").onClick(async () => {
+          btn.setButtonText("Running...");
+          btn.setDisabled(true);
+          try {
+            const plan = await this.plugin.previewFullSync();
+            this.renderPreview(plan);
+          } catch (e) {
+            this.renderPreviewError((e as Error).message);
+          }
+          setTimeout(() => {
+            btn.setButtonText("Preview");
+            btn.setDisabled(false);
+          }, 1000);
+        })
+      );
+
+    this.previewEl = containerEl.createEl("div", { cls: "vault-sync-preview" });
+
     // --- Diagnostics section (provides observability on mobile) ---
     containerEl.createEl("h3", { text: "Diagnostics" });
     this.diagnosticsEl = containerEl.createEl("div", { cls: "vault-sync-diagnostics" });
@@ -179,6 +202,80 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       lines.push(`Last error: ${d.lastError}`);
     }
     return lines.join("\n");
+  }
+
+  private formatPlan(plan: FullSyncPlan): string {
+    function fmtBucket(bucket: { count: number; sample: string[] }): string {
+      if (bucket.count === 0) return "0";
+      const samples = bucket.sample.join(", ");
+      return `${bucket.count} — ${samples}`;
+    }
+
+    return [
+      "Dry-run Full sync preview",
+      "=========================",
+      `Would push (new):              ${fmtBucket(plan.wouldPushNew)}`,
+      `Would push (changed):          ${fmtBucket(plan.wouldPushChanged)}`,
+      `Would pull (rev diff):         ${fmtBucket(plan.wouldPullRevMismatch)}`,
+      `Would skip (orphan guard):     ${fmtBucket(plan.wouldSkipOrphanGuard)}`,
+      `Would tombstone local:         ${fmtBucket(plan.wouldTombstoneLocal)}`,
+      `Would pull-delete:             ${fmtBucket(plan.wouldPullDelete)}`,
+      `Would delete (server tombst.): ${fmtBucket(plan.wouldDeleteLocalTombstoned)}`,
+      `Already tombstoned:            ${plan.alreadyTombstoned}`,
+      `Already orphan:                ${plan.alreadyOrphan}`,
+      `Oversize skipped:              ${plan.oversizeSkipped}`,
+      `Excluded:                      ${plan.excludedCount}`,
+      "",
+      "Note: plan computed with bypassOrphanGuard=true (matches Force full sync).",
+    ].join("\n");
+  }
+
+  private renderPreview(plan: FullSyncPlan): void {
+    if (!this.previewEl) return;
+    this.previewEl.empty();
+
+    const text = this.formatPlan(plan);
+    const pre = this.previewEl.createEl("pre", {
+      cls: "vault-sync-diag-pre",
+      text,
+    });
+    pre.style.userSelect = "text";
+    pre.style.webkitUserSelect = "text";
+
+    new Setting(this.previewEl)
+      .addButton((btn) =>
+        btn.setButtonText("Copy").onClick(() => {
+          const range = document.createRange();
+          range.selectNodeContents(pre);
+          const sel = window.getSelection();
+          if (sel) {
+            sel.removeAllRanges();
+            sel.addRange(range);
+          }
+          try {
+            navigator.clipboard.writeText(text).then(
+              () => { btn.setButtonText("Copied!"); },
+              () => {
+                document.execCommand("copy");
+                btn.setButtonText("Copied!");
+              }
+            );
+          } catch {
+            document.execCommand("copy");
+            btn.setButtonText("Copied!");
+          }
+          setTimeout(() => btn.setButtonText("Copy"), 1500);
+        })
+      );
+  }
+
+  private renderPreviewError(message: string): void {
+    if (!this.previewEl) return;
+    this.previewEl.empty();
+    this.previewEl.createEl("pre", {
+      cls: "vault-sync-diag-pre",
+      text: `Preview failed: ${message}`,
+    });
   }
 
   private renderDiagnostics(): void {
