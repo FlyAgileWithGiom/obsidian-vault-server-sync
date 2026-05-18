@@ -3694,8 +3694,9 @@ describe("resumeFullSync (non-destructive)", () => {
 
     await eng.resumeFullSync();
 
-    // lastSeq must be updated to the new seq (99), not reset to 0
-    const savedSeq = store.get("vault-sync-last-seq");
+    // lastSeq must be updated to the new seq (99), not reset to 0.
+    // The store persists JSON.stringify(lastSeq), so "99" becomes '"99"' on disk.
+    const savedSeq = JSON.parse(store.get("vault-sync-last-seq") ?? "0");
     expect(savedSeq).toBe("99");
 
     eng.stop();

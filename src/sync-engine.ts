@@ -27,6 +27,14 @@
  *   known       → tombstoned  on remote delete (changes feed _deleted)
  *   tombstoned  → tombstoned  permanent until forceFullSync clears state
  *
+ * resumeFullSync() preserves all revMap state (tombstoned, orphan, known).
+ *   Use after an interrupted sync — it keeps progress and pulls remaining docs.
+ *   Tombstoned and orphan entries remain blocked from pull.
+ *
+ * forceFullSync() calls clearState() first, enabling transitions:
+ *   tombstoned → known  (re-evaluated on subsequent pull, as if never deleted)
+ *   orphan     → known  (re-evaluated on subsequent pull with bypassOrphanGuard)
+ *
  * OWNERSHIP RULES per scenario:
  *
  *   File modified locally   → LOCAL is canonical, push to REMOTE
@@ -390,6 +398,29 @@ export class SyncEngine {
       this.running = false;
       this.setState("error");
       this.setError(`Force full sync failed: ${(e as Error).message}`);
+    }
+  }
+
+  async resumeFullSync(): Promise<void> {
+    // Non-destructive: preserves revMap (incl. tombstoned/orphan state).
+    // Use when a previous fullSync was interrupted — keeps progress, pulls remaining.
+    // For tombstone re-evaluation or full re-pull of orphans, use forceFullSync.
+    this.stop();
+    if (!this.client.isConfigured()) {
+      this.setState("not-configured");
+      return;
+    }
+    this.running = true;
+    this.setState("syncing");
+    try {
+      await this.client.ensureDb();
+      await this.fullSync({ bypassOrphanGuard: true });
+      this.setState("ok");
+      this.startPolling();
+    } catch (e) {
+      this.running = false;
+      this.setState("error");
+      this.setError(`Resume sync failed: ${(e as Error).message}`);
     }
   }
 
