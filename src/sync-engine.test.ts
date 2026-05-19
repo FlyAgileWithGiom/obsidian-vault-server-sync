@@ -1873,6 +1873,48 @@ describe("SyncEngine", () => {
 
       stubEngine.stop();
     });
+
+    it("treats row.value.deleted=true as tombstone in pushAllLocal and does not call pushBinaryFile", async () => {
+      // ROOT CAUSE regression test: CouchDB returns doc=null and value.deleted=true for tombstones
+      // in _all_docs?include_docs=true responses. The old check `row.doc?.deleted` was always
+      // falsy (doc is null), so tombstoned files fell through to pushBinaryFile, causing
+      // "Binary push failed" errors (~255/cycle in production).
+      const jpegData = new Uint8Array([0xff, 0xd8, 0xff]).buffer;
+      vault._addBinaryFile("images/x.jpeg", jpegData);
+
+      const docId = "file/images/x.jpeg";
+      const client = getClient(engine);
+
+      // allDocs returns empty → file is "unknown" (not in remoteRevs)
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+
+      // allDocsByKeys returns the real CouchDB tombstone shape: doc=null, value.deleted=true
+      client.allDocsByKeys.mockResolvedValue({
+        total_rows: 1,
+        rows: [{
+          id: docId,
+          key: docId,
+          value: { rev: "3-tomb", deleted: true },
+          doc: null,
+        }],
+      });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      const engineErrors: string[] = [];
+      engine.onError = (msg) => engineErrors.push(msg);
+
+      await engine.start();
+
+      // putAttachment MUST NOT be called — tombstone must block pushBinaryFile
+      expect(client.putAttachment).not.toHaveBeenCalled();
+      // put (stub-doc creation) MUST NOT be called either
+      expect(client.put).not.toHaveBeenCalled();
+      // Local file should be deleted (handleRemoteDelete path)
+      expect(vault.getAbstractFileByPath("images/x.jpeg")).toBeNull();
+      // No "Binary push failed" error surfaced
+      const binaryPushErrors = engineErrors.filter((e) => e.startsWith("Binary push failed"));
+      expect(binaryPushErrors).toHaveLength(0);
+    });
   });
 
   describe("handleRemoteDelete - empty parent folder cleanup", () => {

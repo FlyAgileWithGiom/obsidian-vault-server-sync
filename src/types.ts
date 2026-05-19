@@ -85,8 +85,8 @@ export interface CouchAllDocsResult {
   rows: {
     id: string;
     key: string;
-    value: { rev: string };
-    doc?: CouchDoc;
+    value: { rev: string; deleted?: boolean };
+    doc?: CouchDoc | null;
     error?: string; // Present when doc not found (POST _all_docs with keys)
   }[];
 }

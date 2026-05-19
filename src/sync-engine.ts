@@ -523,8 +523,10 @@ export class SyncEngine {
       const unknownDocIds = unknownFiles.map((f) => pathToDocId(f.path));
       const batchResult = await this.client.allDocsByKeys(unknownDocIds);
       for (const row of batchResult.rows) {
-        if (row.doc?.deleted) {
-          // Server has a tombstone — must not resurrect this file
+        if (row.value?.deleted || row.doc?.deleted) {
+          // Server has a tombstone — must not resurrect this file.
+          // CouchDB _all_docs?include_docs=true returns doc=null and value.deleted=true
+          // for tombstones; row.doc?.deleted covers the (unlikely) doc-side flag as well.
           tombstoneIds.add(row.id);
         } else if (!row.error && row.doc) {
           // Doc exists with content but wasn't in allDocs index (edge case); let pull handle it
