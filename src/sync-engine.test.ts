@@ -442,6 +442,18 @@ describe("SyncEngine", () => {
   });
 
   describe("fullSync - pull", () => {
+    it("passes META_TIMEOUT_MS to client.allDocs for the initial rev-index fetch", async () => {
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+      await engine.start();
+
+      expect(client.allDocs).toHaveBeenCalled();
+      const callArgs = client.allDocs.mock.calls[0][0] as Record<string, unknown>;
+      expect(callArgs.timeoutMs).toBeGreaterThanOrEqual(60_000);
+    });
+
     it("pulls remote docs on first sync with empty vault (via forceFullSync)", async () => {
       // forceFullSync bypasses the orphan guard, enabling first-device onboarding.
       // Normal start() with empty revMap skips all pulls (Trou B: agent-created docs protection).

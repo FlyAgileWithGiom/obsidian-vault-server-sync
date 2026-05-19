@@ -118,6 +118,7 @@ export class CouchClient {
     endkey?: string;
     include_docs?: boolean;
     limit?: number;
+    timeoutMs?: number;
   } = {}): Promise<CouchAllDocsResult> {
     const params = new URLSearchParams();
     if (options.startkey) params.set("startkey", JSON.stringify(options.startkey));
@@ -125,7 +126,9 @@ export class CouchClient {
     if (options.include_docs) params.set("include_docs", "true");
     if (options.limit) params.set("limit", String(options.limit));
     const qs = params.toString();
-    return this.request<CouchAllDocsResult>(`/_all_docs${qs ? "?" + qs : ""}`);
+    return this.request<CouchAllDocsResult>(`/_all_docs${qs ? "?" + qs : ""}`, {
+      timeoutMs: options.timeoutMs,
+    });
   }
 
   /**

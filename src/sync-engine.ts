@@ -392,6 +392,7 @@ export class SyncEngine {
       const remoteIndex = await this.client.allDocs({
         startkey: DOC_PREFIX,
         endkey: `${DOC_PREFIX}￿`,
+        timeoutMs: META_TIMEOUT_MS,
       });
       const remoteRevs = new Map<string, string>();
       for (const row of remoteIndex.rows) {
