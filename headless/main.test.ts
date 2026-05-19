@@ -1,9 +1,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createWatcher } from "./main";
-import type { VaultFile, VaultEntry } from "../src/types";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { createWatcher, runStartWithExitOnFailure } from "./main";
+import type { VaultFile, VaultEntry, SyncState } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -142,5 +142,66 @@ describe("createWatcher (native fs.watch integration)", () => {
       (c) => c.file.path === ".vault-sync-state.json"
     );
     expect(excludedCalls).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runStartWithExitOnFailure — supervisor restart semantics
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a minimal fake engine whose start() calls onStateChange with the
+ * given final state before resolving. This exercises the same path as the
+ * real SyncEngine without touching CouchDB.
+ */
+function makeFakeEngine(finalState: SyncState) {
+  return {
+    onStateChange: undefined as ((s: SyncState) => void) | undefined,
+    async start() {
+      // Simulate setState("error"|"ok") being called inside start()
+      this.onStateChange?.(finalState);
+    },
+  };
+}
+
+describe("runStartWithExitOnFailure", () => {
+  it("calls exit(1) when the engine ends in error state", async () => {
+    const exit = vi.fn();
+    const engine = makeFakeEngine("error");
+
+    await runStartWithExitOnFailure(engine, exit);
+
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it("does NOT call exit when the engine ends in ok state", async () => {
+    const exit = vi.fn();
+    const engine = makeFakeEngine("ok");
+
+    await runStartWithExitOnFailure(engine, exit);
+
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  it("does NOT call exit when the engine ends in not-configured state", async () => {
+    const exit = vi.fn();
+    const engine = makeFakeEngine("not-configured");
+
+    await runStartWithExitOnFailure(engine, exit);
+
+    expect(exit).not.toHaveBeenCalled();
+  });
+
+  it("preserves a pre-existing onStateChange callback", async () => {
+    const exit = vi.fn();
+    const observed: SyncState[] = [];
+    const engine = makeFakeEngine("ok");
+    // Simulate the logging callback already assigned (as main() does)
+    engine.onStateChange = (s) => observed.push(s);
+
+    await runStartWithExitOnFailure(engine, exit);
+
+    expect(observed).toContain("ok");
+    expect(exit).not.toHaveBeenCalled();
   });
 });

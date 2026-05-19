@@ -4,7 +4,7 @@ import { SyncEngine } from "../src/sync-engine";
 import { FilesystemVaultAdapter } from "./VaultAdapter";
 import { JsonStateStore } from "./StateStore";
 import { FetchTransport } from "./FetchTransport";
-import type { VaultSyncSettings, VaultFile, VaultEntry } from "../src/types";
+import type { VaultSyncSettings, VaultFile, VaultEntry, SyncState } from "../src/types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "../src/types";
 
 const STATE_FILENAME = ".vault-sync-state.json";
@@ -55,6 +55,31 @@ function loadConfig(vaultRoot: string): VaultSyncSettings {
 }
 
 const DEBOUNCE_MS = 100;
+
+/**
+ * Starts the engine and calls `exit(1)` if the engine ends in `"error"` state,
+ * allowing the launchd supervisor (KeepAlive) to restart the daemon.
+ *
+ * Wraps `engine.onStateChange` to track the last observed state without
+ * clobbering any callback already assigned before this call.
+ */
+export async function runStartWithExitOnFailure(
+  engine: { onStateChange?: (s: SyncState) => void; start(): Promise<void> },
+  exit: (code: number) => void,
+): Promise<void> {
+  const previous = engine.onStateChange;
+  let lastState: SyncState | undefined;
+  engine.onStateChange = (state) => {
+    lastState = state;
+    previous?.(state);
+  };
+
+  await engine.start();
+
+  if (lastState === "error") {
+    exit(1);
+  }
+}
 
 export function createWatcher(
   absVaultRoot: string,
@@ -135,6 +160,8 @@ async function main(): Promise<void> {
 
   const engine = new SyncEngine(settings, vaultAdapter, stateStore, transport);
 
+  // Assign logging callback before runStartWithExitOnFailure so the wrapper
+  // captures it and both the log and the state-tracking run on each transition.
   engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
   engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);
   engine.onCountsChange = ({ pendingPush, pendingPull }) => {
@@ -143,8 +170,8 @@ async function main(): Promise<void> {
     }
   };
 
-  // Start initial sync
-  await engine.start();
+  // Start initial sync — exit(1) if engine ends in error so launchd can restart
+  await runStartWithExitOnFailure(engine, (code) => process.exit(code));
 
   // Watch filesystem for local changes
   // Exclude state file and config file from watching to prevent echo loops
