@@ -439,6 +439,76 @@ describe("SyncEngine", () => {
         ])
       );
     });
+
+    it("emits onCountsChange at least once during pushAllLocal (push progress signal is live)", async () => {
+      // Set up 5 new local files (not on remote) to push.
+      // onCountsChange is the discriminating signal: it fires ONLY via emitCounts(),
+      // never from setState() transitions, so it cleanly isolates push-phase progress.
+      vault._addFile("notes/a.md", "aaa", 1000);
+      vault._addFile("notes/b.md", "bbb", 2000);
+      vault._addFile("notes/c.md", "ccc", 3000);
+      vault._addFile("notes/d.md", "ddd", 4000);
+      vault._addFile("notes/e.md", "eee", 5000);
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.bulkDocs.mockResolvedValue([
+        { ok: true, id: "file/notes/a.md", rev: "1-a" },
+        { ok: true, id: "file/notes/b.md", rev: "1-b" },
+        { ok: true, id: "file/notes/c.md", rev: "1-c" },
+        { ok: true, id: "file/notes/d.md", rev: "1-d" },
+        { ok: true, id: "file/notes/e.md", rev: "1-e" },
+      ]);
+      client.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+      let countsEmitCount = 0;
+      engine.onCountsChange = () => { countsEmitCount++; };
+
+      await engine.forceFullSync();
+
+      // Before fix: 0 onCountsChange calls during push (diagnostic stream dead).
+      // After fix: ≥ 1 call (at least after the tail pushBatch flush).
+      expect(countsEmitCount).toBeGreaterThanOrEqual(1);
+    });
+
+    it("revMapSize advances monotonically across onCountsChange events during pushAllLocal", async () => {
+      // Set up 15 new local files — forces two batch flushes (10 + 5) so we capture
+      // at least 2 snapshots and can verify the revMap grows between them.
+      const fileNames = Array.from({ length: 15 }, (_, i) => `notes/f${i}.md`);
+      for (const name of fileNames) {
+        vault._addFile(name, `content-${name}`, 1000 + fileNames.indexOf(name));
+      }
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+      // bulkDocs returns ok results for whatever batch it receives
+      client.bulkDocs.mockImplementation((batch: CouchDoc[]) =>
+        Promise.resolve(batch.map((d) => ({ ok: true, id: d._id, rev: "1-x" })))
+      );
+      client.changes.mockResolvedValue({ last_seq: "15", results: [] });
+
+      const capturedRevMapSizes: number[] = [];
+      engine.onCountsChange = () => {
+        capturedRevMapSizes.push(engine.getDiagnostics().revMapSize);
+      };
+
+      await engine.forceFullSync();
+
+      // Must have captured at least 2 snapshots (from the two batch flushes)
+      expect(capturedRevMapSizes.length).toBeGreaterThanOrEqual(2);
+
+      // Values must be non-decreasing (UI would see growing revMapSize, not a stale value)
+      for (let i = 1; i < capturedRevMapSizes.length; i++) {
+        expect(capturedRevMapSizes[i]).toBeGreaterThanOrEqual(capturedRevMapSizes[i - 1]);
+      }
+
+      // The final revMapSize must be larger than the first (proves growth happened)
+      const first = capturedRevMapSizes[0];
+      const last = capturedRevMapSizes[capturedRevMapSizes.length - 1];
+      expect(last).toBeGreaterThan(first);
+    });
   });
 
   describe("fullSync - pull", () => {
