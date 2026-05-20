@@ -756,6 +756,7 @@ export class SyncEngine {
         // Tombstoned entries: the file was deleted locally; delete remotely instead of pushing
         if (entry?.state === "tombstoned") {
           await this.handleRemoteDelete(docId);
+          this.emitCounts();
           continue;
         }
         // Orphan entries: skip push (no FS file to push from)
@@ -770,9 +771,11 @@ export class SyncEngine {
         if (this.isBinaryDoc(docId)) {
           if (this.settings.disableBinaryPush) { await this.yield(); continue; }
           await this.pushBinaryFile(file);
+          this.emitCounts();
           await this.yield();
         } else {
           await this.pushTextFile(file);
+          this.emitCounts();
           await this.yield();
         }
         continue;
@@ -781,6 +784,7 @@ export class SyncEngine {
       if (tombstoneIds.has(docId)) {
         // Server has a tombstone — do not resurrect; delete locally
         await this.handleRemoteDelete(docId);
+        this.emitCounts();
         continue;
       }
 
@@ -794,6 +798,7 @@ export class SyncEngine {
         if (this.settings.disableBinaryPush) { await this.yield(); continue; }
         // Binary files need attachment PUT, not bulk_docs
         await this.pushBinaryFile(file);
+        this.emitCounts();
         await this.yield();
       } else {
         let content: string;
@@ -820,6 +825,7 @@ export class SyncEngine {
         // Flush in small chunks to avoid nginx 413
         if (batch.length >= 10) {
           await this.pushBatch(batch.splice(0));
+          this.emitCounts();
           await this.yield();
         }
       }
@@ -827,6 +833,7 @@ export class SyncEngine {
 
     if (batch.length > 0) {
       await this.pushBatch(batch);
+      this.emitCounts();
     }
   }
 
