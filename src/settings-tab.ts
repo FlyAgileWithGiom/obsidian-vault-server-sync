@@ -11,10 +11,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   // Cached <pre> element — reused across renders to avoid DOM teardown on mobile.
   private diagnosticsPre: HTMLElement | null = null;
   private unsubDiagnostics: (() => void) | null = null;
-  // rAF-based coalescing flag: true while a requestAnimationFrame render is queued.
-  // Paint-driven coalescing aligns with the browser render cycle and fires reliably
-  // on iOS WKWebView where setTimeout can stall during engine bursts.
-  private renderRafPending = false;
   private previewEl: HTMLElement | null = null;
 
   constructor(app: App, private plugin: VaultSyncPlugin) {
@@ -22,10 +18,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   }
 
   hide(): void {
-    // Discard any queued rAF render so it doesn't fire after tab close.
-    // The rAF callback captures renderRafPending by closure; resetting the flag
-    // causes the callback to exit early even if the browser fires it late.
-    this.renderRafPending = false;
     // Clean up live update subscription when settings tab is closed.
     if (this.unsubDiagnostics) {
       this.unsubDiagnostics();
@@ -39,9 +31,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     // containerEl.empty() destroys the previous <pre>; reset so renderDiagnostics
     // rebuilds the full DOM structure on next call.
     this.diagnosticsPre = null;
-    // Defensive reset: if iOS resume-from-background skipped hide(), a stale
-    // renderRafPending=true would permanently gate the next handler invocation.
-    this.renderRafPending = false;
 
     containerEl.createEl("h2", { text: "Vault Sync Settings" });
 
@@ -216,19 +205,12 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     this.renderDiagnostics();
 
     // Subscribe to live updates while settings tab is open.
-    // The engine fires onDiagnosticsChange per-doc during pulls (~20 events/batch).
-    // Coalesce bursts with requestAnimationFrame so at most one render executes per
-    // paint frame. rAF is more reliable than setTimeout on iOS WKWebView, where
-    // timers can stall during heavy engine activity.
+    // Render synchronously on every event — rAF coalescing was removed in #42
+    // because rAF callbacks don't fire during sync on iOS Obsidian either.
+    // The cached <pre> (diagnosticsPre) makes each render a cheap textContent
+    // assignment, so synchronous rendering per event is affordable.
     if (this.unsubDiagnostics) this.unsubDiagnostics();
-    const handler = () => {
-      if (this.renderRafPending) return;
-      this.renderRafPending = true;
-      requestAnimationFrame(() => {
-        this.renderRafPending = false;
-        this.renderDiagnostics();
-      });
-    };
+    const handler = () => this.renderDiagnostics();
     this.plugin.subscribeDiagnostics(handler);
     this.unsubDiagnostics = () => this.plugin.unsubscribeDiagnostics(handler);
   }

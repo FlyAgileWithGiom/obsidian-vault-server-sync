@@ -232,7 +232,8 @@ describe("VaultSyncSettingTab — diagnostics live render (sync)", () => {
     plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
     tab = makeTab(plugin);
     tab.display();
-    // Reset spy count AFTER display() which does the initial render
+    // Reset counts AFTER display() which builds initial DOM and does initial render
+    settingConstructorCount = 0;
     (plugin.getDiagnostics as ReturnType<typeof vi.fn>).mockClear();
   });
 
