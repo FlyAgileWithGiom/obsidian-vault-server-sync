@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, PluginSettingTab, Setting } from "obsidian";
 import type VaultSyncPlugin from "./main";
 import type { SyncDiagnostics, FullSyncPlan } from "./types";
 
@@ -158,10 +158,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Force full sync")
-      .setDesc("Reset all sync state and re-fetch everything (destructive — use only after DB swap or to re-evaluate orphans/tombstones)")
+      .setName("Merge with server")
+      .setDesc("Push all local content + pull all server content. Conflicts resolved by last-modified. Local artifacts WILL be pushed to the server. Use when re-evaluating orphans or after DB swap.")
       .addButton((btn) =>
-        btn.setButtonText("Full sync").onClick(async () => {
+        btn.setButtonText("Merge").onClick(async () => {
           btn.setButtonText("Syncing...");
           btn.setDisabled(true);
           try {
@@ -171,9 +171,21 @@ export class VaultSyncSettingTab extends PluginSettingTab {
             btn.setButtonText("Error");
           }
           setTimeout(() => {
-            btn.setButtonText("Full sync");
+            btn.setButtonText("Merge");
             btn.setDisabled(false);
           }, 2000);
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Replace local from server")
+      .setDesc("Delete local files tracked by sync, then re-download from the server. Local files not yet synced will be LOST. Server is source of truth.")
+      .addButton((btn) =>
+        btn.setButtonText("Replace").onClick(() => {
+          const { revMapSize } = this.plugin.getDiagnostics();
+          new ReplaceConfirmModal(this.app, revMapSize, () => {
+            this.plugin.replaceLocalFromServer();
+          }).open();
         })
       );
 
@@ -230,7 +242,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     if (d.lastError) {
       lines.push(`Last error: ${d.lastError}`);
     }
-    // Render timestamp — empirical proof that renders are firing on the device.
+    // Render timestamp -- empirical proof that renders are firing on the device.
     // If this value doesn't update during sync, the render path is broken upstream.
     lines.push(`Last render: ${new Date().toLocaleTimeString()}`);
     return lines.join("\n");
@@ -240,7 +252,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     function fmtBucket(bucket: { count: number; sample: string[] }): string {
       if (bucket.count === 0) return "0";
       const samples = bucket.sample.join(", ");
-      return `${bucket.count} — ${samples}`;
+      return `${bucket.count} -- ${samples}`;
     }
 
     return [
@@ -316,7 +328,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     const text = this.formatDiagnostics(d);
 
     if (this.diagnosticsPre && this.diagnosticsPre.parentElement === this.diagnosticsEl) {
-      // Fast path: element exists and is still attached — just update the text.
+      // Fast path: element exists and is still attached -- just update the text.
       this.diagnosticsPre.textContent = text;
       return;
     }
@@ -361,5 +373,34 @@ export class VaultSyncSettingTab extends PluginSettingTab {
           setTimeout(() => btn.setButtonText("Copy"), 1500);
         })
       );
+  }
+}
+
+/**
+ * Confirmation modal shown before the destructive "Replace local from server" action.
+ * Requires explicit user confirmation before wiping local tracked files.
+ */
+class ReplaceConfirmModal extends Modal {
+  constructor(app: App, private trackedCount: number, private onConfirm: () => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.contentEl.createEl("h3", { text: "Replace local from server" });
+    this.contentEl.createEl("p", {
+      text: `This will delete ${this.trackedCount} local files and re-download them from the server. Local files not yet synced will be lost. Continue?`,
+    });
+    const btnRow = this.contentEl.createDiv({ cls: "modal-button-container" });
+    const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
+    cancelBtn.onclick = () => this.close();
+    const confirmBtn = btnRow.createEl("button", { text: "Yes, replace local", cls: "mod-warning" });
+    confirmBtn.onclick = () => {
+      this.close();
+      this.onConfirm();
+    };
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }

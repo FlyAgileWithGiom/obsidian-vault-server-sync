@@ -84,6 +84,20 @@ export default class VaultSyncPlugin extends Plugin {
       callback: () => this.forceFullSync(),
     });
 
+    // "merge-with-server" is the preferred name for force-full-sync (semantically accurate).
+    // The old "force-full-sync" id is kept so existing keybindings survive a rename.
+    this.addCommand({
+      id: "merge-with-server",
+      name: "Merge with server",
+      callback: () => this.forceFullSync(),
+    });
+
+    this.addCommand({
+      id: "replace-local-from-server",
+      name: "Replace local from server (destructive)",
+      callback: () => this.replaceLocalFromServer(),
+    });
+
     // Register vault events for local change tracking.
     // Convert raw TAbstractFile → VaultEntry before delegating so syncEngine
     // receives the `kind` discriminator it requires (bug: raw TAbstractFile has
@@ -228,6 +242,15 @@ export default class VaultSyncPlugin extends Plugin {
     // fullSync({bypassOrphanGuard:true})/poll lifecycle. Routing through a
     // plain start() here drops the bypass flag and leaves revMap empty.
     await this.syncEngine.forceFullSync();
+  }
+
+  /**
+   * Public: DESTRUCTIVE — deletes all locally-tracked files then re-downloads from
+   * the server. Use when local has artifacts that must not be pushed.
+   * Called from the settings tab and from the replace-local-from-server command.
+   */
+  async replaceLocalFromServer(): Promise<void> {
+    await this.syncEngine.replaceLocalFromServer();
   }
 
   /**
