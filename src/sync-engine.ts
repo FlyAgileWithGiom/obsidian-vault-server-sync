@@ -425,6 +425,51 @@ export class SyncEngine {
   }
 
   /**
+   * DESTRUCTIVE: deletes every FS file currently tracked by revMap, then re-pulls
+   * everything from the server. The server is the source of truth.
+   *
+   * Use when local has artifacts (orphan files from past failed syncs) that must
+   * NOT be propagated to the server — Force full sync would push them.
+   *
+   * Untracked files (not in revMap) are PRESERVED — they're the user's own work
+   * that sync never touched.
+   */
+  async replaceLocalFromServer(): Promise<void> {
+    this.stop();
+
+    // Phase 1: delete every tracked file from FS.
+    // Iterate a snapshot of the revMap keys so the loop is not affected by
+    // clearState() which we call right after.
+    const trackedDocIds = Object.keys(this.revMap);
+    for (const docId of trackedDocIds) {
+      const path = docIdToPath(docId);
+      if (this.isExcluded(path)) continue;
+      const normalized = this.normalizePath(path);
+      const file = this.vault.getEntryByPath(normalized);
+      if (file && file.kind === "file") {
+        try { await this.vault.deleteFile(file); } catch { /* best effort, continue */ }
+        await this.cleanupEmptyParents(normalized);
+      }
+    }
+
+    // Phase 2: clear sync state and run a full server-first pull (bypassOrphanGuard=true).
+    this.clearState();
+    if (!this.client.isConfigured()) { this.setState("not-configured"); return; }
+    this.running = true;
+    this.setState("syncing");
+    try {
+      await this.client.ensureDb();
+      await this.fullSync({ bypassOrphanGuard: true });
+      this.setState("ok");
+      this.startPolling();
+    } catch (e) {
+      this.running = false;
+      this.setState("error");
+      this.setError(`Replace local from server failed: ${(e as Error).message}`);
+    }
+  }
+
+  /**
    * Dry-run version of forceFullSync: produces a FullSyncPlan describing exactly
    * what would happen without executing any writes.
    *
@@ -740,6 +785,24 @@ export class SyncEngine {
       }
     }
 
+    // Phase 2.5: bulk content-compare for files that are on remote but not in revMap.
+    // This is the hot path after clearState() (e.g. forceFullSync): all files are in
+    // remoteRevs but revMap is empty, so the steady-state mtime-skip can't fire.
+    // Without this phase every file would go through pushTextFile (N individual GETs),
+    // even if local content is identical to remote. Bulk fetch + string compare avoids
+    // re-pushing unchanged content.
+    //
+    // Steady-state push (revMap populated): fast path via mtime skip (line below).
+    // Post-clearState push (revMap empty): this bulk compare avoids re-pushing identical
+    // content — only files with local changes go through the bulkDocs push path.
+    const handledByBulkCompare = await this.bulkPushExistingRemoteDocs(
+      files.filter((f) => {
+        const docId = pathToDocId(f.path);
+        return remoteRevs.has(docId) && !this.revMap[docId] && !this.isBinaryDoc(docId);
+      }),
+      remoteRevs,
+    );
+
     // Phase 3: push genuinely new files, delete locally any tombstoned ones
     const batch: CouchDoc[] = [];
 
@@ -750,6 +813,9 @@ export class SyncEngine {
       if (fi % 100 === 99) await this.yield();
 
       if (remoteRevs.has(docId)) {
+        // Skip files already resolved by bulk content-compare (Phase 2.5)
+        if (handledByBulkCompare.has(docId)) continue;
+
         // Trou A fix: skip push only when file has not changed since last sync.
         // mtime:0 means migration default (unknown mtime) — treat as changed → push.
         const entry = this.revMap[docId];
@@ -835,6 +901,105 @@ export class SyncEngine {
       await this.pushBatch(batch);
       this.emitCounts();
     }
+  }
+
+  /**
+   * Phase 2.5 helper: bulk fetch remote content for text files that are in remoteRevs
+   * but have no revMap entry (typical after clearState). Compare local vs remote content:
+   * - If equal: populate revMap as "known" (skip push entirely).
+   * - If different: queue for bulkDocs push with the remote _rev to avoid 409 conflicts.
+   * - If chunk fetch fails: log warning, return empty set so main loop handles as fallback.
+   *
+   * Binary files are excluded — they have attachments, not inline content.
+   *
+   * Returns a Set of docIds that were fully handled (either matched or pushed via bulkDocs).
+   * The main loop checks this set and skips those docIds to avoid double-push.
+   */
+  private async bulkPushExistingRemoteDocs(
+    needCompareFiles: VaultFile[],
+    remoteRevs: Map<string, string>,
+  ): Promise<Set<string>> {
+    const handled = new Set<string>();
+    if (needCompareFiles.length === 0) return handled;
+
+    // Process in META_BATCH_SIZE chunks to stay within CouchDB request limits.
+    for (let i = 0; i < needCompareFiles.length; i += META_BATCH_SIZE) {
+      const chunk = needCompareFiles.slice(i, i + META_BATCH_SIZE);
+      const chunkIds = chunk.map((f) => pathToDocId(f.path));
+
+      let batchResult;
+      try {
+        batchResult = await this.client.allDocsByKeys(chunkIds, META_TIMEOUT_MS);
+      } catch (e) {
+        // Network blip or server error: skip this chunk, let per-file path handle it.
+        console.warn(`[vault-sync] Bulk content-compare chunk failed (${(e as Error).message}); falling back to per-file path for ${chunk.length} files`);
+        continue;
+      }
+
+      // Build a lookup from the batch result for O(1) access per file.
+      const remoteByDocId = new Map<string, { rev: string; content: string | null | undefined }>();
+      for (const row of batchResult.rows) {
+        if (!row.error && row.doc && !row.doc.deleted) {
+          remoteByDocId.set(row.id, { rev: row.doc._rev!, content: row.doc.content });
+        }
+      }
+
+      const diffBatch: CouchDoc[] = [];
+
+      for (const file of chunk) {
+        const docId = pathToDocId(file.path);
+        const remote = remoteByDocId.get(docId);
+
+        if (!remote) {
+          // Error or missing doc: safety net — let per-file path handle it.
+          continue;
+        }
+
+        if (remote.content === undefined || remote.content === null) {
+          // Binary doc stored without inline content (attachment-only): skip.
+          // The per-file pushBinaryFile path handles these correctly.
+          continue;
+        }
+
+        // Read local content.
+        let localContent: string;
+        try {
+          localContent = await this.vault.readText(file);
+          this.unsyncableFiles.delete(file.path);
+        } catch (e) {
+          const check = isRecoverableReadError(e);
+          if (check.recoverable) {
+            this.unsyncableFiles.set(file.path, {
+              reason: check.code ?? "unknown",
+              firstSeen: this.unsyncableFiles.get(file.path)?.firstSeen ?? Date.now(),
+              retryAfter: Date.now() + 60_000,
+            });
+            // Don't mark as handled — per-file path will retry next sync.
+            continue;
+          }
+          throw e; // Non-recoverable: propagate
+        }
+
+        if (localContent === remote.content) {
+          // Content matches: no push needed. Populate revMap so mtime-skip fires next sync.
+          this.revMap[docId] = { state: "known", rev: remote.rev, mtime: file.mtime };
+          handled.add(docId);
+        } else {
+          // Content differs: queue for bulkDocs with _rev to avoid 409 conflicts.
+          diffBatch.push({ _id: docId, _rev: remote.rev, content: localContent, mtime: file.mtime });
+          handled.add(docId);
+        }
+      }
+
+      // Flush diff batch in chunks of 10 (same limit as Phase 3 new-file pushes).
+      for (let j = 0; j < diffBatch.length; j += 10) {
+        await this.pushBatch(diffBatch.slice(j, j + 10));
+        this.emitCounts();
+        await this.yield();
+      }
+    }
+
+    return handled;
   }
 
   private async pushBatch(batch: CouchDoc[]): Promise<void> {
