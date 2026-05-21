@@ -215,6 +215,17 @@ export class Notice {
   constructor(_msg: string, _timeout?: number) {}
 }
 
+export class Modal {
+  contentEl: HTMLElement;
+  constructor(_app: unknown) {
+    this.contentEl = document.createElement("div");
+  }
+  open(): void {}
+  close(): void {}
+  onOpen(): void {}
+  onClose(): void {}
+}
+
 export class App {
   vault = new Vault();
 }

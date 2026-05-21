@@ -25,6 +25,8 @@ vi.mock("./sync-engine", () => ({
     onError: null,
     onDiagnosticsChange: null,
     getDiagnostics: vi.fn().mockReturnValue({}),
+    replaceLocalFromServer: vi.fn().mockResolvedValue(undefined),
+    planFullSync: vi.fn().mockResolvedValue({}),
   })),
 }));
 
@@ -495,5 +497,34 @@ describe("VaultSyncPlugin.previewFullSync", () => {
 
     expect(planFullSync).toHaveBeenCalledWith({ bypassOrphanGuard: true });
     expect(result).toBe(mockPlan);
+  });
+});
+
+describe("VaultSyncPlugin.replaceLocalFromServer", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("delegates to syncEngine.replaceLocalFromServer", async () => {
+    const plugin = makePlugin();
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => "test-vault";
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    const syncEngineInstance = vi.mocked(SyncEngine).mock.results.at(-1)!.value;
+
+    await plugin.replaceLocalFromServer();
+
+    expect(syncEngineInstance.replaceLocalFromServer).toHaveBeenCalled();
+    // Must not fall back to a destructive alternative
+    expect(syncEngineInstance.forceFullSync).not.toHaveBeenCalled();
+    expect(syncEngineInstance.start).not.toHaveBeenCalled();
   });
 });

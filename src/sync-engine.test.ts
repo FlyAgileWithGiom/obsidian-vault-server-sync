@@ -3808,6 +3808,135 @@ describe("resumeFullSync (non-destructive)", () => {
   });
 });
 
+describe("replaceLocalFromServer", () => {
+  // Each test uses a fresh Vault/VaultAdapter/settings and pre-populated StateStore
+  // so it is isolated from the outer SyncEngine describe's beforeEach.
+  let rVault: Vault;
+  let rAdapter: TestVaultAdapter;
+  let rSettings: VaultSyncSettings;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    rVault = new Vault();
+    rAdapter = new TestVaultAdapter(rVault);
+    rSettings = makeSettings();
+  });
+
+  it("deletes tracked files only — untracked files are preserved", async () => {
+    // revMap tracks a.md and b.md; vault also has c.md (untracked).
+    // Server returns empty allDocs (server is empty for simplicity).
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/a.md": { state: "known", rev: "1-a", mtime: 1000 },
+      "file/b.md": { state: "known", rev: "1-b", mtime: 1000 },
+    }));
+    rVault._addFile("a.md", "content a", 1000);
+    rVault._addFile("b.md", "content b", 1000);
+    rVault._addFile("c.md", "untracked content", 2000);
+
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    // Server is empty
+    c.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await eng.replaceLocalFromServer();
+
+    // Tracked files must be deleted
+    expect(rAdapter.getEntryByPath("a.md")).toBeNull();
+    expect(rAdapter.getEntryByPath("b.md")).toBeNull();
+    // Untracked file must be preserved
+    expect(rAdapter.getEntryByPath("c.md")).not.toBeNull();
+
+    eng.stop();
+  });
+
+  it("pulls from server after wipe — server docs are re-downloaded", async () => {
+    // revMap has 2 entries; vault has those 2 files.
+    // Server has 3 docs: the 2 matching revMap + 1 new doc d.md.
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/a.md": { state: "known", rev: "1-a", mtime: 1000 },
+      "file/b.md": { state: "known", rev: "1-b", mtime: 1000 },
+    }));
+    rVault._addFile("a.md", "old a", 1000);
+    rVault._addFile("b.md", "old b", 1000);
+
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    // Server has all 3 docs
+    c.allDocs.mockResolvedValue({
+      total_rows: 3,
+      rows: [
+        { id: "file/a.md", key: "file/a.md", value: { rev: "2-a" } },
+        { id: "file/b.md", key: "file/b.md", value: { rev: "2-b" } },
+        { id: "file/d.md", key: "file/d.md", value: { rev: "1-d" } },
+      ],
+    });
+    // allDocsByKeys returns content for pull
+    c.allDocsByKeys.mockResolvedValue({
+      total_rows: 3,
+      rows: [
+        { id: "file/a.md", key: "file/a.md", value: { rev: "2-a" }, doc: { _id: "file/a.md", _rev: "2-a", content: "from server a", mtime: 2000 } },
+        { id: "file/b.md", key: "file/b.md", value: { rev: "2-b" }, doc: { _id: "file/b.md", _rev: "2-b", content: "from server b", mtime: 2000 } },
+        { id: "file/d.md", key: "file/d.md", value: { rev: "1-d" }, doc: { _id: "file/d.md", _rev: "1-d", content: "from server", mtime: 3000 } },
+      ],
+    });
+    c.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+    await eng.replaceLocalFromServer();
+
+    // All 3 server docs must exist in vault after the call
+    expect(rVault._getContent("a.md")).toBe("from server a");
+    expect(rVault._getContent("b.md")).toBe("from server b");
+    expect(rVault._getContent("d.md")).toBe("from server");
+
+    eng.stop();
+  });
+
+  it("does NOT push any tracked file during the run", async () => {
+    // revMap has 2 tracked files; vault has exactly those 2 files.
+    // After Phase 1 (wipe tracked) the vault files are gone, so pushAllLocal
+    // sees no tracked files in the vault → no push calls.
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/a.md": { state: "known", rev: "1-a", mtime: 1000 },
+      "file/b.md": { state: "known", rev: "1-b", mtime: 1000 },
+    }));
+    rVault._addFile("a.md", "content a", 1000);
+    rVault._addFile("b.md", "content b", 1000);
+
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    // Server mirrors the 2 tracked docs exactly
+    c.allDocs.mockResolvedValue({
+      total_rows: 2,
+      rows: [
+        { id: "file/a.md", key: "file/a.md", value: { rev: "1-a" } },
+        { id: "file/b.md", key: "file/b.md", value: { rev: "1-b" } },
+      ],
+    });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "3", results: [] });
+
+    await eng.replaceLocalFromServer();
+
+    // bulkDocs must not have been called with non-tombstone payloads.
+    // (pushAllLocal uses bulkDocs for text batch push; tombstone deletes use bulkDocs too
+    // but those are _deleted payloads which we don't produce here since there are no
+    // locally-deleted known files — the wipe is done outside the sync lifecycle.)
+    const bulkCalls = c.bulkDocs.mock.calls as Array<[CouchDoc[]]>;
+    const contentPushes = bulkCalls.flatMap(([batch]) => batch).filter((d) => !d._deleted);
+    expect(contentPushes).toHaveLength(0);
+
+    eng.stop();
+  });
+});
+
 describe("lwwWinner", () => {
   it("returns local when mtimes are equal (already have it, no need to fetch)", () => {
     expect(lwwWinner(1000, 1000)).toBe("local");
