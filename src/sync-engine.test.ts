@@ -509,6 +509,167 @@ describe("SyncEngine", () => {
       const last = capturedRevMapSizes[capturedRevMapSizes.length - 1];
       expect(last).toBeGreaterThan(first);
     });
+
+    // ---------------------------------------------------------------------------
+    // Phase 2.5: bulk content-compare for files in remoteRevs without revMap entry
+    // ---------------------------------------------------------------------------
+    describe("bulk content-compare (Phase 2.5)", () => {
+      it("does not push files when local content matches remote (no re-push after clearState)", async () => {
+        // Simulate post-clearState scenario: 5 files exist locally AND on remote,
+        // but revMap is empty (just cleared). Local content matches remote exactly.
+        // Expected: no per-file put for these files; revMap populated as "known".
+        vault._addFile("notes/a.md", "hello", 1000);
+        vault._addFile("notes/b.md", "hello", 2000);
+        vault._addFile("notes/c.md", "hello", 3000);
+        vault._addFile("notes/d.md", "hello", 4000);
+        vault._addFile("notes/e.md", "hello", 5000);
+
+        const client = getClient(engine);
+        // allDocs returns all 5 docIds (they exist on remote)
+        client.allDocs.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "2-a" } },
+            { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "2-b" } },
+            { id: "file/notes/c.md", key: "file/notes/c.md", value: { rev: "2-c" } },
+            { id: "file/notes/d.md", key: "file/notes/d.md", value: { rev: "2-d" } },
+            { id: "file/notes/e.md", key: "file/notes/e.md", value: { rev: "2-e" } },
+          ],
+        });
+        // allDocsByKeys (include_docs=true) returns remote content identical to local
+        client.allDocsByKeys.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "2-a" }, doc: { _id: "file/notes/a.md", _rev: "2-a", content: "hello", mtime: 900 } },
+            { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "2-b" }, doc: { _id: "file/notes/b.md", _rev: "2-b", content: "hello", mtime: 900 } },
+            { id: "file/notes/c.md", key: "file/notes/c.md", value: { rev: "2-c" }, doc: { _id: "file/notes/c.md", _rev: "2-c", content: "hello", mtime: 900 } },
+            { id: "file/notes/d.md", key: "file/notes/d.md", value: { rev: "2-d" }, doc: { _id: "file/notes/d.md", _rev: "2-d", content: "hello", mtime: 900 } },
+            { id: "file/notes/e.md", key: "file/notes/e.md", value: { rev: "2-e" }, doc: { _id: "file/notes/e.md", _rev: "2-e", content: "hello", mtime: 900 } },
+          ],
+        });
+        client.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+        // forceFullSync: clearState() → fullSync (empty revMap, all 5 files in remoteRevs)
+        await engine.forceFullSync();
+
+        // No push payloads for these 5 files (neither via bulkDocs nor per-file put)
+        const allBulkCalls: CouchDoc[][] = client.bulkDocs.mock.calls as CouchDoc[][];
+        const pushedIds = allBulkCalls.flatMap((args) => args[0]).map((d) => d._id);
+        expect(pushedIds).not.toContain("file/notes/a.md");
+        expect(pushedIds).not.toContain("file/notes/b.md");
+        expect(pushedIds).not.toContain("file/notes/c.md");
+        expect(pushedIds).not.toContain("file/notes/d.md");
+        expect(pushedIds).not.toContain("file/notes/e.md");
+
+        // Per-file put must NOT be called — no per-file push for matching content
+        const putCallIds = (client.put.mock.calls as Array<[CouchDoc]>)
+          .map(([doc]) => doc._id);
+        expect(putCallIds).not.toContain("file/notes/a.md");
+        expect(putCallIds).not.toContain("file/notes/b.md");
+        expect(putCallIds).not.toContain("file/notes/c.md");
+        expect(putCallIds).not.toContain("file/notes/d.md");
+        expect(putCallIds).not.toContain("file/notes/e.md");
+
+        // revMap must be populated for all 5 files as "known" (by bulk compare)
+        const diag = engine.getDiagnostics();
+        expect(diag.revMapSize).toBe(5);
+        expect(diag.knownRevMapSize).toBe(5);
+      });
+
+      it("pushes only files where local content differs from remote, skips matching ones", async () => {
+        // 5 files on remote; 3 match local content, 2 differ.
+        // Expected: bulkDocs called with exactly the 2 diff files.
+        vault._addFile("notes/match1.md", "same", 1000);
+        vault._addFile("notes/match2.md", "same", 2000);
+        vault._addFile("notes/match3.md", "same", 3000);
+        vault._addFile("notes/diff1.md", "local-version", 4000);
+        vault._addFile("notes/diff2.md", "local-version", 5000);
+
+        const client = getClient(engine);
+        client.allDocs.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/match1.md", key: "file/notes/match1.md", value: { rev: "2-m1" } },
+            { id: "file/notes/match2.md", key: "file/notes/match2.md", value: { rev: "2-m2" } },
+            { id: "file/notes/match3.md", key: "file/notes/match3.md", value: { rev: "2-m3" } },
+            { id: "file/notes/diff1.md",  key: "file/notes/diff1.md",  value: { rev: "2-d1" } },
+            { id: "file/notes/diff2.md",  key: "file/notes/diff2.md",  value: { rev: "2-d2" } },
+          ],
+        });
+        client.allDocsByKeys.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/match1.md", key: "file/notes/match1.md", value: { rev: "2-m1" }, doc: { _id: "file/notes/match1.md", _rev: "2-m1", content: "same", mtime: 900 } },
+            { id: "file/notes/match2.md", key: "file/notes/match2.md", value: { rev: "2-m2" }, doc: { _id: "file/notes/match2.md", _rev: "2-m2", content: "same", mtime: 900 } },
+            { id: "file/notes/match3.md", key: "file/notes/match3.md", value: { rev: "2-m3" }, doc: { _id: "file/notes/match3.md", _rev: "2-m3", content: "same", mtime: 900 } },
+            { id: "file/notes/diff1.md",  key: "file/notes/diff1.md",  value: { rev: "2-d1" }, doc: { _id: "file/notes/diff1.md",  _rev: "2-d1", content: "remote-version", mtime: 900 } },
+            { id: "file/notes/diff2.md",  key: "file/notes/diff2.md",  value: { rev: "2-d2" }, doc: { _id: "file/notes/diff2.md",  _rev: "2-d2", content: "remote-version", mtime: 900 } },
+          ],
+        });
+        client.bulkDocs.mockImplementation((batch: CouchDoc[]) =>
+          Promise.resolve(batch.map((d) => ({ ok: true, id: d._id, rev: "3-x" })))
+        );
+        client.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+        await engine.forceFullSync();
+
+        // Exactly the 2 diff files must be pushed; matching files must NOT be pushed
+        const allBulkCalls: CouchDoc[][] = client.bulkDocs.mock.calls as CouchDoc[][];
+        const pushedIds = allBulkCalls.flatMap((args) => args[0]).map((d) => d._id);
+        expect(pushedIds).toContain("file/notes/diff1.md");
+        expect(pushedIds).toContain("file/notes/diff2.md");
+        expect(pushedIds).not.toContain("file/notes/match1.md");
+        expect(pushedIds).not.toContain("file/notes/match2.md");
+        expect(pushedIds).not.toContain("file/notes/match3.md");
+
+        // Push payload for diff files must include _rev to avoid 409 conflicts
+        const diffPush = allBulkCalls.flatMap((args) => args[0]).find((d) => d._id === "file/notes/diff1.md");
+        expect(diffPush?._rev).toBe("2-d1");
+      });
+
+      it("falls back to per-file path (pushTextFile via put) when allDocsByKeys chunk throws", async () => {
+        // Safety net: if the bulk content-compare fetch fails, existing per-file
+        // path handles those files — no data loss.
+        // pushTextFile calls client.put() (not bulkDocs), so we assert put() is called.
+        vault._addFile("notes/a.md", "hello", 1000);
+        vault._addFile("notes/b.md", "hello", 2000);
+        vault._addFile("notes/c.md", "hello", 3000);
+        vault._addFile("notes/d.md", "hello", 4000);
+        vault._addFile("notes/e.md", "hello", 5000);
+
+        const client = getClient(engine);
+        client.allDocs.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "2-a" } },
+            { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "2-b" } },
+            { id: "file/notes/c.md", key: "file/notes/c.md", value: { rev: "2-c" } },
+            { id: "file/notes/d.md", key: "file/notes/d.md", value: { rev: "2-d" } },
+            { id: "file/notes/e.md", key: "file/notes/e.md", value: { rev: "2-e" } },
+          ],
+        });
+        // Bulk content-compare throws (network blip)
+        client.allDocsByKeys.mockRejectedValue(new Error("network timeout"));
+        // client.get throws "not found" — pushTextFile pushes as new with no _rev
+        client.get.mockRejectedValue(new Error("not found"));
+        // client.put succeeds so the per-file fallback path can push
+        client.put.mockResolvedValue({ ok: true, id: "x", rev: "3-x" });
+        client.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+        // Must not throw — engine must degrade gracefully
+        await expect(engine.forceFullSync()).resolves.not.toThrow();
+
+        // Per-file fallback: client.put must be called for each of the 5 files
+        // (pushTextFile uses put, not bulkDocs, for per-file pushes)
+        const putCallIds = (client.put.mock.calls as Array<[CouchDoc]>)
+          .map(([doc]) => doc._id);
+        expect(putCallIds).toContain("file/notes/a.md");
+        expect(putCallIds).toContain("file/notes/b.md");
+        expect(putCallIds).toContain("file/notes/c.md");
+        expect(putCallIds).toContain("file/notes/d.md");
+        expect(putCallIds).toContain("file/notes/e.md");
+      });
+    });
   });
 
   describe("fullSync - pull", () => {
