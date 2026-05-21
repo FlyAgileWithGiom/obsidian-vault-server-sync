@@ -437,10 +437,16 @@ export class SyncEngine {
   async replaceLocalFromServer(): Promise<void> {
     this.stop();
 
+    if (!this.client.isConfigured()) { this.setState("not-configured"); return; }
+    this.running = true;
+    this.setState("syncing");
+
     // Phase 1: delete every tracked file from FS.
     // Iterate a snapshot of the revMap keys so the loop is not affected by
     // clearState() which we call right after.
+    // Emit progress every 10 files so the UI clock keeps ticking during large vaults.
     const trackedDocIds = Object.keys(this.revMap);
+    let deleteCount = 0;
     for (const docId of trackedDocIds) {
       const path = docIdToPath(docId);
       if (this.isExcluded(path)) continue;
@@ -450,13 +456,15 @@ export class SyncEngine {
         try { await this.vault.deleteFile(file); } catch { /* best effort, continue */ }
         await this.cleanupEmptyParents(normalized);
       }
+      deleteCount++;
+      if (deleteCount % 10 === 0) {
+        this.emitCounts();
+        await this.yield();
+      }
     }
 
     // Phase 2: clear sync state and run a full server-first pull (bypassOrphanGuard=true).
     this.clearState();
-    if (!this.client.isConfigured()) { this.setState("not-configured"); return; }
-    this.running = true;
-    this.setState("syncing");
     try {
       await this.client.ensureDb();
       await this.fullSync({ bypassOrphanGuard: true });
