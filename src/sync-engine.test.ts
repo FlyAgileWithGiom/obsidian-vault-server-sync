@@ -4096,6 +4096,48 @@ describe("replaceLocalFromServer", () => {
 
     eng.stop();
   });
+
+  it("emits onCountsChange during Phase 1 delete loop when vault has many tracked files", async () => {
+    // Pre-populate revMap with 60 tracked files and matching vault entries.
+    // This mirrors the iOS scenario where Phase 1 alone takes many seconds and
+    // the UI clock must keep ticking during the wipe, not only after Phase 2 starts.
+    const store = new TestStateStore();
+    const revMapEntries: Record<string, { state: string; rev: string; mtime: number }> = {};
+    for (let i = 0; i < 60; i++) {
+      revMapEntries[`file/notes/file${i}.md`] = { state: "known", rev: `1-${i}`, mtime: 1000 + i };
+    }
+    store.set("vault-sync-revmap", JSON.stringify(revMapEntries));
+
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    for (let i = 0; i < 60; i++) {
+      rVault._addFile(`notes/file${i}.md`, `content ${i}`, 1000 + i);
+    }
+
+    const c = getClient(eng);
+
+    // Track whether Phase 2 has started (allDocs is the first Phase 2 network call).
+    let phase2Started = false;
+    c.allDocs.mockImplementation(() => {
+      phase2Started = true;
+      return Promise.resolve({ total_rows: 0, rows: [] });
+    });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    // Count onCountsChange calls that fire BEFORE Phase 2 begins.
+    let countsBeforePhase2 = 0;
+    eng.onCountsChange = () => {
+      if (!phase2Started) countsBeforePhase2++;
+    };
+
+    await eng.replaceLocalFromServer();
+
+    // Before fix: 0 — emitCounts() is never called during the Phase 1 delete loop.
+    // After fix: ≥ 1 — emitCounts() fires periodically inside the loop.
+    expect(countsBeforePhase2).toBeGreaterThanOrEqual(1);
+
+    eng.stop();
+  });
 });
 
 describe("lwwWinner", () => {
