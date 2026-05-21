@@ -48,6 +48,11 @@
  * PHASES of fullSync (in strict order):
  *   1. reconcileLocalDeletes : known entries with no FS file → tombstoned
  *   2. pushAllLocal          : push files to DB, skip tombstoned/orphan
+ *      2.5 bulk content-compare (inside pushAllLocal): for files in remoteRevs
+ *          with no revMap entry, batch-fetch remote content and compare strings.
+ *          Steady-state push (revMap populated): fast path via mtime skip.
+ *          Post-clearState push (revMap empty, e.g. forceFullSync): bulk compare
+ *          avoids re-pushing identical content — only changed files reach bulkDocs.
  *   3. pullAllRemote         : pull rev-mismatched known entries from DB
  *   4. pullBinaryDocs        : fetch binary attachments
  *   5. polling (changes feed): incremental updates after fullSync
