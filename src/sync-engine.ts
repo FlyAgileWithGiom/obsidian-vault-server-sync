@@ -88,6 +88,10 @@ const BINARY_PULL_TIMEOUT_MS = 120_000;
 // 7000+ keys timed out (30s default) on slow CouchDB connections — see GitHub #15.
 const META_BATCH_SIZE = 500;
 const META_TIMEOUT_MS = 60_000;
+// Page size for the initial remote-index scan in fullSync. A single unbounded
+// allDocs over 7000+ ids stayed silent for 30-60s on iOS while building the
+// remote rev index; pagination lets emitCounts tick between pages.
+const FULLSYNC_SCAN_PAGE_SIZE = 2000;
 
 const CONTENT_TYPE_MAP: Record<string, string> = {
   png: "image/png",
@@ -648,14 +652,31 @@ export class SyncEngine {
   async fullSync(opts: { bypassOrphanGuard?: boolean } = {}): Promise<void> {
     this.setState("syncing");
     try {
-      // Fetch remote rev index (no content) -- lightweight, ~15K rows with just id+rev
-      const remoteIndex = await this.client.allDocs({
-        startkey: DOC_PREFIX,
-        endkey: `${DOC_PREFIX}￿`,
-      });
+      // Fetch remote rev index (no content) -- lightweight metadata only.
+      // Paginated so the diagnostics clock ticks across the scan: a single
+      // unbounded allDocs over 7000+ ids took 30-60s of complete UI silence
+      // on iOS. We use limit = PAGE_SIZE + 1 as a lookahead: when the last
+      // call returns fewer than that, we've hit the end. The lookahead row
+      // becomes the next startkey (inclusive), so no row is dropped.
       const remoteRevs = new Map<string, string>();
-      for (const row of remoteIndex.rows) {
-        remoteRevs.set(row.id, row.value.rev);
+      const endkey = `${DOC_PREFIX}￿`;
+      let startkey: string = DOC_PREFIX;
+      while (true) {
+        const page = await this.client.allDocs({
+          startkey,
+          endkey,
+          limit: FULLSYNC_SCAN_PAGE_SIZE + 1,
+        });
+        const rows = page.rows;
+        const lookaheadHit = rows.length > FULLSYNC_SCAN_PAGE_SIZE;
+        const consumed = lookaheadHit ? rows.slice(0, FULLSYNC_SCAN_PAGE_SIZE) : rows;
+        for (const row of consumed) {
+          remoteRevs.set(row.id, row.value.rev);
+        }
+        this.emitCounts();
+        if (!lookaheadHit) break;
+        await this.yield();
+        startkey = rows[FULLSYNC_SCAN_PAGE_SIZE].id;
       }
 
       await this.reconcileLocalDeletes(remoteRevs);
@@ -1202,6 +1223,15 @@ export class SyncEngine {
         // Metadata chunk failed (e.g. timeout) — track affected docs, don't abort full pull.
         console.warn(`[vault-sync] Binary metadata chunk [${offset}..${offset + chunk.length - 1}] failed: ${(e as Error).message}`);
         for (const id of chunk) metaFailedDocIds.add(id);
+      }
+      // Surface progress so the diagnostics clock keeps ticking across chunk
+      // boundaries — on iOS with thousands of binary docs each chunk can take
+      // many seconds, and without this the UI looks frozen even though work
+      // is in flight. yield() is gated on "more chunks to come" so it never
+      // dangles past the final iteration (matters under vi.useFakeTimers).
+      this.emitCounts();
+      if (offset + META_BATCH_SIZE < docIds.length) {
+        await this.yield();
       }
     }
 
