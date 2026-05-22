@@ -4138,6 +4138,56 @@ describe("replaceLocalFromServer", () => {
 
     eng.stop();
   });
+
+  it("emits onCountsChange between binary metadata chunks during Phase 2", async () => {
+    // Phase 2 of Replace runs fullSync → pullAllRemote → pullBinaryDocs.
+    // pullBinaryDocs fetches doc metadata in chunks of META_BATCH_SIZE (500) to
+    // stay within CouchDB request limits. With 1100 binary docs that means
+    // 3 sequential `allDocsByKeys` calls. On iOS each chunk can take several
+    // seconds; without progress emit between them the UI clock stays frozen
+    // for the entire metadata-fetch phase.
+    //
+    // 1100 .png docs returned from allDocs with no attachment data → meta loop
+    // runs in full, every doc classifies as binary orphan, no download happens.
+    // This isolates the meta-fetch loop as the signal source.
+    const store = new TestStateStore();
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    const TOTAL_BINARIES = 1100; // > 2*META_BATCH_SIZE so we get at least 3 chunks
+    const remoteRows = Array.from({ length: TOTAL_BINARIES }, (_, i) => ({
+      id: `file/img${i}.png`,
+      key: `file/img${i}.png`,
+      value: { rev: `1-r${i}` },
+    }));
+    c.allDocs.mockResolvedValue({ total_rows: TOTAL_BINARIES, rows: remoteRows });
+
+    // Mark each meta-chunk call so we can scope assertions to "between chunks".
+    const events: string[] = [];
+    c.allDocsByKeys.mockImplementation(async () => {
+      events.push("meta-chunk");
+      return { total_rows: 0, rows: [] };
+    });
+    c.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    eng.onCountsChange = () => events.push("emit");
+
+    await eng.replaceLocalFromServer();
+
+    const chunkIndices = events
+      .map((e, i) => (e === "meta-chunk" ? i : -1))
+      .filter((i) => i >= 0);
+    expect(chunkIndices.length).toBeGreaterThanOrEqual(3);
+
+    // Between every pair of consecutive meta-chunk events, at least one emit
+    // must have fired — otherwise the UI clock is frozen for that span.
+    for (let i = 0; i < chunkIndices.length - 1; i++) {
+      const between = events.slice(chunkIndices[i] + 1, chunkIndices[i + 1]);
+      expect(between).toContain("emit");
+    }
+
+    eng.stop();
+  });
 });
 
 describe("lwwWinner", () => {
