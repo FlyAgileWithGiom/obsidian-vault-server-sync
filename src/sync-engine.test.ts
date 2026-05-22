@@ -4188,6 +4188,62 @@ describe("replaceLocalFromServer", () => {
 
     eng.stop();
   });
+
+  it("emits onCountsChange between pages of the initial remote-index scan", async () => {
+    // Phase 2 begins with `client.allDocs({startkey, endkey})` to build the
+    // remote rev index. Before pagination this was a single network round-trip
+    // that on iOS with 7000+ docs took 30-60s of complete UI silence — no
+    // state change, no count emit, "Last render" frozen.
+    //
+    // After pagination the scan must walk pages and emit progress between them
+    // so the diagnostics clock keeps ticking.
+    const store = new TestStateStore();
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    // 12000 docs forces multiple pages at any sane page size up to 6000.
+    // Each id is zero-padded so byte-wise sort matches numeric order.
+    const TOTAL = 12000;
+    const allRows: Array<{ id: string; key: string; value: { rev: string } }> = [];
+    for (let i = 0; i < TOTAL; i++) {
+      const id = `file/doc${String(i).padStart(6, "0")}.md`;
+      allRows.push({ id, key: id, value: { rev: `1-r${i}` } });
+    }
+
+    // Realistic CouchDB allDocs mock: honours startkey (inclusive) and limit.
+    // Any docId in the prefix range is matched.
+    const events: string[] = [];
+    c.allDocs.mockImplementation(async (opts: { startkey?: string; limit?: number }) => {
+      events.push("scan-page");
+      const startkey = opts.startkey ?? "";
+      const limit = opts.limit ?? allRows.length;
+      const startIdx = allRows.findIndex((r) => r.id >= startkey);
+      const slice = startIdx === -1 ? [] : allRows.slice(startIdx, startIdx + limit);
+      return { total_rows: allRows.length, rows: slice };
+    });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    eng.onCountsChange = () => events.push("emit");
+
+    await eng.forceFullSync();
+
+    const pageIndices = events
+      .map((e, i) => (e === "scan-page" ? i : -1))
+      .filter((i) => i >= 0);
+
+    // Pagination must produce ≥ 2 scan-page calls for 12K docs.
+    expect(pageIndices.length).toBeGreaterThanOrEqual(2);
+
+    // Between every pair of consecutive pages, at least one emit must fire —
+    // otherwise the UI clock is frozen for that span.
+    for (let i = 0; i < pageIndices.length - 1; i++) {
+      const between = events.slice(pageIndices[i] + 1, pageIndices[i + 1]);
+      expect(between).toContain("emit");
+    }
+
+    eng.stop();
+  });
 });
 
 describe("lwwWinner", () => {
