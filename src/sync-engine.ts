@@ -1203,6 +1203,12 @@ export class SyncEngine {
         console.warn(`[vault-sync] Binary metadata chunk [${offset}..${offset + chunk.length - 1}] failed: ${(e as Error).message}`);
         for (const id of chunk) metaFailedDocIds.add(id);
       }
+      // Surface progress so the diagnostics clock keeps ticking across chunk
+      // boundaries — on iOS with thousands of binary docs each chunk can take
+      // many seconds, and without this the UI looks frozen even though work
+      // is in flight.
+      this.emitCounts();
+      await this.yield();
     }
 
     // Classify docs: meta-fetch-failed (transient skip), real orphans (no attachment), or download
