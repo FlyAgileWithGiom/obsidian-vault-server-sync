@@ -4307,6 +4307,69 @@ describe("pull throughput instrumentation", () => {
   });
 });
 
+describe("parallel text apply (PARALLEL_TEXT_APPLY)", () => {
+  // Issue #57: pullTextDocs currently applies docs sequentially within each
+  // batch of 20. pullBinaryDocs already mirrors this with PARALLEL_BINARY_PULLS=5.
+  // Mirror the same pattern for text so pathological apply latency (cloud-sync
+  // interception, huge content) doesn't serialize the whole batch.
+
+  it("pulls K docs in roughly K/5 * apply_ms when applyRemoteDoc is slow", async () => {
+    const storeWithRevMap = new TestStateStore();
+    // Pre-populate revMap with stale revs so orphan guard passes for all 10 docs.
+    const revMap: Record<string, { state: string; rev: string; mtime: number }> = {};
+    for (let i = 0; i < 10; i++) {
+      revMap[`file/notes/n${i}.md`] = { state: "known", rev: "0-old", mtime: 0 };
+    }
+    storeWithRevMap.set("vault-sync-revmap", JSON.stringify(revMap));
+
+    const localVault = new Vault();
+    const localAdapter = new TestVaultAdapter(localVault);
+    const eng = new SyncEngine(makeSettings(), localAdapter, storeWithRevMap, noopTransport);
+    const client = getClient(eng);
+
+    const docRows = Array.from({ length: 10 }, (_, i) => ({
+      id: `file/notes/n${i}.md`, key: `file/notes/n${i}.md`, value: { rev: `1-${i}` },
+    }));
+    client.allDocs.mockResolvedValue({ total_rows: 10, rows: docRows });
+
+    client.allDocsByKeys.mockImplementation(async (keys: string[]) => {
+      return {
+        total_rows: keys.length,
+        rows: keys.map((id) => ({
+          id, key: id, value: { rev: id.includes("n") ? `1-${id.slice(-4, -3)}` : "1-x" },
+          doc: { _id: id, _rev: `1-${id.slice(-4, -3)}`, content: `content of ${id}`, mtime: 1000 },
+        })),
+      };
+    });
+
+    // modifyText / createText awaits 60ms — pathological "apply" cost.
+    // Sequential 10 docs => ~600ms. Parallel by 5 => ~120ms.
+    const origCreate = localVault.create.bind(localVault);
+    localVault.create = async (path: unknown, content: unknown) => {
+      await new Promise((r) => setTimeout(r, 60));
+      return origCreate(path as never, content as never);
+    };
+
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+    client.ensureDb.mockResolvedValue(undefined);
+
+    const t0 = performance.now();
+    await eng.forceFullSync();
+    const elapsed = performance.now() - t0;
+
+    // Parallel-by-5: 10 docs / 5 = 2 chunks, each ~60ms, plus fixed overhead.
+    // Sequential would be ~600ms+. Assert well under that to confirm parallelism.
+    // Allow generous slack for CI variance (200ms cap means parallelism is working).
+    expect(elapsed).toBeLessThan(300);
+
+    // All 10 docs were applied
+    for (let i = 0; i < 10; i++) {
+      expect(localVault.getAbstractFileByPath(`notes/n${i}.md`)).not.toBeNull();
+    }
+    eng.stop();
+  });
+});
+
 describe("built-in exclusions (.vault-sync-state*)", () => {
   // Issue #55: even after relocating daemon state outside the vault, users with
   // legacy `.vault-sync-state*` files (including Dropbox/iCloud "conflicted copy"

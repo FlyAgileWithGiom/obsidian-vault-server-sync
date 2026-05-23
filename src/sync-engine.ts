@@ -92,6 +92,10 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TOD
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
 const ATTACHMENT_NAME = "data.bin";
 const PARALLEL_BINARY_PULLS = 5;
+// Mirrors PARALLEL_BINARY_PULLS for text apply. Sequential apply within a batch
+// serializes the whole pull on pathological cases (cloud-sync interception, huge
+// content); chunked Promise.allSettled keeps throughput resilient. See issue #57.
+const PARALLEL_TEXT_APPLY = 5;
 const BINARY_PULL_RETRIES = 3;
 const BINARY_PULL_TIMEOUT_MS = 120_000;
 // Chunk size for binary metadata pre-fetch (POST _all_docs). A single POST with
@@ -1209,29 +1213,44 @@ export class SyncEngine {
         }
       }
 
-      for (const doc of docs) {
-        if (doc) {
-          try {
+      // Apply docs in parallel chunks of PARALLEL_TEXT_APPLY. Mirrors the binary
+      // pull path. Errors are isolated per-doc via Promise.allSettled so one slow
+      // or failing doc does not block siblings in the chunk.
+      for (let chunkStart = 0; chunkStart < docs.length; chunkStart += PARALLEL_TEXT_APPLY) {
+        const chunk = docs.slice(chunkStart, chunkStart + PARALLEL_TEXT_APPLY);
+        const results = await Promise.allSettled(
+          chunk.map(async (doc) => {
+            if (!doc) return null;
             const applyStart = performance.now();
             await this.applyRemoteDoc(doc);
             this.recordApply(performance.now() - applyStart);
-            if (doc._rev) {
-              this.revMap[doc._id] = { state: "known", rev: doc._rev, mtime: doc.mtime ?? 0 };
+            return doc;
+          })
+        );
+
+        for (let j = 0; j < results.length; j++) {
+          const result = results[j];
+          const doc = chunk[j];
+          if (result.status === "fulfilled") {
+            const appliedDoc = result.value;
+            if (appliedDoc && appliedDoc._rev) {
+              this.revMap[appliedDoc._id] = { state: "known", rev: appliedDoc._rev, mtime: appliedDoc.mtime ?? 0 };
               this.pullApplied++;
+            } else if (!appliedDoc) {
+              // doc was null (allDocsByKeys row had error or missing doc)
+              this.pullSkipped++;
             }
-          } catch (e) {
+          } else {
             failCount++;
             this.pullSkipped++;
-            if (failCount <= 3) {
-              this.setError(`Pull ${doc._id.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+            if (failCount <= 3 && doc) {
+              this.setError(`Pull ${doc._id.slice(0, 40)}: ${(result.reason as Error).message?.slice(0, 80)}`);
             }
           }
-        } else {
-          this.pullSkipped++;
+          this.pullFetched++;
+          this.pullCount--;
+          this.emitCounts();
         }
-        this.pullFetched++;
-        this.pullCount--;
-        this.emitCounts();
       }
       await this.yield();
       this.persistState();
