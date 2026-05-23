@@ -19,12 +19,20 @@ import { slugify } from "./slugify";
 export default class VaultSyncPlugin extends Plugin {
   settings: VaultSyncSettings = { ...DEFAULT_SETTINGS };
   private syncEngine!: SyncEngine;
+  private vaultAdapter!: ObsidianVaultAdapter;
   private ribbonEl: HTMLElement | null = null;
   private statusBarEl: HTMLElement | null = null;
   private syncState: SyncState = "idle";
   private syncCounts: SyncCounts = { pendingPush: 0, pendingPull: 0 };
   private diagnosticsListeners: Set<() => void> = new Set();
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Vault name the engine was last initialised for. On iOS Obsidian, switching
+   * vault does NOT trigger onunload/onload, so the captured adapter + state keep
+   * pointing at the old vault. refreshIfVaultChanged() compares this snapshot
+   * to the live vault name and rebuilds the engine when they diverge (issue #56).
+   */
+  private engineVaultName: string = "";
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -36,14 +44,7 @@ export default class VaultSyncPlugin extends Plugin {
       await this.saveSettings();
     }
 
-    const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
-    const stateStore = new ObsidianStateStore();
-    const transport = new ObsidianTransport();
-    this.syncEngine = new SyncEngine(this.settings, vaultAdapter, stateStore, transport);
-    this.syncEngine.onStateChange = (state) => this.updateState(state);
-    this.syncEngine.onCountsChange = (counts) => this.updateCounts(counts);
-    this.syncEngine.onError = (msg) => this.handleSyncError(msg);
-    this.syncEngine.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    this.buildEngine();
 
     // Ribbon icon for sync toggle
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "Vault Sync", () => {
@@ -104,28 +105,28 @@ export default class VaultSyncPlugin extends Plugin {
     // no `kind`, causing all local-change handlers to silently return).
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
-        const entry = vaultAdapter.getEntryByPath(file.path);
+        const entry = this.vaultAdapter.getEntryByPath(file.path);
         if (entry) this.syncEngine.handleLocalChange(entry);
       })
     );
 
     this.registerEvent(
       this.app.vault.on("create", (file) => {
-        const entry = vaultAdapter.getEntryByPath(file.path);
+        const entry = this.vaultAdapter.getEntryByPath(file.path);
         if (entry) this.syncEngine.handleLocalChange(entry);
       })
     );
 
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
-        const entry = vaultAdapter.getEntryByPath(file.path);
+        const entry = this.vaultAdapter.getEntryByPath(file.path);
         if (entry) this.syncEngine.handleLocalDelete(entry);
       })
     );
 
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
-        const entry = vaultAdapter.getEntryByPath(file.path);
+        const entry = this.vaultAdapter.getEntryByPath(file.path);
         if (entry) this.syncEngine.handleLocalRename(entry, oldPath);
       })
     );
@@ -139,6 +140,53 @@ export default class VaultSyncPlugin extends Plugin {
         this.startSync();
       }, STARTUP_DELAY_MS);
     }
+  }
+
+  /**
+   * Construct (or reconstruct) the SyncEngine bound to the CURRENT vault.
+   * Captures the vault name so refreshIfVaultChanged() can detect drift.
+   */
+  private buildEngine(): void {
+    this.vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
+    const stateStore = new ObsidianStateStore();
+    const transport = new ObsidianTransport();
+    this.syncEngine = new SyncEngine(this.settings, this.vaultAdapter, stateStore, transport);
+    this.syncEngine.onStateChange = (state) => this.updateState(state);
+    this.syncEngine.onCountsChange = (counts) => this.updateCounts(counts);
+    this.syncEngine.onError = (msg) => this.handleSyncError(msg);
+    this.syncEngine.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    this.engineVaultName = this.app.vault.getName();
+  }
+
+  /**
+   * Rebuild the engine if the active vault has changed since onload.
+   *
+   * Obsidian iOS keeps the plugin instance alive across vault switches —
+   * onunload/onload are not called. Without this check, the captured
+   * SyncEngine + adapter keep pointing at the old vault and the diagnostics
+   * panel (and any other read) shows stale data. See issue #56.
+   *
+   * Returns true when a rebuild happened, false otherwise.
+   */
+  async refreshIfVaultChanged(): Promise<boolean> {
+    const current = this.app.vault.getName();
+    if (current === this.engineVaultName) return false;
+
+    this.syncEngine?.stop();
+    await this.loadSettings();
+    // Re-derive DB name for the new vault if user hasn't set one explicitly.
+    if (!this.settings.couchDbName) {
+      this.settings.couchDbName = `vault-${slugify(current)}`;
+      await this.saveSettings();
+    }
+    this.buildEngine();
+    this.notifyDiagnosticsListeners();
+
+    // Auto-restart sync for the new vault if it's configured.
+    if (this.settings.couchDbUrl && this.settings.couchDbName) {
+      this.startSync().catch((e) => this.handleSyncError((e as Error).message));
+    }
+    return true;
   }
 
   onunload(): void {
