@@ -4279,11 +4279,11 @@ describe("pull throughput instrumentation", () => {
       };
     });
 
-    // modifyText resolves after ~30ms to simulate FS latency; vault.modify is what TestVaultAdapter calls
-    const origModify = localVault.modify.bind(localVault);
-    localVault.modify = async (file: unknown, content: unknown) => {
+    // createText resolves after ~30ms to simulate FS latency; vault.create is what TestVaultAdapter calls
+    const origCreate = localVault.create.bind(localVault);
+    localVault.create = async (path: unknown, content: unknown) => {
       await new Promise((r) => setTimeout(r, 30));
-      return origModify(file as never, content as never);
+      return origCreate(path as never, content as never);
     };
 
     client.changes.mockResolvedValue({ last_seq: "1", results: [] });

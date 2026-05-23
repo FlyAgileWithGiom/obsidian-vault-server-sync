@@ -107,6 +107,10 @@ export interface SyncDiagnostics {
   unsyncableCount: number;
   /** Up to 5 paths of currently unsyncable files, for diagnostics UI */
   unsyncableSample: string[];
+  /** Rolling average (last 50 samples) of allDocsByKeys call duration in pullTextDocs, ms */
+  avgFetchMs: number | null;
+  /** Rolling average (last 50 samples) of applyRemoteDoc call duration in pullTextDocs, ms */
+  avgApplyMs: number | null;
 }
 
 /**
