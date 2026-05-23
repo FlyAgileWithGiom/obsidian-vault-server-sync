@@ -73,16 +73,22 @@ export function migrateStateFile(vaultRoot: string, newStatePath: string): void 
   let newExists = false;
   try { newExists = fs.statSync(newStatePath).isFile(); } catch { /* no new */ }
 
+  if (newExists) {
+    // New location wins. Unlink legacy so it stops being walked & re-conflicted.
+    // Isolated try/catch: a failed unlink here MUST NOT trigger the rename fallback,
+    // which would copy the legacy file over the current state (data loss).
+    try { fs.unlinkSync(legacy); }
+    catch (e) { console.warn(`[vault-sync] State migration: could not remove legacy ${legacy}: ${(e as Error).message}`); }
+    return;
+  }
+
   try {
-    if (newExists) {
-      // New location wins. Unlink legacy so it stops being walked & re-conflicted.
-      fs.unlinkSync(legacy);
-      return;
-    }
     fs.mkdirSync(path.dirname(newStatePath), { recursive: true });
     fs.renameSync(legacy, newStatePath);
   } catch (e) {
     // Cross-device rename (EXDEV) or transient I/O — fall back to copy+unlink.
+    // Safe here because the newExists branch returned above: target is absent
+    // so copyFileSync cannot clobber a current state file.
     try {
       fs.mkdirSync(path.dirname(newStatePath), { recursive: true });
       fs.copyFileSync(legacy, newStatePath);

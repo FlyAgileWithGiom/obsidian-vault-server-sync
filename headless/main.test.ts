@@ -232,4 +232,5 @@ describe("migrateStateFile", () => {
     // Legacy file is cleaned up so it cannot keep generating conflict copies.
     expect(fs.existsSync(oldPath)).toBe(false);
   });
+
 });
