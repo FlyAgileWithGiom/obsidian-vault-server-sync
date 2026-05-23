@@ -4246,6 +4246,67 @@ describe("replaceLocalFromServer", () => {
   });
 });
 
+describe("pull throughput instrumentation", () => {
+  it("records avgFetchMs and avgApplyMs after a full sync that pulls text docs", async () => {
+    // Arrange: two text docs in the remote index with stale revs in revMap so orphan guard passes
+    const storeWithRevMap = new TestStateStore();
+    storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+      "file/notes/a.md": { rev: "0-old", mtime: 0 },
+      "file/notes/b.md": { rev: "0-old", mtime: 0 },
+    }));
+    const localVault = new Vault();
+    const localAdapter = new TestVaultAdapter(localVault);
+    const eng = new SyncEngine(makeSettings(), localAdapter, storeWithRevMap, noopTransport);
+    const client = getClient(eng);
+
+    client.allDocs.mockResolvedValue({
+      total_rows: 2,
+      rows: [
+        { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "1-a" } },
+        { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "1-b" } },
+      ],
+    });
+
+    // allDocsByKeys resolves after ~50ms to simulate fetch latency
+    client.allDocsByKeys.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return {
+        total_rows: 2,
+        rows: [
+          { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "1-a" }, doc: { _id: "file/notes/a.md", _rev: "1-a", content: "doc a", mtime: 1000 } },
+          { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "1-b" }, doc: { _id: "file/notes/b.md", _rev: "1-b", content: "doc b", mtime: 1001 } },
+        ],
+      };
+    });
+
+    // createText resolves after ~30ms to simulate FS latency; vault.create is what TestVaultAdapter calls
+    const origCreate = localVault.create.bind(localVault);
+    localVault.create = async (path: unknown, content: unknown) => {
+      await new Promise((r) => setTimeout(r, 30));
+      return origCreate(path as never, content as never);
+    };
+
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+    client.ensureDb.mockResolvedValue(undefined);
+
+    // Act: forceFullSync triggers pullTextDocs
+    await eng.forceFullSync();
+
+    // Assert: metrics are non-null and in expected range
+    const diag = eng.getDiagnostics();
+    expect(diag.avgFetchMs).not.toBeNull();
+    expect(diag.avgApplyMs).not.toBeNull();
+    // fetch took ~50ms — allow wide range for CI variance
+    expect(diag.avgFetchMs!).toBeGreaterThan(10);
+    expect(diag.avgFetchMs!).toBeLessThan(500);
+    // apply took ~30ms per doc — allow wide range
+    expect(diag.avgApplyMs!).toBeGreaterThan(5);
+    expect(diag.avgApplyMs!).toBeLessThan(500);
+
+    eng.stop();
+  });
+});
+
 describe("lwwWinner", () => {
   it("returns local when mtimes are equal (already have it, no need to fetch)", () => {
     expect(lwwWinner(1000, 1000)).toBe("local");

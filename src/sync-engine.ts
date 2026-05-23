@@ -209,6 +209,9 @@ export class SyncEngine {
   private currentState: SyncState = "idle";
   /** Files skipped due to recoverable read errors (EAGAIN, EACCES, EIO, ENOENT). Cleared on successful read. */
   private unsyncableFiles: Map<string, { reason: string; firstSeen: number; retryAfter: number }> = new Map();
+  /** Ring buffers for pull throughput instrumentation (max 50 samples each) */
+  private fetchMsSamples: number[] = [];
+  private applyMsSamples: number[] = [];
 
   /** Callback to update UI state */
   onStateChange: (state: SyncState) => void = () => {};
@@ -257,7 +260,26 @@ export class SyncEngine {
       lastError: this.lastError,
       unsyncableCount: this.unsyncableFiles.size,
       unsyncableSample: [...this.unsyncableFiles.keys()].slice(0, 5),
+      avgFetchMs: this.avgOf(this.fetchMsSamples),
+      fetchSampleCount: this.fetchMsSamples.length,
+      avgApplyMs: this.avgOf(this.applyMsSamples),
+      applySampleCount: this.applyMsSamples.length,
     };
+  }
+
+  private avgOf(samples: number[]): number | null {
+    if (samples.length === 0) return null;
+    return samples.reduce((s, v) => s + v, 0) / samples.length;
+  }
+
+  private recordFetch(ms: number): void {
+    this.fetchMsSamples.push(ms);
+    if (this.fetchMsSamples.length > 50) this.fetchMsSamples.shift();
+  }
+
+  private recordApply(ms: number): void {
+    this.applyMsSamples.push(ms);
+    if (this.applyMsSamples.length > 50) this.applyMsSamples.shift();
   }
 
   private setState(state: SyncState): void {
@@ -1161,7 +1183,9 @@ export class SyncEngine {
       let docs: (CouchDoc | null)[];
 
       try {
+        const fetchStart = performance.now();
         const result = await this.client.allDocsByKeys(batchKeys);
+        this.recordFetch(performance.now() - fetchStart);
         docs = result.rows.map((row) => (row.error || !row.doc) ? null : row.doc);
       } catch {
         // Batch failed -- fall back to individual GETs
@@ -1178,7 +1202,9 @@ export class SyncEngine {
       for (const doc of docs) {
         if (doc) {
           try {
+            const applyStart = performance.now();
             await this.applyRemoteDoc(doc);
+            this.recordApply(performance.now() - applyStart);
             if (doc._rev) {
               this.revMap[doc._id] = { state: "known", rev: doc._rev, mtime: doc.mtime ?? 0 };
               this.pullApplied++;
