@@ -78,6 +78,16 @@ import type {
 const REVMAP_KEY = "vault-sync-revmap";
 const SEQ_KEY = "vault-sync-last-seq";
 const DOC_PREFIX = "file/";
+/**
+ * Path prefixes that are NEVER synced, regardless of user configuration.
+ * Critical for protecting the vault from re-importing sync internals — including
+ * Dropbox/iCloud "conflicted copy" variants like
+ * ".vault-sync-state (Guillaume's conflicted copy 2026-05-23).json".
+ * See issue #55: prefix-match (not exact) catches every variant.
+ */
+const ALWAYS_EXCLUDED_PREFIXES: readonly string[] = [
+  ".vault-sync-state",
+];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
 const ATTACHMENT_NAME = "data.bin";
@@ -1934,6 +1944,7 @@ export class SyncEngine {
   // --- Utilities ---
 
   private isExcluded(path: string): boolean {
+    if (ALWAYS_EXCLUDED_PREFIXES.some((prefix) => path.startsWith(prefix))) return true;
     return this.settings.excludePatterns.some((pattern) => path.startsWith(pattern));
   }
 }

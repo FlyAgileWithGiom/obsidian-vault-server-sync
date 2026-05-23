@@ -4307,6 +4307,96 @@ describe("pull throughput instrumentation", () => {
   });
 });
 
+describe("built-in exclusions (.vault-sync-state*)", () => {
+  // Issue #55: even after relocating daemon state outside the vault, users with
+  // legacy `.vault-sync-state*` files (including Dropbox/iCloud "conflicted copy"
+  // variants) need protection against re-importing them on next sync. The exclusion
+  // must be BUILT-IN (not user-configurable) — clearing settings.excludePatterns
+  // must NOT disable this protection.
+
+  it("does not push .vault-sync-state.json even when user clears excludePatterns", async () => {
+    const v = new Vault();
+    v._addFile(".vault-sync-state.json", "{\"some\":\"state\"}", 1000);
+    v._addFile("notes/keep.md", "real content", 1000);
+    const va = new TestVaultAdapter(v);
+    const ss = new TestStateStore();
+    // User explicitly cleared all exclude patterns
+    const e = new SyncEngine(makeSettings({ excludePatterns: [] }), va, ss, noopTransport);
+    const client = getClient(e);
+    client.get.mockRejectedValue(new Error("not found"));
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/keep.md", rev: "1-a" }]);
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await e.start();
+
+    const pushedIds: string[] = [];
+    for (const call of client.bulkDocs.mock.calls) {
+      for (const doc of call[0]) pushedIds.push(doc._id);
+    }
+    expect(pushedIds).not.toContain("file/.vault-sync-state.json");
+    expect(pushedIds).toContain("file/notes/keep.md");
+    e.stop();
+  });
+
+  it("does not push Dropbox conflicted-copy variant .vault-sync-state (Guillaume's conflicted copy 2026-05-23).json", async () => {
+    // Literal pathological filename from the production incident (issue #54/#55).
+    const conflictedName = ".vault-sync-state (Guillaume's conflicted copy 2026-05-23).json";
+    const v = new Vault();
+    v._addFile(conflictedName, "{\"phantom\":\"state\"}", 1000);
+    v._addFile("notes/keep.md", "real content", 1000);
+    const va = new TestVaultAdapter(v);
+    const ss = new TestStateStore();
+    const e = new SyncEngine(makeSettings({ excludePatterns: [] }), va, ss, noopTransport);
+    const client = getClient(e);
+    client.get.mockRejectedValue(new Error("not found"));
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/keep.md", rev: "1-a" }]);
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await e.start();
+
+    const pushedIds: string[] = [];
+    for (const call of client.bulkDocs.mock.calls) {
+      for (const doc of call[0]) pushedIds.push(doc._id);
+    }
+    expect(pushedIds).not.toContain(`file/${conflictedName}`);
+    expect(pushedIds).toContain("file/notes/keep.md");
+    e.stop();
+  });
+
+  it("does not pull a remote .vault-sync-state*.json doc to FS", async () => {
+    const v = new Vault();
+    const va = new TestVaultAdapter(v);
+    const ss = new TestStateStore();
+    const e = new SyncEngine(makeSettings({ excludePatterns: [] }), va, ss, noopTransport);
+    const client = getClient(e);
+
+    // Server has a phantom state file (e.g. pushed by a misconfigured peer)
+    const phantomId = "file/.vault-sync-state (conflicted copy).json";
+    client.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: phantomId, key: phantomId, value: { rev: "1-x" } }],
+    });
+    client.allDocsByKeys.mockResolvedValue({
+      total_rows: 1,
+      rows: [{
+        id: phantomId, key: phantomId, value: { rev: "1-x" },
+        doc: { _id: phantomId, _rev: "1-x", content: "{}", mtime: 1000 },
+      }],
+    });
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await e.forceFullSync();
+
+    // The phantom file must NOT have been created locally
+    expect(v.getAbstractFileByPath(".vault-sync-state (conflicted copy).json")).toBeNull();
+    e.stop();
+  });
+});
+
 describe("lwwWinner", () => {
   it("returns local when mtimes are equal (already have it, no need to fetch)", () => {
     expect(lwwWinner(1000, 1000)).toBe("local");
