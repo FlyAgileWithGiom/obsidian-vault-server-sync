@@ -239,12 +239,14 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       lines.push(`Pull progress: ${d.pullProgress.fetched} / ${d.pullProgress.total}`);
       lines.push(`Pull applied: ${d.pullApplied}, skipped: ${d.pullSkipped}`);
     }
-    if (d.avgFetchMs !== null) {
-      lines.push(`Avg fetch (text pull): ${Math.round(d.avgFetchMs)} ms (${d.fetchSampleCount} samples)`);
-    }
-    if (d.avgApplyMs !== null) {
-      lines.push(`Avg apply: ${Math.round(d.avgApplyMs)} ms (${d.applySampleCount} samples)`);
-    }
+    // Always render throughput lines — "0 samples" is diagnostic when text pulls haven't fired yet
+    // (e.g. still in binary phase, or allDocsByKeys throwing). Hiding them when null masked the
+    // instrumentation from the user entirely, making it impossible to distinguish "not shipped"
+    // from "no text pulls ran" (issue #52).
+    const fetchLabel = d.avgFetchMs !== null ? `${Math.round(d.avgFetchMs)} ms` : "--";
+    lines.push(`Avg fetch (text pull): ${fetchLabel} (${d.fetchSampleCount} samples)`);
+    const applyLabel = d.avgApplyMs !== null ? `${Math.round(d.avgApplyMs)} ms` : "--";
+    lines.push(`Avg apply: ${applyLabel} (${d.applySampleCount} samples)`);
     if (d.lastError) {
       lines.push(`Last error: ${d.lastError}`);
     }
