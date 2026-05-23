@@ -4307,6 +4307,159 @@ describe("pull throughput instrumentation", () => {
   });
 });
 
+describe("parallel text apply (PARALLEL_TEXT_APPLY)", () => {
+  // Issue #57: pullTextDocs currently applies docs sequentially within each
+  // batch of 20. pullBinaryDocs already mirrors this with PARALLEL_BINARY_PULLS=5.
+  // Mirror the same pattern for text so pathological apply latency (cloud-sync
+  // interception, huge content) doesn't serialize the whole batch.
+
+  it("pulls K docs in roughly K/5 * apply_ms when applyRemoteDoc is slow", async () => {
+    const storeWithRevMap = new TestStateStore();
+    // Pre-populate revMap with stale revs so orphan guard passes for all 10 docs.
+    const revMap: Record<string, { state: string; rev: string; mtime: number }> = {};
+    for (let i = 0; i < 10; i++) {
+      revMap[`file/notes/n${i}.md`] = { state: "known", rev: "0-old", mtime: 0 };
+    }
+    storeWithRevMap.set("vault-sync-revmap", JSON.stringify(revMap));
+
+    const localVault = new Vault();
+    const localAdapter = new TestVaultAdapter(localVault);
+    const eng = new SyncEngine(makeSettings(), localAdapter, storeWithRevMap, noopTransport);
+    const client = getClient(eng);
+
+    const docRows = Array.from({ length: 10 }, (_, i) => ({
+      id: `file/notes/n${i}.md`, key: `file/notes/n${i}.md`, value: { rev: `1-${i}` },
+    }));
+    client.allDocs.mockResolvedValue({ total_rows: 10, rows: docRows });
+
+    client.allDocsByKeys.mockImplementation(async (keys: string[]) => {
+      return {
+        total_rows: keys.length,
+        rows: keys.map((id) => ({
+          id, key: id, value: { rev: id.includes("n") ? `1-${id.slice(-4, -3)}` : "1-x" },
+          doc: { _id: id, _rev: `1-${id.slice(-4, -3)}`, content: `content of ${id}`, mtime: 1000 },
+        })),
+      };
+    });
+
+    // modifyText / createText awaits 60ms — pathological "apply" cost.
+    // Sequential 10 docs => ~600ms. Parallel by 5 => ~120ms.
+    const origCreate = localVault.create.bind(localVault);
+    localVault.create = async (path: unknown, content: unknown) => {
+      await new Promise((r) => setTimeout(r, 60));
+      return origCreate(path as never, content as never);
+    };
+
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+    client.ensureDb.mockResolvedValue(undefined);
+
+    const t0 = performance.now();
+    await eng.forceFullSync();
+    const elapsed = performance.now() - t0;
+
+    // Parallel-by-5: 10 docs / 5 = 2 chunks, each ~60ms, plus fixed overhead.
+    // Sequential would be ~600ms+. Assert well under that to confirm parallelism.
+    // Allow generous slack for CI variance (200ms cap means parallelism is working).
+    expect(elapsed).toBeLessThan(300);
+
+    // All 10 docs were applied
+    for (let i = 0; i < 10; i++) {
+      expect(localVault.getAbstractFileByPath(`notes/n${i}.md`)).not.toBeNull();
+    }
+    eng.stop();
+  });
+});
+
+describe("built-in exclusions (.vault-sync-state*)", () => {
+  // Issue #55: even after relocating daemon state outside the vault, users with
+  // legacy `.vault-sync-state*` files (including Dropbox/iCloud "conflicted copy"
+  // variants) need protection against re-importing them on next sync. The exclusion
+  // must be BUILT-IN (not user-configurable) — clearing settings.excludePatterns
+  // must NOT disable this protection.
+
+  it("does not push .vault-sync-state.json even when user clears excludePatterns", async () => {
+    const v = new Vault();
+    v._addFile(".vault-sync-state.json", "{\"some\":\"state\"}", 1000);
+    v._addFile("notes/keep.md", "real content", 1000);
+    const va = new TestVaultAdapter(v);
+    const ss = new TestStateStore();
+    // User explicitly cleared all exclude patterns
+    const e = new SyncEngine(makeSettings({ excludePatterns: [] }), va, ss, noopTransport);
+    const client = getClient(e);
+    client.get.mockRejectedValue(new Error("not found"));
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/keep.md", rev: "1-a" }]);
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await e.start();
+
+    const pushedIds: string[] = [];
+    for (const call of client.bulkDocs.mock.calls) {
+      for (const doc of call[0]) pushedIds.push(doc._id);
+    }
+    expect(pushedIds).not.toContain("file/.vault-sync-state.json");
+    expect(pushedIds).toContain("file/notes/keep.md");
+    e.stop();
+  });
+
+  it("does not push Dropbox conflicted-copy variant .vault-sync-state (Guillaume's conflicted copy 2026-05-23).json", async () => {
+    // Literal pathological filename from the production incident (issue #54/#55).
+    const conflictedName = ".vault-sync-state (Guillaume's conflicted copy 2026-05-23).json";
+    const v = new Vault();
+    v._addFile(conflictedName, "{\"phantom\":\"state\"}", 1000);
+    v._addFile("notes/keep.md", "real content", 1000);
+    const va = new TestVaultAdapter(v);
+    const ss = new TestStateStore();
+    const e = new SyncEngine(makeSettings({ excludePatterns: [] }), va, ss, noopTransport);
+    const client = getClient(e);
+    client.get.mockRejectedValue(new Error("not found"));
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/keep.md", rev: "1-a" }]);
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await e.start();
+
+    const pushedIds: string[] = [];
+    for (const call of client.bulkDocs.mock.calls) {
+      for (const doc of call[0]) pushedIds.push(doc._id);
+    }
+    expect(pushedIds).not.toContain(`file/${conflictedName}`);
+    expect(pushedIds).toContain("file/notes/keep.md");
+    e.stop();
+  });
+
+  it("does not pull a remote .vault-sync-state*.json doc to FS", async () => {
+    const v = new Vault();
+    const va = new TestVaultAdapter(v);
+    const ss = new TestStateStore();
+    const e = new SyncEngine(makeSettings({ excludePatterns: [] }), va, ss, noopTransport);
+    const client = getClient(e);
+
+    // Server has a phantom state file (e.g. pushed by a misconfigured peer)
+    const phantomId = "file/.vault-sync-state (conflicted copy).json";
+    client.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: phantomId, key: phantomId, value: { rev: "1-x" } }],
+    });
+    client.allDocsByKeys.mockResolvedValue({
+      total_rows: 1,
+      rows: [{
+        id: phantomId, key: phantomId, value: { rev: "1-x" },
+        doc: { _id: phantomId, _rev: "1-x", content: "{}", mtime: 1000 },
+      }],
+    });
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await e.forceFullSync();
+
+    // The phantom file must NOT have been created locally
+    expect(v.getAbstractFileByPath(".vault-sync-state (conflicted copy).json")).toBeNull();
+    e.stop();
+  });
+});
+
 describe("lwwWinner", () => {
   it("returns local when mtimes are equal (already have it, no need to fetch)", () => {
     expect(lwwWinner(1000, 1000)).toBe("local");

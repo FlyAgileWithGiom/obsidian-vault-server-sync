@@ -26,6 +26,12 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   }
 
   display(): void {
+    // On iOS Obsidian, vault switches don't reload the plugin (#56). Opening
+    // the settings panel is the natural moment to detect and recover from
+    // engine-vault drift. Fire-and-forget — UI builds immediately and the
+    // engine rebuild notifies diagnostics listeners on its own.
+    this.plugin.refreshIfVaultChanged?.().catch(() => { /* logged in handleSyncError */ });
+
     const { containerEl } = this;
     containerEl.empty();
     // containerEl.empty() destroys the previous <pre>; reset so renderDiagnostics

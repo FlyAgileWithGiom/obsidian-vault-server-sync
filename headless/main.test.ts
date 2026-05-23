@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createWatcher } from "./main";
+import { createWatcher, resolveStatePath, migrateStateFile } from "./main";
 import type { VaultFile, VaultEntry } from "../src/types";
 
 // ---------------------------------------------------------------------------
@@ -143,4 +143,94 @@ describe("createWatcher (native fs.watch integration)", () => {
     );
     expect(excludedCalls).toHaveLength(0);
   });
+});
+
+// ---------------------------------------------------------------------------
+// State file location (issue #54)
+// ---------------------------------------------------------------------------
+
+describe("resolveStatePath", () => {
+  // The 2026-05-23 incident: daemon wrote .vault-sync-state.json at vault root.
+  // When the vault lives in Dropbox/iCloud, cloud sync creates "conflicted copy"
+  // variants of the state file on every fast write burst. Those copies are then
+  // walked as user content and pushed to CouchDB. Infinite loop.
+  // Fix: state file must live OUTSIDE the vault and outside cloud-sync scope.
+
+  it("returns a path outside the vault root (macOS Application Support)", () => {
+    const vaultRoot = "/Users/alice/Dropbox/MyVault";
+    const dbName = "vault-myvault";
+    const result = resolveStatePath(vaultRoot, dbName, { platform: "darwin", home: "/Users/alice" });
+    expect(result.startsWith(vaultRoot)).toBe(false);
+    expect(result).toBe("/Users/alice/Library/Application Support/vault-sync-daemon/vault-myvault/state.json");
+  });
+
+  it("returns ~/.config path on Linux", () => {
+    const result = resolveStatePath("/home/bob/vault", "vault-bob", { platform: "linux", home: "/home/bob" });
+    expect(result).toBe("/home/bob/.config/vault-sync-daemon/vault-bob/state.json");
+  });
+
+  it("returns %APPDATA% path on Windows", () => {
+    const result = resolveStatePath("C:\\vault", "vault-x", {
+      platform: "win32", home: "C:\\Users\\X", appData: "C:\\Users\\X\\AppData\\Roaming",
+    });
+    // path.join produces forward slashes on Linux test host, but the leading
+    // %APPDATA% segment must be preserved.
+    expect(result).toContain("vault-sync-daemon");
+    expect(result).toContain("vault-x");
+    expect(result).toContain("state.json");
+    expect(result).toContain("AppData");
+  });
+
+  it("disambiguates by dbName (different vaults => different state paths)", () => {
+    const a = resolveStatePath("/Users/alice/A", "vault-a", { platform: "darwin", home: "/Users/alice" });
+    const b = resolveStatePath("/Users/alice/B", "vault-b", { platform: "darwin", home: "/Users/alice" });
+    expect(a).not.toBe(b);
+  });
+});
+
+describe("migrateStateFile", () => {
+  let vaultRoot: string;
+  let newStateDir: string;
+  let newStatePath: string;
+
+  beforeEach(() => {
+    vaultRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vault-migrate-"));
+    newStateDir = fs.mkdtempSync(path.join(os.tmpdir(), "vault-state-"));
+    newStatePath = path.join(newStateDir, "state.json");
+  });
+
+  afterEach(() => {
+    fs.rmSync(vaultRoot, { recursive: true, force: true });
+    fs.rmSync(newStateDir, { recursive: true, force: true });
+  });
+
+  it("moves legacy .vault-sync-state.json from vault root to the new location", () => {
+    const oldPath = path.join(vaultRoot, ".vault-sync-state.json");
+    fs.writeFileSync(oldPath, '{"vault-sync-revmap":"legacy"}', "utf-8");
+
+    migrateStateFile(vaultRoot, newStatePath);
+
+    expect(fs.existsSync(oldPath)).toBe(false);
+    expect(fs.existsSync(newStatePath)).toBe(true);
+    expect(fs.readFileSync(newStatePath, "utf-8")).toBe('{"vault-sync-revmap":"legacy"}');
+  });
+
+  it("does nothing when no legacy file exists", () => {
+    migrateStateFile(vaultRoot, newStatePath);
+    expect(fs.existsSync(newStatePath)).toBe(false);
+  });
+
+  it("preserves the new state when both exist (do not overwrite newer state with legacy)", () => {
+    const oldPath = path.join(vaultRoot, ".vault-sync-state.json");
+    fs.writeFileSync(oldPath, '{"legacy":"DO NOT USE"}', "utf-8");
+    fs.writeFileSync(newStatePath, '{"current":"KEEP ME"}', "utf-8");
+
+    migrateStateFile(vaultRoot, newStatePath);
+
+    // New location wins — legacy file is removed but new content stays intact.
+    expect(fs.readFileSync(newStatePath, "utf-8")).toBe('{"current":"KEEP ME"}');
+    // Legacy file is cleaned up so it cannot keep generating conflict copies.
+    expect(fs.existsSync(oldPath)).toBe(false);
+  });
+
 });

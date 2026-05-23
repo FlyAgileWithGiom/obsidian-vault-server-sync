@@ -500,6 +500,94 @@ describe("VaultSyncPlugin.previewFullSync", () => {
   });
 });
 
+describe("VaultSyncPlugin.refreshIfVaultChanged (issue #56)", () => {
+  // Symptom: on Obsidian iOS, switching vault A -> vault B keeps the diagnostics
+  // panel showing vault A's values. iOS keeps the plugin instance alive across
+  // vault switches (desktop reloads the plugin, masking the bug). The captured
+  // syncEngine + adapter still point at vault A.
+  //
+  // Fix: plugin remembers the vault name it was initialized for. When asked to
+  // refresh, it checks the current vault name; if different, it stops the old
+  // engine and rebuilds one bound to the new vault.
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("recreates the SyncEngine when app.vault.getName() differs from the loaded name", async () => {
+    const plugin = makePlugin();
+    let currentVault = "vault-A";
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => currentVault;
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    const initialEngineCount = vi.mocked(SyncEngine).mock.results.length;
+    const initialEngine = vi.mocked(SyncEngine).mock.results.at(-1)!.value;
+
+    // Simulate iOS vault switch: app.vault.getName() now returns vault-B,
+    // but the plugin instance is unchanged.
+    currentVault = "vault-B";
+
+    const refreshed = await (plugin as unknown as { refreshIfVaultChanged: () => Promise<boolean> })
+      .refreshIfVaultChanged();
+
+    expect(refreshed).toBe(true);
+    // A new SyncEngine instance was constructed
+    expect(vi.mocked(SyncEngine).mock.results.length).toBeGreaterThan(initialEngineCount);
+    // Previous engine was stopped
+    expect(initialEngine.stop).toHaveBeenCalled();
+  });
+
+  it("is a no-op when the vault has not changed", async () => {
+    const plugin = makePlugin();
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => "stable-vault";
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    const engineCount = vi.mocked(SyncEngine).mock.results.length;
+    const initialEngine = vi.mocked(SyncEngine).mock.results.at(-1)!.value;
+
+    const refreshed = await (plugin as unknown as { refreshIfVaultChanged: () => Promise<boolean> })
+      .refreshIfVaultChanged();
+
+    expect(refreshed).toBe(false);
+    // No new SyncEngine constructed
+    expect(vi.mocked(SyncEngine).mock.results.length).toBe(engineCount);
+    // Existing engine was not stopped
+    expect(initialEngine.stop).not.toHaveBeenCalled();
+  });
+
+  it("notifies diagnostics listeners after vault switch so settings panel re-renders", async () => {
+    const plugin = makePlugin();
+    let currentVault = "vault-A";
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => currentVault;
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+
+    await plugin.onload();
+
+    const listener = vi.fn();
+    plugin.subscribeDiagnostics(listener);
+
+    currentVault = "vault-B";
+    await (plugin as unknown as { refreshIfVaultChanged: () => Promise<boolean> })
+      .refreshIfVaultChanged();
+
+    expect(listener).toHaveBeenCalled();
+  });
+});
+
 describe("VaultSyncPlugin.replaceLocalFromServer", () => {
   beforeEach(() => {
     vi.useFakeTimers();
