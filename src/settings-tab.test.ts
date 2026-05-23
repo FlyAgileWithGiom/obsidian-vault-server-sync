@@ -386,3 +386,76 @@ describe("VaultSyncSettingTab — Last render timestamp in formatDiagnostics (#3
     expect(match1![1]).not.toBe(match2![1]);
   });
 });
+
+describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visible (#52)", () => {
+  // Eliminated hypotheses:
+  //   H2 (getDiagnostics omits fields): sync-engine.ts:263-266 explicitly returns all four fields.
+  //   H6 (stale build): grep -c "avgFetchMs" main.js returns 2 — code is shipped.
+  // Culprit: the `if (d.avgFetchMs !== null)` conditional in formatDiagnostics hides the
+  // instrumentation lines whenever no text-pull batches have completed (pullTextDocs ran
+  // with an empty list, e.g. during the binary-only phase, or allDocsByKeys threw every time).
+  // prod getDiagnostics() always returns avgFetchMs: null (never undefined), so the condition
+  // is always false until the first successful batch — making the lines invisible precisely
+  // when they would be most informative. The existing 1.13.4 test used undefined (not null)
+  // via makeDiagnosticsSnapshot omission, so it never exercised the null path.
+
+  it("Avg fetch line is present even when avgFetchMs is null (0 samples)", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d: SyncDiagnostics = {
+      running: true,
+      state: "syncing",
+      revMapSize: 8072,
+      knownRevMapSize: 8072,
+      lastSeq: "72347-abc",
+      pullProgress: null,
+      pullSkipped: 0,
+      pullApplied: 0,
+      pendingPushCount: 0,
+      lastError: null,
+      unsyncableCount: 0,
+      unsyncableSample: [],
+      avgFetchMs: null,
+      fetchSampleCount: 0,
+      avgApplyMs: null,
+      applySampleCount: 0,
+    };
+
+    const output = formatDiagnostics(d);
+    expect(output).toMatch(/Avg fetch \(text pull\)/);
+    expect(output).toContain("0 samples");
+  });
+
+  it("Avg apply line is present even when avgApplyMs is null (0 samples)", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d: SyncDiagnostics = {
+      running: true,
+      state: "syncing",
+      revMapSize: 8072,
+      knownRevMapSize: 8072,
+      lastSeq: "72347-abc",
+      pullProgress: null,
+      pullSkipped: 0,
+      pullApplied: 0,
+      pendingPushCount: 0,
+      lastError: null,
+      unsyncableCount: 0,
+      unsyncableSample: [],
+      avgFetchMs: null,
+      fetchSampleCount: 0,
+      avgApplyMs: null,
+      applySampleCount: 0,
+    };
+
+    const output = formatDiagnostics(d);
+    expect(output).toMatch(/Avg apply:/);
+    expect(output).toContain("0 samples");
+  });
+});
