@@ -261,7 +261,9 @@ export class SyncEngine {
       unsyncableCount: this.unsyncableFiles.size,
       unsyncableSample: [...this.unsyncableFiles.keys()].slice(0, 5),
       avgFetchMs: this.avgOf(this.fetchMsSamples),
+      fetchSampleCount: this.fetchMsSamples.length,
       avgApplyMs: this.avgOf(this.applyMsSamples),
+      applySampleCount: this.applyMsSamples.length,
     };
   }
 
