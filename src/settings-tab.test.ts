@@ -459,3 +459,36 @@ describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visi
     expect(output).toContain("0 samples");
   });
 });
+
+describe("VaultSyncSettingTab — unsyncable visibility (#P3)", () => {
+  it("formatDiagnostics contains 'Unsyncable:' when unsyncableCount > 0", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d = makeDiagnosticsSnapshot({
+      unsyncableCount: 2,
+      unsyncableSample: ["path/to/file.jpeg", "other/image.png"],
+    });
+
+    const output = formatDiagnostics(d);
+    expect(output).toContain("Unsyncable:");
+    expect(output).toContain("2");
+    expect(output).toContain("path/to/file.jpeg");
+    expect(output).toContain("other/image.png");
+  });
+
+  it("formatDiagnostics contains 'Unsyncable: 0' and no sample line when unsyncableCount is 0", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d = makeDiagnosticsSnapshot({ unsyncableCount: 0, unsyncableSample: [] });
+
+    const output = formatDiagnostics(d);
+    expect(output).toContain("Unsyncable: 0");
+    expect(output).not.toContain("Unsyncable sample:");
+  });
+});
