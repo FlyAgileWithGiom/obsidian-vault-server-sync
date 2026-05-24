@@ -289,3 +289,114 @@ describe("S3 — Persistently-failing binaries become unsyncable", () => {
     10_000,
   );
 });
+
+// -------------------------------------------------------------------
+// S4 — 409 backoff timing is bounded (P4 regression detector)
+// Fake timers: yes
+// Budget: < 5 s
+// -------------------------------------------------------------------
+
+describe("S4 — 409 backoff timing is bounded", () => {
+  let vault: ScenarioVault;
+  let engine: SyncEngine;
+  let stateChanges: string[];
+  let errors: string[];
+
+  // Mutable state captured by the S4 facade closure
+  let s4CallCount = 0;
+  let s4Timestamps: number[] = [];
+  let s4Timeouts: number[] = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+
+    s4CallCount = 0;
+    s4Timestamps = [];
+    s4Timeouts = [];
+
+    vault = new ScenarioVault();
+    vault.addBinaryFile("assets/bin-0.png", new ArrayBuffer(4096), 2_000_000);
+
+    // Build base facade for bookkeeping (allDocs, allDocsByKeys, etc.)
+    // but override putAttachment to implement the 409-on-attempts-0-3 plan.
+    const base = makeCouchFacade({ textCount: 0, binaryCount: 1 });
+
+    currentFacade = {
+      ...base,
+      // Override putAttachmentTimeouts and putAttachmentCallCount to use our closures
+      get putAttachmentTimeouts() { return s4Timeouts; },
+      get putAttachmentCallCount() { return s4CallCount; },
+      get putAttachmentTimestamps() {
+        const m = new Map<string, number[]>();
+        m.set("assets/bin-0.png", s4Timestamps);
+        return m;
+      },
+
+      putAttachment: async (
+        docId: string,
+        _attName: string,
+        _rev: string,
+        _data: ArrayBuffer,
+        _contentType: string,
+        timeoutMs?: number,
+      ) => {
+        // Record timestamp at entry — under fake timers, Date.now() returns virtual time
+        s4Timestamps.push(Date.now());
+        s4Timeouts.push(timeoutMs ?? -1);
+        s4CallCount++;
+
+        // Attempts 0-3 (calls 1-4): reject with 409
+        // Attempt 4 (call 5): succeed
+        if (s4CallCount <= 4) {
+          // Throw a CouchError(409) — must match the instanceof check in pushBinaryFile.
+          // CouchError is the class from the vi.mock factory (same reference the engine uses).
+          throw new CouchError(409, "conflict");
+        }
+
+        return { ok: true, id: docId, rev: "5-success" };
+      },
+    };
+
+    ({ engine, stateChanges, errors } = makeEngine(vault));
+  });
+
+  afterEach(() => {
+    engine.stop();
+    currentFacade = null;
+    vi.useRealTimers();
+  });
+
+  it(
+    "backoff delays follow min(2^attempt × 100, 2000) shape",
+    async () => {
+      // Run forceFullSync concurrently with timer advancement.
+      // The engine's setTimeout inside the 409 backoff loop resolves when virtual time advances.
+      const syncPromise = engine.forceFullSync();
+      await vi.advanceTimersByTimeAsync(10_000);
+      await syncPromise;
+
+      // putAttachment called exactly 5 times: calls 1-4 fail with 409, call 5 succeeds
+      expect(s4CallCount).toBe(5);
+
+      // Verify delay deltas between consecutive putAttachment entries:
+      //   attempt 0→1: min(2^0 × 100, 2000) = 100 ms
+      //   attempt 1→2: min(2^1 × 100, 2000) = 200 ms
+      //   attempt 2→3: min(2^2 × 100, 2000) = 400 ms
+      //   attempt 3→4: min(2^3 × 100, 2000) = 800 ms
+      expect(s4Timestamps).toHaveLength(5);
+      const deltas = s4Timestamps.slice(1).map((t, i) => t - s4Timestamps[i]);
+      const expectedDeltas = [100, 200, 400, 800];
+      for (let i = 0; i < expectedDeltas.length; i++) {
+        // ±10 ms tolerance to absorb the synchronous client.get() call between retries
+        expect(deltas[i]).toBeGreaterThanOrEqual(expectedDeltas[i] - 10);
+        expect(deltas[i]).toBeLessThanOrEqual(expectedDeltas[i] + 50);
+      }
+
+      // After success: 1 doc tracked, 0 unsyncable
+      const diag = engine.getDiagnostics();
+      expect(diag.revMapSize).toBe(1);
+      expect(diag.unsyncableCount).toBe(0);
+    },
+    5_000,
+  );
+});
