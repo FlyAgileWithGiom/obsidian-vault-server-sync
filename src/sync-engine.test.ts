@@ -1908,7 +1908,8 @@ describe("SyncEngine", () => {
         "data.bin",
         expect.any(String), // rev from the put
         pngData,
-        "image/png"
+        "image/png",
+        expect.any(Number)
       );
     });
 
@@ -1933,7 +1934,8 @@ describe("SyncEngine", () => {
         "data.bin",
         expect.any(String),
         pngData,
-        "image/png"
+        "image/png",
+        expect.any(Number)
       );
     });
 
@@ -1980,7 +1982,8 @@ describe("SyncEngine", () => {
         "data.bin",
         "2-fresh",
         jpegData,
-        "image/jpeg"
+        "image/jpeg",
+        expect.any(Number)
       );
       // No error should be surfaced on successful retry
       expect(errors).toHaveLength(0);
@@ -2005,7 +2008,7 @@ describe("SyncEngine", () => {
       retryClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
 
       const { CouchError } = await import("./couch-client");
-      // All 3 putAttachment attempts fail with 409
+      // All putAttachment attempts fail with 409 — now retried 5 times with backoff
       retryClient.putAttachment = vi.fn()
         .mockRejectedValue(new CouchError(409, "Document update conflict."));
       // get() always returns a fresh-looking rev (but another client keeps winning)
@@ -2016,10 +2019,17 @@ describe("SyncEngine", () => {
         mtime: 1000,
       });
 
-      await retryEngine.start();
-      const file: VaultFile = { kind: "file", path: "images/persistent.jpeg", mtime: Date.now(), size: jpegData.byteLength };
-      retryEngine.handleLocalChange(file);
-      await new Promise((r) => setTimeout(r, 120));
+      // Use fake timers to avoid real backoff delays (100+200+400+800ms = 1500ms per cycle).
+      // Call fullSync() directly (not start()) to avoid the polling loop that would cause
+      // vi.runAllTimersAsync() to spin forever.
+      vi.useFakeTimers();
+      try {
+        const syncPromise = retryEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+      } finally {
+        vi.useRealTimers();
+      }
 
       // After MAX_RETRIES exhausted, error must be surfaced
       expect(retryErrors).toHaveLength(1);
@@ -2103,6 +2113,445 @@ describe("SyncEngine", () => {
       expect(stubErrors).toHaveLength(0);
 
       stubEngine.stop();
+    });
+
+    it("adds binary to unsyncableFiles after 3 consecutive network failures and skips on 4th fullSync", async () => {
+      // Network errors (timeout, 5xx) that are NOT 409 should be counted per file.
+      // After 3 failures the file must land in unsyncableFiles and be skipped on the next cycle.
+      const pngData = new Uint8Array([1, 2, 3]).buffer;
+      vault._addBinaryFile("images/flaky.png", pngData);
+
+      // Pre-seed revMap with mtime:0 so the "not changed since last sync" skip does not fire.
+      // mtime:0 is the migration default meaning "unknown mtime" → always attempt push.
+      const failStore = new TestStateStore();
+      failStore.set("vault-sync-revmap", JSON.stringify({ "file/images/flaky.png": { state: "known", rev: "1-stub", mtime: 0 } }));
+      const failEngine = makeEngine(settings, vaultAdapter, failStore);
+      failEngine.onStateChange = () => {};
+      const failErrors: string[] = [];
+      failEngine.onError = (msg) => failErrors.push(msg);
+      const failClient = getClient(failEngine);
+
+      const networkError = new Error("Request failed. The request timed out.");
+
+      // Remote has the stub doc (put succeeded), so pullAllRemote won't delete it locally.
+      // pushAllLocal sees the stub in remoteRevs, but revMap mtime:0 means "not changed since
+      // last sync" check fires only when entry.mtime > 0 && file.mtime <= entry.mtime.
+      // We force mtime:0 via the revMap pre-seed so it always pushes.
+      failClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/flaky.png", key: "file/images/flaky.png", value: { rev: "1-stub" } }],
+      });
+      failClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      // get() returns the stub doc
+      failClient.get = vi.fn().mockResolvedValue({ _id: "file/images/flaky.png", _rev: "1-stub", content: null, mtime: 0 });
+      // put() creates the stub doc
+      failClient.put = vi.fn().mockResolvedValue({ ok: true, id: "file/images/flaky.png", rev: "1-stub" });
+      // putAttachment always throws a network error
+      failClient.putAttachment = vi.fn().mockRejectedValue(networkError);
+
+      // Run fullSync 3 times → 3 consecutive failures → should be unsyncable
+      await failEngine.start();
+      // force 2 more fullSync cycles
+      await (failEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+      await (failEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+
+      // Now putAttachment should have been called 3 times total
+      expect(failClient.putAttachment).toHaveBeenCalledTimes(3);
+
+      // Reset putAttachment spy to detect if it's called on the 4th cycle
+      failClient.putAttachment.mockClear();
+
+      // 4th fullSync: file is now unsyncable, must NOT call putAttachment
+      await (failEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+      expect(failClient.putAttachment).not.toHaveBeenCalled();
+
+      failEngine.stop();
+    });
+
+    it("clears push-network unsyncable state after a successful push", async () => {
+      // After a network failure marks the file unsyncable, a successful push must clear it.
+      const pngData = new Uint8Array([1, 2]).buffer;
+      vault._addBinaryFile("images/recover.png", pngData);
+
+      // Pre-seed revMap with mtime:0 so mtime-skip never fires across the 3 failure cycles.
+      const recStore = new TestStateStore();
+      recStore.set("vault-sync-revmap", JSON.stringify({ "file/images/recover.png": { state: "known", rev: "1-stub", mtime: 0 } }));
+      const recEngine = makeEngine(settings, vaultAdapter, recStore);
+      recEngine.onStateChange = () => {};
+      recEngine.onError = () => {};
+      const recClient = getClient(recEngine);
+
+      const networkError = new Error("The request timed out.");
+      // allDocs returns the stub so pullAllRemote's remote-deletion check won't delete the local file.
+      recClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/recover.png", key: "file/images/recover.png", value: { rev: "1-stub" } }],
+      });
+      recClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      recClient.get = vi.fn().mockResolvedValue({ _id: "file/images/recover.png", _rev: "1-stub", content: null, mtime: 0 });
+      // First 3 calls fail, subsequent succeed
+      recClient.putAttachment = vi.fn()
+        .mockRejectedValueOnce(networkError)
+        .mockRejectedValueOnce(networkError)
+        .mockRejectedValueOnce(networkError)
+        .mockResolvedValue({ ok: true, id: "file/images/recover.png", rev: "2-ok" });
+
+      // 3 failing cycles → unsyncable
+      await recEngine.start();
+      await (recEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+      await (recEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+
+      // forceFullSync clears the failure counter and unsyncableFiles → putAttachment attempted again
+      recClient.putAttachment.mockClear();
+      await recEngine.forceFullSync();
+
+      // After forceFullSync, unsyncable state is cleared → putAttachment called again
+      expect(recClient.putAttachment).toHaveBeenCalled();
+
+      recEngine.stop();
+    });
+
+    it("applies exponential backoff before each 409 retry in binary push", async () => {
+      // 409 twice → success on 3rd attempt. The backoff sleeps between retries via setTimeout.
+      // Use fake timers to verify setTimeout is called with the expected durations without
+      // actually waiting: delay for attempt i is min(2^i * 100, 2000) ms.
+      vi.useFakeTimers();
+      try {
+        const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+        vault._addBinaryFile("images/backoff.jpeg", jpegData);
+
+        const backoffStore = new TestStateStore();
+        backoffStore.set("vault-sync-revmap", JSON.stringify({ "file/images/backoff.jpeg": { state: "known", rev: "1-stale", mtime: 0 } }));
+        const backoffEngine = makeEngine(settings, vaultAdapter, backoffStore);
+        backoffEngine.onStateChange = () => {};
+        const backoffErrors: string[] = [];
+        backoffEngine.onError = (msg) => backoffErrors.push(msg);
+        const backoffClient = getClient(backoffEngine);
+
+        const { CouchError } = await import("./couch-client");
+
+        backoffClient.allDocs.mockResolvedValue({
+          total_rows: 1,
+          rows: [{ id: "file/images/backoff.jpeg", key: "file/images/backoff.jpeg", value: { rev: "1-stale" } }],
+        });
+        backoffClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+        // get() returns fresh rev for 409 recovery
+        backoffClient.get = vi.fn().mockResolvedValue({ _id: "file/images/backoff.jpeg", _rev: "2-fresh", content: null, mtime: 0 });
+        // First two putAttachment calls 409, third succeeds
+        backoffClient.putAttachment = vi.fn()
+          .mockRejectedValueOnce(new CouchError(409, "Document update conflict."))
+          .mockRejectedValueOnce(new CouchError(409, "Document update conflict."))
+          .mockResolvedValueOnce({ ok: true, id: "file/images/backoff.jpeg", rev: "3-ok" });
+
+        const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+
+        // Run fullSync; fake timers advance all scheduled sleeps immediately
+        const syncPromise = backoffEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+
+        // 3 total attempts: initial + 2 retries after 409
+        expect(backoffClient.putAttachment).toHaveBeenCalledTimes(3);
+        // No error on success
+        expect(backoffErrors).toHaveLength(0);
+
+        // Verify backoff sleeps were scheduled: at least 2 setTimeout calls with
+        // the expected durations (100ms for attempt 0 → 1, 200ms for attempt 1 → 2).
+        const sleepCalls = setTimeoutSpy.mock.calls.filter((args) => typeof args[1] === "number" && (args[1] === 100 || args[1] === 200));
+        expect(sleepCalls.length).toBeGreaterThanOrEqual(2);
+
+        backoffEngine.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("raises binary 409 retry cap to 5 attempts before surfacing an error", async () => {
+      // With MAX_RETRIES=5, a file that 409s on every attempt should be retried 5 times total.
+      const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+      vault._addBinaryFile("images/alwayscf.jpeg", jpegData);
+
+      const capStore = new TestStateStore();
+      capStore.set("vault-sync-revmap", JSON.stringify({ "file/images/alwayscf.jpeg": { state: "known", rev: "1-stale", mtime: 0 } }));
+      const capEngine = makeEngine(settings, vaultAdapter, capStore);
+      capEngine.onStateChange = () => {};
+      const capErrors: string[] = [];
+      capEngine.onError = (msg) => capErrors.push(msg);
+      const capClient = getClient(capEngine);
+
+      const { CouchError } = await import("./couch-client");
+
+      vi.useFakeTimers();
+      try {
+        capClient.allDocs.mockResolvedValue({
+          total_rows: 1,
+          rows: [{ id: "file/images/alwayscf.jpeg", key: "file/images/alwayscf.jpeg", value: { rev: "1-stale" } }],
+        });
+        capClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+        capClient.get = vi.fn().mockResolvedValue({ _id: "file/images/alwayscf.jpeg", _rev: "2-fresh", content: null, mtime: 0 });
+        // Always 409
+        capClient.putAttachment = vi.fn().mockRejectedValue(new CouchError(409, "Document update conflict."));
+
+        const syncPromise = capEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+
+        // 5 attempts (attempt 0..4), then exhausted → error surfaced
+        expect(capClient.putAttachment).toHaveBeenCalledTimes(5);
+        expect(capErrors).toHaveLength(1);
+        expect(capErrors[0]).toContain("Binary push failed for images/alwayscf.jpeg");
+      } finally {
+        vi.useRealTimers();
+        capEngine.stop();
+      }
+    });
+
+    it("409 error does NOT increment the push-network failure counter", async () => {
+      // The binaryPushFailureCounts counter must only increment on non-409 errors.
+      // 409 means a conflict that retry logic handles; it must not push the file
+      // toward the unsyncable threshold.
+      const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+      vault._addBinaryFile("images/conflict.jpeg", jpegData);
+
+      const cfStore = new TestStateStore();
+      cfStore.set("vault-sync-revmap", JSON.stringify({ "file/images/conflict.jpeg": { state: "known", rev: "1-old", mtime: 0 } }));
+      const cfEngine = makeEngine(settings, vaultAdapter, cfStore);
+      cfEngine.onStateChange = () => {};
+      cfEngine.onError = () => {};
+      const cfClient = getClient(cfEngine);
+
+      const { CouchError } = await import("./couch-client");
+
+      cfClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/conflict.jpeg", key: "file/images/conflict.jpeg", value: { rev: "1-old" } }],
+      });
+      // allDocsByKeys must return attachment metadata so pullBinaryDocs treats the file as
+      // "has attachment" → downloads it (state stays "known") rather than marking it "orphan"
+      // (which would skip it in pushAllLocal on the 2nd cycle via the orphan guard).
+      cfClient.allDocsByKeys = vi.fn().mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/conflict.jpeg", doc: { _id: "file/images/conflict.jpeg", _rev: "1-old", _attachments: { "data.bin": { content_type: "image/jpeg", length: 2 } } } }],
+      });
+      cfClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      cfClient.get = vi.fn().mockResolvedValue({ _id: "file/images/conflict.jpeg", _rev: "2-fresh", content: null, mtime: 0 });
+
+      // putAttachment always responds with a 409 — exhausts all retries but must NOT
+      // count toward the network-failure threshold.
+      vi.useFakeTimers();
+      try {
+        cfClient.putAttachment = vi.fn().mockRejectedValue(new CouchError(409, "Document update conflict."));
+
+        const syncPromise = cfEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+
+        // After exhausting retries via 409s, run another full cycle.
+        // The file must still be attempted (not in unsyncableFiles) because
+        // 409 must NEVER bump the push-network counter.
+        cfClient.putAttachment.mockClear();
+        const syncPromise2 = cfEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise2;
+
+        // putAttachment attempted again on the 2nd cycle → counter stayed at 0
+        expect(cfClient.putAttachment).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+        cfEngine.stop();
+      }
+    });
+  });
+
+  describe("binary file sync - pushLocks race prevention", () => {
+    it("serializes pushAllLocal and handleLocalChange pushes for the same binary file", async () => {
+      // Setup: pushAllLocal has a binary in flight (putAttachment is pending).
+      // handleLocalChange fires for the same file.
+      // Without pushLocks in pushAllLocal, two putAttachment calls race.
+      // With pushLocks, the second push waits for the first to finish.
+
+      const pngData = new Uint8Array([1, 2, 3]).buffer;
+      vault._addBinaryFile("images/race.png", pngData);
+
+      const raceStore = new TestStateStore();
+      raceStore.set("vault-sync-revmap", JSON.stringify({ "file/images/race.png": { state: "known", rev: "1-stub", mtime: 0 } }));
+      const raceEngine = makeEngine(settings, vaultAdapter, raceStore);
+      raceEngine.onStateChange = () => {};
+      raceEngine.onError = () => {};
+      const raceClient = getClient(raceEngine);
+
+      raceClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/race.png", key: "file/images/race.png", value: { rev: "1-stub" } }],
+      });
+      raceClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      raceClient.get = vi.fn().mockResolvedValue({ _id: "file/images/race.png", _rev: "1-stub", content: null, mtime: 0 });
+
+      // Start the engine so handleLocalChange is accepted (running = true).
+      // Use start() → first fullSync completes immediately.
+      raceClient.putAttachment = vi.fn().mockResolvedValue({ ok: true, id: "file/images/race.png", rev: "2-ok" });
+      await raceEngine.start();
+      raceClient.putAttachment.mockClear();
+
+      // Now update mtime so pushAllLocal considers the file changed on the NEXT cycle.
+      // Need to re-add to vault since start() may have caused handleRemoteDelete to remove it.
+      vault._addBinaryFile("images/race.png", new Uint8Array([4, 5, 6]).buffer);
+      // Update allDocs to reflect the new rev from start()
+      raceClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/race.png", key: "file/images/race.png", value: { rev: "2-ok" } }],
+      });
+      raceClient.get = vi.fn().mockResolvedValue({ _id: "file/images/race.png", _rev: "2-ok", content: null, mtime: 0 });
+      // Force the engine to treat the file as needing a push (revMap mtime:0 disables skip)
+      // The engine's internal revMap was updated by start(); we need to override it.
+      // Access internal revMap via type cast to set mtime:0
+      (raceEngine as unknown as { revMap: Record<string, unknown> }).revMap["file/images/race.png"] = { state: "known", rev: "2-ok", mtime: 0 };
+
+      // Install blocking mock for the race test
+      let resolveFirstPut!: () => void;
+      const firstPutPending = new Promise<void>((r) => { resolveFirstPut = r; });
+      let concurrentCalls = 0;
+      let maxConcurrentCalls = 0;
+      raceClient.putAttachment = vi.fn().mockImplementation(async () => {
+        concurrentCalls++;
+        maxConcurrentCalls = Math.max(maxConcurrentCalls, concurrentCalls);
+        await firstPutPending;
+        concurrentCalls--;
+        return { ok: true, id: "file/images/race.png", rev: "3-ok" };
+      });
+
+      // Start fullSync (which calls pushAllLocal → pushBinaryWithLock → putAttachment blocked)
+      const syncPromise = raceEngine.fullSync();
+
+      // Give the sync a moment to reach putAttachment (which is now blocking)
+      await new Promise((r) => setTimeout(r, 20));
+
+      // putAttachment is in flight — trigger a second push via handleLocalChange
+      const file: VaultFile = { kind: "file", path: "images/race.png", mtime: Date.now() + 1, size: pngData.byteLength };
+      raceEngine.handleLocalChange(file);
+
+      // Wait for debounce to fire (50ms) — second push should now be queued but NOT started yet
+      await new Promise((r) => setTimeout(r, 80));
+
+      // At this point, only 1 concurrent putAttachment should be in flight
+      expect(maxConcurrentCalls).toBe(1);
+
+      // Release the first put → first completes → second starts → resolves
+      resolveFirstPut();
+
+      // Wait for everything to settle
+      await syncPromise;
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Both pushes completed (total 2 putAttachment calls), but never concurrently
+      expect(raceClient.putAttachment).toHaveBeenCalledTimes(2);
+      expect(maxConcurrentCalls).toBe(1);
+
+      raceEngine.stop();
+    });
+  });
+
+  describe("binary file sync - parallel push", () => {
+    it("pushes K binaries in parallel chunks: wall time is roughly ceil(K/3) slots, not K slots", async () => {
+      // With K=6 binaries and PARALLEL_BINARY_PUSH=3, we expect ~2 rounds of 3 concurrent
+      // uploads. Each putAttachment takes ~30ms. Total should be ≤ 3 rounds * 30ms = 90ms,
+      // well below the sequential 6 * 30ms = 180ms.
+      const SLOT_MS = 30;
+      const K = 6;
+
+      for (let i = 0; i < K; i++) {
+        vault._addBinaryFile(`images/img${i}.png`, new Uint8Array([i]).buffer);
+      }
+
+      // Pre-seed revMap with mtime:0 for all files so mtime-skip never fires.
+      const store = new TestStateStore();
+      const revMapSeed: Record<string, unknown> = {};
+      for (let i = 0; i < K; i++) {
+        revMapSeed[`file/images/img${i}.png`] = { state: "known", rev: "1-stub", mtime: 0 };
+      }
+      store.set("vault-sync-revmap", JSON.stringify(revMapSeed));
+
+      const parEngine = makeEngine(settings, vaultAdapter, store);
+      parEngine.onStateChange = () => {};
+      parEngine.onError = () => {};
+      const parClient = getClient(parEngine);
+
+      // Remote has all stubs so pullAllRemote won't delete them.
+      parClient.allDocs.mockResolvedValue({
+        total_rows: K,
+        rows: Array.from({ length: K }, (_, i) => ({
+          id: `file/images/img${i}.png`,
+          key: `file/images/img${i}.png`,
+          value: { rev: "1-stub" },
+        })),
+      });
+      parClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      parClient.get = vi.fn().mockResolvedValue({ _id: "placeholder", _rev: "1-stub", content: null, mtime: 0 });
+
+      // Each putAttachment takes SLOT_MS ms
+      parClient.putAttachment = vi.fn().mockImplementation(async () => {
+        await new Promise((r) => setTimeout(r, SLOT_MS));
+        return { ok: true, id: "placeholder", rev: "2-ok" };
+      });
+
+      const start = Date.now();
+      await parEngine.fullSync();
+      const elapsed = Date.now() - start;
+
+      // Sequential would take K * SLOT_MS = 180ms; parallel ceil(K/3) * SLOT_MS = 60ms.
+      // Allow 3x headroom for CI jitter.
+      const sequentialMs = K * SLOT_MS;
+      expect(elapsed).toBeLessThan(sequentialMs);
+      expect(parClient.putAttachment).toHaveBeenCalledTimes(K);
+
+      parEngine.stop();
+    });
+
+    it("one failing binary in a chunk does not abort the rest of the chunk (Promise.allSettled)", async () => {
+      // Promise.allSettled guarantees other files in the same chunk complete
+      // even when one throws. This is the load-bearing property of the parallel push design.
+      const K = 3; // Exactly one full chunk
+      for (let i = 0; i < K; i++) {
+        vault._addBinaryFile(`images/settle${i}.png`, new Uint8Array([i]).buffer);
+      }
+
+      const settleStore = new TestStateStore();
+      const revMapSeed: Record<string, unknown> = {};
+      for (let i = 0; i < K; i++) {
+        revMapSeed[`file/images/settle${i}.png`] = { state: "known", rev: "1-stub", mtime: 0 };
+      }
+      settleStore.set("vault-sync-revmap", JSON.stringify(revMapSeed));
+
+      const settleEngine = makeEngine(settings, vaultAdapter, settleStore);
+      settleEngine.onStateChange = () => {};
+      settleEngine.onError = () => {};
+      const settleClient = getClient(settleEngine);
+
+      settleClient.allDocs.mockResolvedValue({
+        total_rows: K,
+        rows: Array.from({ length: K }, (_, i) => ({
+          id: `file/images/settle${i}.png`,
+          key: `file/images/settle${i}.png`,
+          value: { rev: "1-stub" },
+        })),
+      });
+      settleClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      settleClient.get = vi.fn().mockResolvedValue({ _id: "placeholder", _rev: "1-stub", content: null, mtime: 0 });
+
+      // First file in the chunk throws; others succeed.
+      let callIndex = 0;
+      settleClient.putAttachment = vi.fn().mockImplementation(async () => {
+        const idx = callIndex++;
+        if (idx === 0) throw new Error("network failure on first file");
+        return { ok: true, id: `file/images/settle${idx}.png`, rev: "2-ok" };
+      });
+
+      await settleEngine.fullSync();
+
+      // All K files attempted despite the first one failing
+      expect(settleClient.putAttachment).toHaveBeenCalledTimes(K);
+
+      settleEngine.stop();
     });
   });
 

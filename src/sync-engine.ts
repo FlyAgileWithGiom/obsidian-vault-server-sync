@@ -98,6 +98,9 @@ const PARALLEL_BINARY_PULLS = 5;
 const PARALLEL_TEXT_APPLY = 5;
 const BINARY_PULL_RETRIES = 3;
 const BINARY_PULL_TIMEOUT_MS = 120_000;
+const BINARY_PUSH_TIMEOUT_MS = 120_000;
+// Lower than PARALLEL_BINARY_PULLS because mobile upload bandwidth is typically more constrained.
+const PARALLEL_BINARY_PUSH = 3;
 // Chunk size for binary metadata pre-fetch (POST _all_docs). A single POST with
 // 7000+ keys timed out (30s default) on slow CouchDB connections — see GitHub #15.
 const META_BATCH_SIZE = 500;
@@ -223,6 +226,10 @@ export class SyncEngine {
   private currentState: SyncState = "idle";
   /** Files skipped due to recoverable read errors (EAGAIN, EACCES, EIO, ENOENT). Cleared on successful read. */
   private unsyncableFiles: Map<string, { reason: string; firstSeen: number; retryAfter: number }> = new Map();
+  /** Consecutive network-failure count per binary file path. Cleared on success or forceFullSync. */
+  private binaryPushFailureCounts = new Map<string, number>();
+  /** After this many consecutive network (non-409, non-tombstone) failures, skip until forceFullSync. */
+  private static readonly BINARY_PUSH_MAX_FAILURES = 3;
   /** Ring buffers for pull throughput instrumentation (max 50 samples each) */
   private fetchMsSamples: number[] = [];
   private applyMsSamples: number[] = [];
@@ -411,6 +418,8 @@ export class SyncEngine {
     console.log("[vault-sync] Clearing revMap and lastSeq");
     this.revMap = {};
     this.lastSeq = 0;
+    this.binaryPushFailureCounts.clear();
+    this.unsyncableFiles.clear();
     this.persistState();
   }
 
@@ -868,8 +877,10 @@ export class SyncEngine {
       remoteRevs,
     );
 
-    // Phase 3: push genuinely new files, delete locally any tombstoned ones
+    // Phase 3: push genuinely new files, delete locally any tombstoned ones.
+    // Binary files are collected separately and pushed in parallel batches of PARALLEL_BINARY_PUSH.
     const batch: CouchDoc[] = [];
+    const binaryToPush: VaultFile[] = [];
 
     for (let fi = 0; fi < files.length; fi++) {
       const file = files[fi];
@@ -901,9 +912,8 @@ export class SyncEngine {
         // For changed files, delegate to pushTextFile/pushBinaryFile which handle rev correctly.
         if (this.isBinaryDoc(docId)) {
           if (this.settings.disableBinaryPush) { await this.yield(); continue; }
-          await this.pushBinaryFile(file);
-          this.emitCounts();
-          await this.yield();
+          if (this.unsyncableFiles.has(file.path)) { await this.yield(); continue; }
+          binaryToPush.push(file);
         } else {
           await this.pushTextFile(file);
           this.emitCounts();
@@ -927,10 +937,8 @@ export class SyncEngine {
       // Genuinely new file, not on remote
       if (this.isBinaryDoc(docId)) {
         if (this.settings.disableBinaryPush) { await this.yield(); continue; }
-        // Binary files need attachment PUT, not bulk_docs
-        await this.pushBinaryFile(file);
-        this.emitCounts();
-        await this.yield();
+        if (this.unsyncableFiles.has(file.path)) { await this.yield(); continue; }
+        binaryToPush.push(file);
       } else {
         let content: string;
         try {
@@ -965,6 +973,17 @@ export class SyncEngine {
     if (batch.length > 0) {
       await this.pushBatch(batch);
       this.emitCounts();
+    }
+
+    // Phase 4: push binary files in parallel chunks of PARALLEL_BINARY_PUSH.
+    // Uses pushBinaryWithLock to serialize against concurrent handleLocalChange PUTs for the
+    // same file — prevents the pushAllLocal/event-handler race that causes 409 conflicts.
+    // Promise.allSettled ensures one failure doesn't abort the remaining chunk.
+    for (let batchStart = 0; batchStart < binaryToPush.length; batchStart += PARALLEL_BINARY_PUSH) {
+      const chunk = binaryToPush.slice(batchStart, batchStart + PARALLEL_BINARY_PUSH);
+      await Promise.allSettled(chunk.map((f) => this.pushBinaryWithLock(f)));
+      this.emitCounts();
+      await this.yield();
     }
   }
 
@@ -1787,6 +1806,20 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * Acquire pushLocks[file.path] then call pushBinaryFile, mirroring pushFile's lock pattern.
+   * Prevents a concurrent handleLocalChange PUT from racing with pushAllLocal's batch PUT.
+   */
+  private async pushBinaryWithLock(file: VaultFile): Promise<void> {
+    const key = file.path;
+    const prev = this.pushLocks.get(key) ?? Promise.resolve();
+    const settled = prev.catch(() => {});
+    const next = settled.then(() => this.pushBinaryFile(file));
+    const swallowed = next.catch(() => {});
+    this.pushLocks.set(key, swallowed);
+    await next;
+  }
+
   private async pushBinaryFile(file: VaultFile): Promise<void> {
     try {
       const docId = pathToDocId(file.path);
@@ -1837,15 +1870,19 @@ export class SyncEngine {
         }
       }
 
-      const MAX_RETRIES = 3;
+      // Higher cap than the old 3 to absorb brief write storms under slow connections.
+      const MAX_RETRIES = 5;
       let attachmentRev = rev;
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
-          const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, attachmentRev, data, contentType);
+          const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, attachmentRev, data, contentType, BINARY_PUSH_TIMEOUT_MS);
           if (result.ok && result.rev) {
             this.revMap[docId] = { state: "known", rev: result.rev, mtime: file.mtime };
             this.persistState();
           }
+          // Successful push: clear network-failure tracking for this file
+          this.binaryPushFailureCounts.delete(file.path);
+          this.unsyncableFiles.delete(file.path);
           break;
         } catch (e) {
           if (isTombstone404(e)) {
@@ -1853,7 +1890,9 @@ export class SyncEngine {
             await this.handleRemoteDelete(docId);
             return;
           } else if (e instanceof CouchError && e.status === 409 && attempt < MAX_RETRIES - 1) {
-            // Rev became stale between stub PUT and attachment PUT — refetch and retry
+            // Rev became stale between stub PUT and attachment PUT — refetch and retry.
+            // Backoff: min(2^attempt * 100ms, 2000ms) — exponential ramp caps congestion storms.
+            await new Promise((r) => setTimeout(r, Math.min(2 ** attempt * 100, 2000)));
             const fresh = await this.client.get(docId);
             attachmentRev = fresh._rev ?? "";
             const curEntry: RevMapEntry | undefined = this.revMap[docId];
@@ -1869,6 +1908,22 @@ export class SyncEngine {
       }
     } catch (e) {
       this.setError(`Binary push failed for ${file.path}: ${(e as Error).message}`);
+      // Track consecutive network failures (exclude 409 conflicts — those are expected transients).
+      // After BINARY_PUSH_MAX_FAILURES, mark unsyncable so pushAllLocal skips the file until
+      // a forceFullSync clears the counter (see clearState()).
+      const is409 = e instanceof CouchError && e.status === 409;
+      if (!is409) {
+        const prev = this.binaryPushFailureCounts.get(file.path) ?? 0;
+        const next = prev + 1;
+        this.binaryPushFailureCounts.set(file.path, next);
+        if (next >= SyncEngine.BINARY_PUSH_MAX_FAILURES) {
+          this.unsyncableFiles.set(file.path, {
+            reason: "push-network",
+            firstSeen: this.unsyncableFiles.get(file.path)?.firstSeen ?? Date.now(),
+            retryAfter: Date.now() + 60_000,
+          });
+        }
+      }
     }
   }
 
