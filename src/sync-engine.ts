@@ -224,6 +224,10 @@ export class SyncEngine {
   private currentState: SyncState = "idle";
   /** Files skipped due to recoverable read errors (EAGAIN, EACCES, EIO, ENOENT). Cleared on successful read. */
   private unsyncableFiles: Map<string, { reason: string; firstSeen: number; retryAfter: number }> = new Map();
+  /** Consecutive network-failure count per binary file path. Cleared on success or forceFullSync. */
+  private binaryPushFailureCounts = new Map<string, number>();
+  /** After this many consecutive network (non-409, non-tombstone) failures, skip until forceFullSync. */
+  private static readonly BINARY_PUSH_MAX_FAILURES = 3;
   /** Ring buffers for pull throughput instrumentation (max 50 samples each) */
   private fetchMsSamples: number[] = [];
   private applyMsSamples: number[] = [];
@@ -412,6 +416,8 @@ export class SyncEngine {
     console.log("[vault-sync] Clearing revMap and lastSeq");
     this.revMap = {};
     this.lastSeq = 0;
+    this.binaryPushFailureCounts.clear();
+    this.unsyncableFiles.clear();
     this.persistState();
   }
 
@@ -902,6 +908,7 @@ export class SyncEngine {
         // For changed files, delegate to pushTextFile/pushBinaryFile which handle rev correctly.
         if (this.isBinaryDoc(docId)) {
           if (this.settings.disableBinaryPush) { await this.yield(); continue; }
+          if (this.unsyncableFiles.has(file.path)) { await this.yield(); continue; }
           await this.pushBinaryFile(file);
           this.emitCounts();
           await this.yield();
@@ -928,6 +935,7 @@ export class SyncEngine {
       // Genuinely new file, not on remote
       if (this.isBinaryDoc(docId)) {
         if (this.settings.disableBinaryPush) { await this.yield(); continue; }
+        if (this.unsyncableFiles.has(file.path)) { await this.yield(); continue; }
         // Binary files need attachment PUT, not bulk_docs
         await this.pushBinaryFile(file);
         this.emitCounts();
@@ -1847,6 +1855,9 @@ export class SyncEngine {
             this.revMap[docId] = { state: "known", rev: result.rev, mtime: file.mtime };
             this.persistState();
           }
+          // Successful push: clear network-failure tracking for this file
+          this.binaryPushFailureCounts.delete(file.path);
+          this.unsyncableFiles.delete(file.path);
           break;
         } catch (e) {
           if (isTombstone404(e)) {
@@ -1870,6 +1881,22 @@ export class SyncEngine {
       }
     } catch (e) {
       this.setError(`Binary push failed for ${file.path}: ${(e as Error).message}`);
+      // Track consecutive network failures (exclude 409 conflicts — those are expected transients).
+      // After BINARY_PUSH_MAX_FAILURES, mark unsyncable so pushAllLocal skips the file until
+      // a forceFullSync clears the counter (see clearState()).
+      const is409 = e instanceof CouchError && e.status === 409;
+      if (!is409) {
+        const prev = this.binaryPushFailureCounts.get(file.path) ?? 0;
+        const next = prev + 1;
+        this.binaryPushFailureCounts.set(file.path, next);
+        if (next >= SyncEngine.BINARY_PUSH_MAX_FAILURES) {
+          this.unsyncableFiles.set(file.path, {
+            reason: "push-network",
+            firstSeen: this.unsyncableFiles.get(file.path)?.firstSeen ?? Date.now(),
+            retryAfter: Date.now() + 60_000,
+          });
+        }
+      }
     }
   }
 

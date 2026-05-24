@@ -2107,6 +2107,102 @@ describe("SyncEngine", () => {
 
       stubEngine.stop();
     });
+
+    it("adds binary to unsyncableFiles after 3 consecutive network failures and skips on 4th fullSync", async () => {
+      // Network errors (timeout, 5xx) that are NOT 409 should be counted per file.
+      // After 3 failures the file must land in unsyncableFiles and be skipped on the next cycle.
+      const pngData = new Uint8Array([1, 2, 3]).buffer;
+      vault._addBinaryFile("images/flaky.png", pngData);
+
+      // Pre-seed revMap with mtime:0 so the "not changed since last sync" skip does not fire.
+      // mtime:0 is the migration default meaning "unknown mtime" → always attempt push.
+      const failStore = new TestStateStore();
+      failStore.set("vault-sync-revmap", JSON.stringify({ "file/images/flaky.png": { state: "known", rev: "1-stub", mtime: 0 } }));
+      const failEngine = makeEngine(settings, vaultAdapter, failStore);
+      failEngine.onStateChange = () => {};
+      const failErrors: string[] = [];
+      failEngine.onError = (msg) => failErrors.push(msg);
+      const failClient = getClient(failEngine);
+
+      const networkError = new Error("Request failed. The request timed out.");
+
+      // Remote has the stub doc (put succeeded), so pullAllRemote won't delete it locally.
+      // pushAllLocal sees the stub in remoteRevs, but revMap mtime:0 means "not changed since
+      // last sync" check fires only when entry.mtime > 0 && file.mtime <= entry.mtime.
+      // We force mtime:0 via the revMap pre-seed so it always pushes.
+      failClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/flaky.png", key: "file/images/flaky.png", value: { rev: "1-stub" } }],
+      });
+      failClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      // get() returns the stub doc
+      failClient.get = vi.fn().mockResolvedValue({ _id: "file/images/flaky.png", _rev: "1-stub", content: null, mtime: 0 });
+      // put() creates the stub doc
+      failClient.put = vi.fn().mockResolvedValue({ ok: true, id: "file/images/flaky.png", rev: "1-stub" });
+      // putAttachment always throws a network error
+      failClient.putAttachment = vi.fn().mockRejectedValue(networkError);
+
+      // Run fullSync 3 times → 3 consecutive failures → should be unsyncable
+      await failEngine.start();
+      // force 2 more fullSync cycles
+      await (failEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+      await (failEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+
+      // Now putAttachment should have been called 3 times total
+      expect(failClient.putAttachment).toHaveBeenCalledTimes(3);
+
+      // Reset putAttachment spy to detect if it's called on the 4th cycle
+      failClient.putAttachment.mockClear();
+
+      // 4th fullSync: file is now unsyncable, must NOT call putAttachment
+      await (failEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+      expect(failClient.putAttachment).not.toHaveBeenCalled();
+
+      failEngine.stop();
+    });
+
+    it("clears push-network unsyncable state after a successful push", async () => {
+      // After a network failure marks the file unsyncable, a successful push must clear it.
+      const pngData = new Uint8Array([1, 2]).buffer;
+      vault._addBinaryFile("images/recover.png", pngData);
+
+      // Pre-seed revMap with mtime:0 so mtime-skip never fires across the 3 failure cycles.
+      const recStore = new TestStateStore();
+      recStore.set("vault-sync-revmap", JSON.stringify({ "file/images/recover.png": { state: "known", rev: "1-stub", mtime: 0 } }));
+      const recEngine = makeEngine(settings, vaultAdapter, recStore);
+      recEngine.onStateChange = () => {};
+      recEngine.onError = () => {};
+      const recClient = getClient(recEngine);
+
+      const networkError = new Error("The request timed out.");
+      // allDocs returns the stub so pullAllRemote's remote-deletion check won't delete the local file.
+      recClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/recover.png", key: "file/images/recover.png", value: { rev: "1-stub" } }],
+      });
+      recClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      recClient.get = vi.fn().mockResolvedValue({ _id: "file/images/recover.png", _rev: "1-stub", content: null, mtime: 0 });
+      // First 3 calls fail, subsequent succeed
+      recClient.putAttachment = vi.fn()
+        .mockRejectedValueOnce(networkError)
+        .mockRejectedValueOnce(networkError)
+        .mockRejectedValueOnce(networkError)
+        .mockResolvedValue({ ok: true, id: "file/images/recover.png", rev: "2-ok" });
+
+      // 3 failing cycles → unsyncable
+      await recEngine.start();
+      await (recEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+      await (recEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+
+      // forceFullSync clears the failure counter and unsyncableFiles → putAttachment attempted again
+      recClient.putAttachment.mockClear();
+      await recEngine.forceFullSync();
+
+      // After forceFullSync, unsyncable state is cleared → putAttachment called again
+      expect(recClient.putAttachment).toHaveBeenCalled();
+
+      recEngine.stop();
+    });
   });
 
   describe("handleRemoteDelete - empty parent folder cleanup", () => {
