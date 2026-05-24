@@ -2305,6 +2305,62 @@ describe("SyncEngine", () => {
         capEngine.stop();
       }
     });
+
+    it("409 error does NOT increment the push-network failure counter", async () => {
+      // The binaryPushFailureCounts counter must only increment on non-409 errors.
+      // 409 means a conflict that retry logic handles; it must not push the file
+      // toward the unsyncable threshold.
+      const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+      vault._addBinaryFile("images/conflict.jpeg", jpegData);
+
+      const cfStore = new TestStateStore();
+      cfStore.set("vault-sync-revmap", JSON.stringify({ "file/images/conflict.jpeg": { state: "known", rev: "1-old", mtime: 0 } }));
+      const cfEngine = makeEngine(settings, vaultAdapter, cfStore);
+      cfEngine.onStateChange = () => {};
+      cfEngine.onError = () => {};
+      const cfClient = getClient(cfEngine);
+
+      const { CouchError } = await import("./couch-client");
+
+      cfClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/conflict.jpeg", key: "file/images/conflict.jpeg", value: { rev: "1-old" } }],
+      });
+      // allDocsByKeys must return attachment metadata so pullBinaryDocs treats the file as
+      // "has attachment" → downloads it (state stays "known") rather than marking it "orphan"
+      // (which would skip it in pushAllLocal on the 2nd cycle via the orphan guard).
+      cfClient.allDocsByKeys = vi.fn().mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/conflict.jpeg", doc: { _id: "file/images/conflict.jpeg", _rev: "1-old", _attachments: { "data.bin": { content_type: "image/jpeg", length: 2 } } } }],
+      });
+      cfClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      cfClient.get = vi.fn().mockResolvedValue({ _id: "file/images/conflict.jpeg", _rev: "2-fresh", content: null, mtime: 0 });
+
+      // putAttachment always responds with a 409 — exhausts all retries but must NOT
+      // count toward the network-failure threshold.
+      vi.useFakeTimers();
+      try {
+        cfClient.putAttachment = vi.fn().mockRejectedValue(new CouchError(409, "Document update conflict."));
+
+        const syncPromise = cfEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+
+        // After exhausting retries via 409s, run another full cycle.
+        // The file must still be attempted (not in unsyncableFiles) because
+        // 409 must NEVER bump the push-network counter.
+        cfClient.putAttachment.mockClear();
+        const syncPromise2 = cfEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise2;
+
+        // putAttachment attempted again on the 2nd cycle → counter stayed at 0
+        expect(cfClient.putAttachment).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+        cfEngine.stop();
+      }
+    });
   });
 
   describe("binary file sync - pushLocks race prevention", () => {
@@ -2449,6 +2505,53 @@ describe("SyncEngine", () => {
       expect(parClient.putAttachment).toHaveBeenCalledTimes(K);
 
       parEngine.stop();
+    });
+
+    it("one failing binary in a chunk does not abort the rest of the chunk (Promise.allSettled)", async () => {
+      // Promise.allSettled guarantees other files in the same chunk complete
+      // even when one throws. This is the load-bearing property of the parallel push design.
+      const K = 3; // Exactly one full chunk
+      for (let i = 0; i < K; i++) {
+        vault._addBinaryFile(`images/settle${i}.png`, new Uint8Array([i]).buffer);
+      }
+
+      const settleStore = new TestStateStore();
+      const revMapSeed: Record<string, unknown> = {};
+      for (let i = 0; i < K; i++) {
+        revMapSeed[`file/images/settle${i}.png`] = { state: "known", rev: "1-stub", mtime: 0 };
+      }
+      settleStore.set("vault-sync-revmap", JSON.stringify(revMapSeed));
+
+      const settleEngine = makeEngine(settings, vaultAdapter, settleStore);
+      settleEngine.onStateChange = () => {};
+      settleEngine.onError = () => {};
+      const settleClient = getClient(settleEngine);
+
+      settleClient.allDocs.mockResolvedValue({
+        total_rows: K,
+        rows: Array.from({ length: K }, (_, i) => ({
+          id: `file/images/settle${i}.png`,
+          key: `file/images/settle${i}.png`,
+          value: { rev: "1-stub" },
+        })),
+      });
+      settleClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      settleClient.get = vi.fn().mockResolvedValue({ _id: "placeholder", _rev: "1-stub", content: null, mtime: 0 });
+
+      // First file in the chunk throws; others succeed.
+      let callIndex = 0;
+      settleClient.putAttachment = vi.fn().mockImplementation(async () => {
+        const idx = callIndex++;
+        if (idx === 0) throw new Error("network failure on first file");
+        return { ok: true, id: `file/images/settle${idx}.png`, rev: "2-ok" };
+      });
+
+      await settleEngine.fullSync();
+
+      // All K files attempted despite the first one failing
+      expect(settleClient.putAttachment).toHaveBeenCalledTimes(K);
+
+      settleEngine.stop();
     });
   });
 
