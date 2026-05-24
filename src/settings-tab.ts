@@ -235,6 +235,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
   private formatDiagnostics(d: SyncDiagnostics): string {
     const lines = [
+      `Version: ${this.plugin.manifest.version}`,
       `Status: ${d.state}`,
       `Running: ${d.running ? "yes" : "no"}`,
       `Tracked docs (revMap): ${d.revMapSize}`,
@@ -253,6 +254,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     lines.push(`Avg fetch (text pull): ${fetchLabel} (${d.fetchSampleCount} samples)`);
     const applyLabel = d.avgApplyMs !== null ? `${Math.round(d.avgApplyMs)} ms` : "--";
     lines.push(`Avg apply: ${applyLabel} (${d.applySampleCount} samples)`);
+    lines.push(`Unsyncable: ${d.unsyncableCount}`);
+    if (d.unsyncableCount > 0) {
+      lines.push(`Unsyncable sample: ${d.unsyncableSample.join(", ")}`);
+    }
     if (d.lastError) {
       lines.push(`Last error: ${d.lastError}`);
     }

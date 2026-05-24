@@ -133,6 +133,7 @@ function makePluginMock(diagnosticsOverrides: Partial<SyncDiagnostics> = {}): Va
   const listeners = new Set<() => void>();
 
   const plugin = {
+    manifest: { version: "0.0.0-test" },
     settings: {
       couchDbUrl: "https://sync.example.com",
       couchDbName: "vault-test",
@@ -401,6 +402,7 @@ describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visi
 
   it("Avg fetch line is present even when avgFetchMs is null (0 samples)", () => {
     const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
     const formatDiagnostics = (
       tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
     ).formatDiagnostics.bind(tab);
@@ -431,6 +433,7 @@ describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visi
 
   it("Avg apply line is present even when avgApplyMs is null (0 samples)", () => {
     const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
     const formatDiagnostics = (
       tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
     ).formatDiagnostics.bind(tab);
@@ -457,5 +460,59 @@ describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visi
     const output = formatDiagnostics(d);
     expect(output).toMatch(/Avg apply:/);
     expect(output).toContain("0 samples");
+  });
+});
+
+describe("VaultSyncSettingTab — unsyncable visibility (#P3)", () => {
+  it("formatDiagnostics contains 'Unsyncable:' when unsyncableCount > 0", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d = makeDiagnosticsSnapshot({
+      unsyncableCount: 2,
+      unsyncableSample: ["path/to/file.jpeg", "other/image.png"],
+    });
+
+    const output = formatDiagnostics(d);
+    expect(output).toContain("Unsyncable:");
+    expect(output).toContain("2");
+    expect(output).toContain("path/to/file.jpeg");
+    expect(output).toContain("other/image.png");
+  });
+
+  it("formatDiagnostics contains 'Unsyncable: 0' and no sample line when unsyncableCount is 0", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d = makeDiagnosticsSnapshot({ unsyncableCount: 0, unsyncableSample: [] });
+
+    const output = formatDiagnostics(d);
+    expect(output).toContain("Unsyncable: 0");
+    expect(output).not.toContain("Unsyncable sample:");
+  });
+});
+
+describe("VaultSyncSettingTab — manifest version in Diagnostics panel", () => {
+  it("formatDiagnostics output contains 'Version: ' as the first line", () => {
+    const plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+    // Provide a manifest version on the plugin mock
+    (plugin as unknown as { manifest: { version: string } }).manifest = { version: "1.13.8" };
+
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: VaultSyncPlugin }).plugin = plugin;
+
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const output = formatDiagnostics(makeDiagnosticsSnapshot());
+    expect(output).toContain("Version: ");
+    expect(output.split("\n")[0]).toMatch(/^Version: /);
   });
 });
