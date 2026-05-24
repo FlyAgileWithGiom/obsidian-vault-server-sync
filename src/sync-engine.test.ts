@@ -2008,7 +2008,7 @@ describe("SyncEngine", () => {
       retryClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
 
       const { CouchError } = await import("./couch-client");
-      // All 3 putAttachment attempts fail with 409
+      // All putAttachment attempts fail with 409 — now retried 5 times with backoff
       retryClient.putAttachment = vi.fn()
         .mockRejectedValue(new CouchError(409, "Document update conflict."));
       // get() always returns a fresh-looking rev (but another client keeps winning)
@@ -2019,10 +2019,17 @@ describe("SyncEngine", () => {
         mtime: 1000,
       });
 
-      await retryEngine.start();
-      const file: VaultFile = { kind: "file", path: "images/persistent.jpeg", mtime: Date.now(), size: jpegData.byteLength };
-      retryEngine.handleLocalChange(file);
-      await new Promise((r) => setTimeout(r, 120));
+      // Use fake timers to avoid real backoff delays (100+200+400+800ms = 1500ms per cycle).
+      // Call fullSync() directly (not start()) to avoid the polling loop that would cause
+      // vi.runAllTimersAsync() to spin forever.
+      vi.useFakeTimers();
+      try {
+        const syncPromise = retryEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+      } finally {
+        vi.useRealTimers();
+      }
 
       // After MAX_RETRIES exhausted, error must be surfaced
       expect(retryErrors).toHaveLength(1);
@@ -2202,6 +2209,101 @@ describe("SyncEngine", () => {
       expect(recClient.putAttachment).toHaveBeenCalled();
 
       recEngine.stop();
+    });
+
+    it("applies exponential backoff before each 409 retry in binary push", async () => {
+      // 409 twice → success on 3rd attempt. The backoff sleeps between retries via setTimeout.
+      // Use fake timers to verify setTimeout is called with the expected durations without
+      // actually waiting: delay for attempt i is min(2^i * 100, 2000) ms.
+      vi.useFakeTimers();
+      try {
+        const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+        vault._addBinaryFile("images/backoff.jpeg", jpegData);
+
+        const backoffStore = new TestStateStore();
+        backoffStore.set("vault-sync-revmap", JSON.stringify({ "file/images/backoff.jpeg": { state: "known", rev: "1-stale", mtime: 0 } }));
+        const backoffEngine = makeEngine(settings, vaultAdapter, backoffStore);
+        backoffEngine.onStateChange = () => {};
+        const backoffErrors: string[] = [];
+        backoffEngine.onError = (msg) => backoffErrors.push(msg);
+        const backoffClient = getClient(backoffEngine);
+
+        const { CouchError } = await import("./couch-client");
+
+        backoffClient.allDocs.mockResolvedValue({
+          total_rows: 1,
+          rows: [{ id: "file/images/backoff.jpeg", key: "file/images/backoff.jpeg", value: { rev: "1-stale" } }],
+        });
+        backoffClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+        // get() returns fresh rev for 409 recovery
+        backoffClient.get = vi.fn().mockResolvedValue({ _id: "file/images/backoff.jpeg", _rev: "2-fresh", content: null, mtime: 0 });
+        // First two putAttachment calls 409, third succeeds
+        backoffClient.putAttachment = vi.fn()
+          .mockRejectedValueOnce(new CouchError(409, "Document update conflict."))
+          .mockRejectedValueOnce(new CouchError(409, "Document update conflict."))
+          .mockResolvedValueOnce({ ok: true, id: "file/images/backoff.jpeg", rev: "3-ok" });
+
+        const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+
+        // Run fullSync; fake timers advance all scheduled sleeps immediately
+        const syncPromise = backoffEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+
+        // 3 total attempts: initial + 2 retries after 409
+        expect(backoffClient.putAttachment).toHaveBeenCalledTimes(3);
+        // No error on success
+        expect(backoffErrors).toHaveLength(0);
+
+        // Verify backoff sleeps were scheduled: at least 2 setTimeout calls with
+        // the expected durations (100ms for attempt 0 → 1, 200ms for attempt 1 → 2).
+        const sleepCalls = setTimeoutSpy.mock.calls.filter((args) => typeof args[1] === "number" && (args[1] === 100 || args[1] === 200));
+        expect(sleepCalls.length).toBeGreaterThanOrEqual(2);
+
+        backoffEngine.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("raises binary 409 retry cap to 5 attempts before surfacing an error", async () => {
+      // With MAX_RETRIES=5, a file that 409s on every attempt should be retried 5 times total.
+      const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+      vault._addBinaryFile("images/alwayscf.jpeg", jpegData);
+
+      const capStore = new TestStateStore();
+      capStore.set("vault-sync-revmap", JSON.stringify({ "file/images/alwayscf.jpeg": { state: "known", rev: "1-stale", mtime: 0 } }));
+      const capEngine = makeEngine(settings, vaultAdapter, capStore);
+      capEngine.onStateChange = () => {};
+      const capErrors: string[] = [];
+      capEngine.onError = (msg) => capErrors.push(msg);
+      const capClient = getClient(capEngine);
+
+      const { CouchError } = await import("./couch-client");
+
+      vi.useFakeTimers();
+      try {
+        capClient.allDocs.mockResolvedValue({
+          total_rows: 1,
+          rows: [{ id: "file/images/alwayscf.jpeg", key: "file/images/alwayscf.jpeg", value: { rev: "1-stale" } }],
+        });
+        capClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+        capClient.get = vi.fn().mockResolvedValue({ _id: "file/images/alwayscf.jpeg", _rev: "2-fresh", content: null, mtime: 0 });
+        // Always 409
+        capClient.putAttachment = vi.fn().mockRejectedValue(new CouchError(409, "Document update conflict."));
+
+        const syncPromise = capEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+
+        // 5 attempts (attempt 0..4), then exhausted → error surfaced
+        expect(capClient.putAttachment).toHaveBeenCalledTimes(5);
+        expect(capErrors).toHaveLength(1);
+        expect(capErrors[0]).toContain("Binary push failed for images/alwayscf.jpeg");
+      } finally {
+        vi.useRealTimers();
+        capEngine.stop();
+      }
     });
   });
 

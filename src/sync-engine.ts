@@ -1855,7 +1855,8 @@ export class SyncEngine {
         }
       }
 
-      const MAX_RETRIES = 3;
+      // Higher cap than the old 3 to absorb brief write storms under slow connections.
+      const MAX_RETRIES = 5;
       let attachmentRev = rev;
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
@@ -1874,7 +1875,9 @@ export class SyncEngine {
             await this.handleRemoteDelete(docId);
             return;
           } else if (e instanceof CouchError && e.status === 409 && attempt < MAX_RETRIES - 1) {
-            // Rev became stale between stub PUT and attachment PUT — refetch and retry
+            // Rev became stale between stub PUT and attachment PUT — refetch and retry.
+            // Backoff: min(2^attempt * 100ms, 2000ms) — exponential ramp caps congestion storms.
+            await new Promise((r) => setTimeout(r, Math.min(2 ** attempt * 100, 2000)));
             const fresh = await this.client.get(docId);
             attachmentRev = fresh._rev ?? "";
             const curEntry: RevMapEntry | undefined = this.revMap[docId];
