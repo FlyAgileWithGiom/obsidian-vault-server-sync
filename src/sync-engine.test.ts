@@ -2307,6 +2307,94 @@ describe("SyncEngine", () => {
     });
   });
 
+  describe("binary file sync - pushLocks race prevention", () => {
+    it("serializes pushAllLocal and handleLocalChange pushes for the same binary file", async () => {
+      // Setup: pushAllLocal has a binary in flight (putAttachment is pending).
+      // handleLocalChange fires for the same file.
+      // Without pushLocks in pushAllLocal, two putAttachment calls race.
+      // With pushLocks, the second push waits for the first to finish.
+
+      const pngData = new Uint8Array([1, 2, 3]).buffer;
+      vault._addBinaryFile("images/race.png", pngData);
+
+      const raceStore = new TestStateStore();
+      raceStore.set("vault-sync-revmap", JSON.stringify({ "file/images/race.png": { state: "known", rev: "1-stub", mtime: 0 } }));
+      const raceEngine = makeEngine(settings, vaultAdapter, raceStore);
+      raceEngine.onStateChange = () => {};
+      raceEngine.onError = () => {};
+      const raceClient = getClient(raceEngine);
+
+      raceClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/race.png", key: "file/images/race.png", value: { rev: "1-stub" } }],
+      });
+      raceClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      raceClient.get = vi.fn().mockResolvedValue({ _id: "file/images/race.png", _rev: "1-stub", content: null, mtime: 0 });
+
+      // Start the engine so handleLocalChange is accepted (running = true).
+      // Use start() → first fullSync completes immediately.
+      raceClient.putAttachment = vi.fn().mockResolvedValue({ ok: true, id: "file/images/race.png", rev: "2-ok" });
+      await raceEngine.start();
+      raceClient.putAttachment.mockClear();
+
+      // Now update mtime so pushAllLocal considers the file changed on the NEXT cycle.
+      // Need to re-add to vault since start() may have caused handleRemoteDelete to remove it.
+      vault._addBinaryFile("images/race.png", new Uint8Array([4, 5, 6]).buffer);
+      // Update allDocs to reflect the new rev from start()
+      raceClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/race.png", key: "file/images/race.png", value: { rev: "2-ok" } }],
+      });
+      raceClient.get = vi.fn().mockResolvedValue({ _id: "file/images/race.png", _rev: "2-ok", content: null, mtime: 0 });
+      // Force the engine to treat the file as needing a push (revMap mtime:0 disables skip)
+      // The engine's internal revMap was updated by start(); we need to override it.
+      // Access internal revMap via type cast to set mtime:0
+      (raceEngine as unknown as { revMap: Record<string, unknown> }).revMap["file/images/race.png"] = { state: "known", rev: "2-ok", mtime: 0 };
+
+      // Install blocking mock for the race test
+      let resolveFirstPut!: () => void;
+      const firstPutPending = new Promise<void>((r) => { resolveFirstPut = r; });
+      let concurrentCalls = 0;
+      let maxConcurrentCalls = 0;
+      raceClient.putAttachment = vi.fn().mockImplementation(async () => {
+        concurrentCalls++;
+        maxConcurrentCalls = Math.max(maxConcurrentCalls, concurrentCalls);
+        await firstPutPending;
+        concurrentCalls--;
+        return { ok: true, id: "file/images/race.png", rev: "3-ok" };
+      });
+
+      // Start fullSync (which calls pushAllLocal → pushBinaryWithLock → putAttachment blocked)
+      const syncPromise = raceEngine.fullSync();
+
+      // Give the sync a moment to reach putAttachment (which is now blocking)
+      await new Promise((r) => setTimeout(r, 20));
+
+      // putAttachment is in flight — trigger a second push via handleLocalChange
+      const file: VaultFile = { kind: "file", path: "images/race.png", mtime: Date.now() + 1, size: pngData.byteLength };
+      raceEngine.handleLocalChange(file);
+
+      // Wait for debounce to fire (50ms) — second push should now be queued but NOT started yet
+      await new Promise((r) => setTimeout(r, 80));
+
+      // At this point, only 1 concurrent putAttachment should be in flight
+      expect(maxConcurrentCalls).toBe(1);
+
+      // Release the first put → first completes → second starts → resolves
+      resolveFirstPut();
+
+      // Wait for everything to settle
+      await syncPromise;
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Both pushes completed (total 2 putAttachment calls), but never concurrently
+      expect(raceClient.putAttachment).toHaveBeenCalledTimes(2);
+      expect(maxConcurrentCalls).toBe(1);
+
+      raceEngine.stop();
+    });
+  });
+
   describe("binary file sync - parallel push", () => {
     it("pushes K binaries in parallel chunks: wall time is roughly ceil(K/3) slots, not K slots", async () => {
       // With K=6 binaries and PARALLEL_BINARY_PUSH=3, we expect ~2 rounds of 3 concurrent

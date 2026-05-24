@@ -976,11 +976,12 @@ export class SyncEngine {
     }
 
     // Phase 4: push binary files in parallel chunks of PARALLEL_BINARY_PUSH.
-    // Mirrors the pull pattern: Promise.allSettled so one failure doesn't abort the batch.
-    // pushBinaryFile already swallows per-file errors via setError — fulfilled results are no-ops.
+    // Uses pushBinaryWithLock to serialize against concurrent handleLocalChange PUTs for the
+    // same file — prevents the pushAllLocal/event-handler race that causes 409 conflicts.
+    // Promise.allSettled ensures one failure doesn't abort the remaining chunk.
     for (let batchStart = 0; batchStart < binaryToPush.length; batchStart += PARALLEL_BINARY_PUSH) {
       const chunk = binaryToPush.slice(batchStart, batchStart + PARALLEL_BINARY_PUSH);
-      await Promise.allSettled(chunk.map((f) => this.pushBinaryFile(f)));
+      await Promise.allSettled(chunk.map((f) => this.pushBinaryWithLock(f)));
       this.emitCounts();
       await this.yield();
     }
@@ -1803,6 +1804,20 @@ export class SyncEngine {
     } catch (e) {
       this.setError(`Push failed for ${file.path}: ${(e as Error).message}`);
     }
+  }
+
+  /**
+   * Acquire pushLocks[file.path] then call pushBinaryFile, mirroring pushFile's lock pattern.
+   * Prevents a concurrent handleLocalChange PUT from racing with pushAllLocal's batch PUT.
+   */
+  private async pushBinaryWithLock(file: VaultFile): Promise<void> {
+    const key = file.path;
+    const prev = this.pushLocks.get(key) ?? Promise.resolve();
+    const settled = prev.catch(() => {});
+    const next = settled.then(() => this.pushBinaryFile(file));
+    const swallowed = next.catch(() => {});
+    this.pushLocks.set(key, swallowed);
+    await next;
   }
 
   private async pushBinaryFile(file: VaultFile): Promise<void> {
