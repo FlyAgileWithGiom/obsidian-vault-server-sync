@@ -206,3 +206,86 @@ describe("S2 — Transient binary failures recover", () => {
     15_000,
   );
 });
+
+// -------------------------------------------------------------------
+// S3 — Persistently-failing binaries become unsyncable (P3 regression detector)
+// Budget: < 10 s
+// -------------------------------------------------------------------
+
+describe("S3 — Persistently-failing binaries become unsyncable", () => {
+  let vault: ScenarioVault;
+  let engine: SyncEngine;
+  let stateChanges: string[];
+  let errors: string[];
+  const TEXT_COUNT = 100;
+  const BINARY_COUNT = 50;
+
+  beforeEach(() => {
+    vault = new ScenarioVault();
+
+    const files = makeVaultFiles(TEXT_COUNT, BINARY_COUNT);
+    for (let i = 0; i < TEXT_COUNT; i++) {
+      vault.addTextFile(files[i].path, seedTextContent(i), files[i].mtime);
+    }
+    for (let i = 0; i < BINARY_COUNT; i++) {
+      vault.addBinaryFile(files[TEXT_COUNT + i].path, new ArrayBuffer(4096), files[TEXT_COUNT + i].mtime);
+    }
+
+    // All 50 binaries always fail
+    const failures: Record<string, "always-fail"> = {};
+    for (let i = 0; i < BINARY_COUNT; i++) {
+      failures[`assets/bin-${i}.png`] = "always-fail";
+    }
+
+    currentFacade = makeCouchFacade({ textCount: TEXT_COUNT, binaryCount: BINARY_COUNT, failures });
+    ({ engine, stateChanges, errors } = makeEngine(vault));
+  });
+
+  afterEach(() => {
+    engine.stop();
+    currentFacade = null;
+  });
+
+  it(
+    "marks all 50 persistently-failing binaries as unsyncable after 3 consecutive failures",
+    async () => {
+      // Sync 1 (engine.start): each binary fails (binaryPushFailureCounts[path] = 1)
+      // engine.start() calls fullSync() without clearState, so counts persist.
+      await engine.start();
+
+      // Sync 2 (resumeFullSync): each binary fails again (count = 2)
+      await engine.resumeFullSync();
+
+      // Sync 3 (resumeFullSync): each binary fails again (count = 3 = BINARY_PUSH_MAX_FAILURES)
+      // → all 50 go into unsyncableFiles. setError called once per file (50 calls).
+      await engine.resumeFullSync();
+
+      // After sync 3: unsyncableFiles has 50 entries.
+      // Sync 4 (resumeFullSync): all 50 are SKIPPED via the guard at pushAllLocal line ~915.
+      // Only the consolidated setError fires at the end of fullSync (1 call).
+      errors.length = 0; // Clear prior errors; only measure the 4th sync's output
+      await engine.resumeFullSync();
+
+      const diag = engine.getDiagnostics();
+
+      // All 50 binaries classified as unsyncable
+      expect(diag.unsyncableCount).toBe(BINARY_COUNT);
+
+      // Text files still tracked
+      expect(diag.revMapSize).toBeGreaterThanOrEqual(TEXT_COUNT);
+
+      // lastSeq updated
+      expect(String(diag.lastSeq)).not.toBe("0");
+
+      // State ends "ok" — unsyncable files don't block sync completion
+      expect(stateChanges[stateChanges.length - 1]).toBe("ok");
+
+      // onError called exactly once: the consolidated unsyncable warning.
+      // Not 50 times (one per file) — files were skipped, not retried.
+      // If P3 is reverted (no unsyncable tracking): retries never stop → test timeout fires.
+      expect(errors.length).toBe(1);
+      expect(errors[0]).toContain("unsyncable");
+    },
+    10_000,
+  );
+});
