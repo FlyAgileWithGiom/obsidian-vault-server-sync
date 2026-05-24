@@ -131,3 +131,78 @@ describe("S1 — Happy-path large vault", () => {
     15_000,
   );
 });
+
+// -------------------------------------------------------------------
+// S2 — Transient binary failures recover (P1 + P3)
+// Budget: < 15 s
+// -------------------------------------------------------------------
+
+describe("S2 — Transient binary failures recover", () => {
+  let vault: ScenarioVault;
+  let engine: SyncEngine;
+  let stateChanges: string[];
+
+  beforeEach(() => {
+    vault = new ScenarioVault();
+
+    const files = makeVaultFiles(5800, 200);
+    for (let i = 0; i < 5800; i++) {
+      vault.addTextFile(files[i].path, seedTextContent(i), files[i].mtime);
+    }
+    for (let i = 0; i < 200; i++) {
+      vault.addBinaryFile(files[5800 + i].path, new ArrayBuffer(4096), files[5800 + i].mtime);
+    }
+
+    // First 10 binary paths fail twice then succeed on 3rd call.
+    // facade.callCounts accumulate across syncs (no reset between resumeFullSync calls).
+    const failures: Record<string, { failCount: number }> = {};
+    for (let i = 0; i < 10; i++) {
+      failures[`assets/bin-${i}.png`] = { failCount: 2 };
+    }
+
+    currentFacade = makeCouchFacade({ textCount: 5800, binaryCount: 200, failures });
+    ({ engine, stateChanges } = makeEngine(vault));
+  });
+
+  afterEach(() => {
+    engine.stop();
+    currentFacade = null;
+  });
+
+  it(
+    "recovers from transient failures and all files eventually sync",
+    async () => {
+      // Sync 1: 10 binaries fail (facade count=1, failCount=2 so still failing).
+      // Non-409 errors throw immediately from pushBinaryFile's inner loop (no retry there).
+      // The outer catch increments binaryPushFailureCounts[path] to 1.
+      await engine.forceFullSync();
+
+      // Sync 2: 10 binaries fail again (facade count=2, still failing).
+      // binaryPushFailureCounts[path] = 2 (below BINARY_PUSH_MAX_FAILURES=3).
+      // resumeFullSync does NOT call clearState, so failure counts accumulate.
+      await engine.resumeFullSync();
+
+      // Sync 3: 10 binaries succeed (facade count=3 > failCount=2 → resolves).
+      // binaryPushFailureCounts[path] cleared on success (line ~1884).
+      await engine.resumeFullSync();
+
+      const diag = engine.getDiagnostics();
+
+      // All recovered — no unsyncable files
+      expect(diag.unsyncableCount).toBe(0);
+
+      // At least 5990 docs tracked (most text + most binary)
+      expect(diag.revMapSize).toBeGreaterThanOrEqual(5990);
+
+      // lastSeq updated
+      expect(String(diag.lastSeq)).not.toBe("0");
+
+      // P1: every putAttachment call must have received a positive timeoutMs.
+      // If P1 is reverted (no explicit timeout passed), timeoutMs is undefined → recorded as -1.
+      const timeouts = currentFacade!.putAttachmentTimeouts;
+      expect(timeouts.length).toBeGreaterThan(0);
+      expect(timeouts.every((t) => t > 0)).toBe(true);
+    },
+    15_000,
+  );
+});
