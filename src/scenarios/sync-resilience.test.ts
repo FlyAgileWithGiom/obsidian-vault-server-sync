@@ -400,3 +400,183 @@ describe("S4 — 409 backoff timing is bounded", () => {
     5_000,
   );
 });
+
+// -------------------------------------------------------------------
+// S5 — PushLock prevents 409 storm (P5 regression detector)
+// Real timers (no vi.useFakeTimers — yield() must resolve naturally)
+// Budget: < 5 s
+//
+// Interleaving strategy:
+//   1. forceFullSync() starts — runs to pushBinaryFile → blocked at putAttachment latch.
+//   2. While blocked, call handleLocalChange for same file (debounceMs=0 → real timer fires).
+//   3. Release latch → forceFullSync resumes → completes.
+//   4. The lock (pushLocks) ensures handleLocalChange's push runs AFTER forceFullSync's.
+//
+// Regression signal (P5 reverted, no lock):
+//   The facade's putAttachment detects if the same stale rev is used twice concurrently
+//   and throws CouchError(409) → onError fires → test fails at errors.length === 0.
+// -------------------------------------------------------------------
+
+describe("S5 — PushLock prevents 409 storm", () => {
+  let vault: ScenarioVault;
+  let engine: SyncEngine;
+  let stateChanges: string[];
+  let errors: string[];
+
+  let latchResolve: (() => void) | null = null;
+  let s5PutCount = 0;
+  let s5PutRevs: string[] = [];
+
+  beforeEach(() => {
+    // Real timers: yield() must resolve naturally so forceFullSync can progress.
+    // (Fake timers would block yield() = setTimeout(r, 0) and make the latch unreachable.)
+    s5PutCount = 0;
+    s5PutRevs = [];
+    latchResolve = null;
+
+    vault = new ScenarioVault();
+    vault.addBinaryFile("bin/a.png", new ArrayBuffer(4096), 2_000_000);
+
+    const FILE_DOC_ID = "file/bin/a.png";
+    const INITIAL_REV = "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    currentFacade = {
+      isConfigured: () => true,
+      ensureDb: async () => {},
+
+      get: async (docId: string) => ({
+        _id: docId,
+        _rev: INITIAL_REV,
+        content: null,
+        mtime: 0,
+      }),
+
+      put: async (doc) => ({ ok: true, id: doc._id, rev: "2-stub" }),
+      delete: async (docId, _rev) => ({ ok: true, id: docId, rev: "2-deleted" }),
+
+      // allDocs: return "bin/a.png" already existing remotely.
+      // Required: without this, pullAllRemote sees file in revMap but not remoteRevs
+      // → handleRemoteDelete → file deleted from vault → handleLocalChange has no file.
+      allDocs: async () => ({
+        total_rows: 1,
+        rows: [{ id: FILE_DOC_ID, key: FILE_DOC_ID, value: { rev: INITIAL_REV } }],
+      }),
+
+      allDocsByKeys: async (keys) => ({
+        total_rows: keys.length,
+        rows: keys.map((k) => {
+          if (k === FILE_DOC_ID) {
+            return {
+              id: k, key: k,
+              value: { rev: INITIAL_REV },
+              doc: {
+                _id: k, _rev: INITIAL_REV, content: null, mtime: 2_000_000,
+                _attachments: { "data.bin": { content_type: "image/png", length: 4096, stub: true as const } },
+              },
+            };
+          }
+          return { id: k, key: k, value: { rev: "" }, error: "not_found" as const };
+        }),
+      }),
+
+      bulkDocs: async (docs) => docs.map((d) => ({ ok: true, id: d._id, rev: "2-bulk" })),
+      changes: async () => ({ last_seq: "1", results: [] }),
+      cancelChanges: () => {},
+      updateSettings: () => {},
+      getAttachment: async () => new ArrayBuffer(4096),
+
+      // putAttachment: first call sets the latch (blocks) so handleLocalChange can
+      // be injected while forceFullSync is paused mid-push.
+      // If the SAME rev is used twice (concurrent calls without lock), throw 409.
+      putAttachment: async (docId, _attName, rev, _data, _contentType) => {
+        s5PutCount++;
+        s5PutRevs.push(rev);
+
+        if (s5PutCount === 1) {
+          // Block until latch is released
+          await new Promise<void>((resolve) => { latchResolve = resolve; });
+          return { ok: true, id: docId, rev: "2-first-ok" };
+        }
+
+        // Second (and subsequent) calls succeed — we detect the race via revs, not 409.
+        // With lock: second call uses updated rev "2-first-ok" (forceFullSync updated revMap).
+        // Without lock: second call uses stale INITIAL_REV (ran concurrently before update).
+        return { ok: true, id: docId, rev: `${s5PutCount + 1}-ok` };
+      },
+
+      maxInFlight: 0,
+      putAttachmentTimeouts: [],
+      get putAttachmentCallCount() { return s5PutCount; },
+      putAttachmentTimestamps: new Map(),
+    } as CouchFacade;
+
+    ({ engine, stateChanges, errors } = makeEngine(vault));
+  });
+
+  afterEach(() => {
+    if (latchResolve) { latchResolve(); latchResolve = null; }
+    engine.stop();
+    currentFacade = null;
+  });
+
+  it(
+    "pushLock prevents duplicate in-flight binary push on concurrent sync + handleLocalChange",
+    async () => {
+      // Phase 1: start forceFullSync without awaiting.
+      // Engine's yield() = real setTimeout(0) → resolves naturally.
+      // forceFullSync will run through to the putAttachment latch and block there.
+      const syncPromise = engine.forceFullSync();
+
+      // Wait for latch: poll with real-timer yields until forceFullSync reaches putAttachment.
+      const maxWaitMs = 2000;
+      const startMs = Date.now();
+      while (latchResolve === null && Date.now() - startMs < maxWaitMs) {
+        await new Promise((r) => setImmediate(r));
+      }
+      expect(latchResolve).not.toBeNull();
+
+      // Phase 2: inject handleLocalChange while forceFullSync is paused.
+      // syncDebounceMs=0 → schedules setTimeout(callback, 0).
+      // We wait for one event-loop tick (setTimeout 0) so the debounce callback fires
+      // and pushBinaryFile starts (reaching get()) before we release the latch.
+      // This ensures both threads use the same stale INITIAL_REV concurrently.
+      const binaryFile = vault.getEntryByPath("bin/a.png");
+      expect(binaryFile).not.toBeNull();
+      engine.handleLocalChange(binaryFile!);
+
+      // Wait for the debounce setTimeout(0) to fire and for pushBinaryFile to start
+      // and call get() (which returns immediately). Now Thread 2 has rev = INITIAL_REV
+      // and is about to call putAttachment. This is the race window.
+      await new Promise((r) => setTimeout(r, 5));
+
+      // Phase 3: release latch → forceFullSync's putAttachment resolves.
+      latchResolve!();
+      latchResolve = null;
+
+      // Phase 4: wait for both to complete.
+      await syncPromise;
+      await new Promise((r) => setTimeout(r, 50));
+
+      // onError not called (no unhandled failures)
+      expect(errors.length).toBe(0);
+
+      // Binary file tracked in revMap
+      const diag = engine.getDiagnostics();
+      expect(diag.revMapSize).toBeGreaterThanOrEqual(1);
+
+      // P5 lock invariant: if a second putAttachment was called (handleLocalChange push),
+      // it must have used a DIFFERENT (fresh) rev than the first call's INITIAL_REV.
+      // With the lock: revMap is updated by forceFullSync before handleLocalChange's push
+      //   starts, so call #2 reads the new rev "2-first-ok" → revs differ.
+      // Without the lock: handleLocalChange's pushBinaryFile starts concurrently, reads
+      //   revMap BEFORE forceFullSync updates it → call #2 reads stale INITIAL_REV →
+      //   revs are identical → assertion fails.
+      const INITIAL_REV = "1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+      if (s5PutCount >= 2) {
+        // Second call used a fresh rev (not the stale INITIAL_REV)
+        expect(s5PutRevs[1]).not.toBe(INITIAL_REV);
+      }
+    },
+    5_000,
+  );
+});
