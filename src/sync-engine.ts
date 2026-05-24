@@ -98,6 +98,7 @@ const PARALLEL_BINARY_PULLS = 5;
 const PARALLEL_TEXT_APPLY = 5;
 const BINARY_PULL_RETRIES = 3;
 const BINARY_PULL_TIMEOUT_MS = 120_000;
+const BINARY_PUSH_TIMEOUT_MS = 120_000;
 // Chunk size for binary metadata pre-fetch (POST _all_docs). A single POST with
 // 7000+ keys timed out (30s default) on slow CouchDB connections — see GitHub #15.
 const META_BATCH_SIZE = 500;
@@ -1841,7 +1842,7 @@ export class SyncEngine {
       let attachmentRev = rev;
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
-          const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, attachmentRev, data, contentType);
+          const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, attachmentRev, data, contentType, BINARY_PUSH_TIMEOUT_MS);
           if (result.ok && result.rev) {
             this.revMap[docId] = { state: "known", rev: result.rev, mtime: file.mtime };
             this.persistState();

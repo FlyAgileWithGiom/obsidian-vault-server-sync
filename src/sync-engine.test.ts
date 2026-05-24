@@ -1908,7 +1908,8 @@ describe("SyncEngine", () => {
         "data.bin",
         expect.any(String), // rev from the put
         pngData,
-        "image/png"
+        "image/png",
+        expect.any(Number)
       );
     });
 
@@ -1933,7 +1934,8 @@ describe("SyncEngine", () => {
         "data.bin",
         expect.any(String),
         pngData,
-        "image/png"
+        "image/png",
+        expect.any(Number)
       );
     });
 
@@ -1980,7 +1982,8 @@ describe("SyncEngine", () => {
         "data.bin",
         "2-fresh",
         jpegData,
-        "image/jpeg"
+        "image/jpeg",
+        expect.any(Number)
       );
       // No error should be surfaced on successful retry
       expect(errors).toHaveLength(0);

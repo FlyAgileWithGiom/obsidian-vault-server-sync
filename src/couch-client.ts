@@ -183,11 +183,11 @@ export class CouchClient {
     return resp.arrayBuffer();
   }
 
-  async putAttachment(docId: string, attName: string, rev: string, data: ArrayBuffer, contentType: string): Promise<CouchBulkResult> {
+  async putAttachment(docId: string, attName: string, rev: string, data: ArrayBuffer, contentType: string, timeoutMs = 120_000): Promise<CouchBulkResult> {
     const url = `${this.baseUrl}/${encodeURIComponent(docId)}/${encodeURIComponent(attName)}?rev=${encodeURIComponent(rev)}`;
     const headers: Record<string, string> = { "Content-Type": contentType };
     if (this.authHeader) headers["Authorization"] = this.authHeader;
-    const resp = await this.transport.request({ url, method: "PUT", headers, body: data });
+    const resp = await this.transport.request({ url, method: "PUT", headers, body: data, timeoutMs });
     if (resp.status >= 400) {
       const text = await resp.text();
       throw new CouchError(resp.status, `CouchDB ${resp.status}: ${text}`);
