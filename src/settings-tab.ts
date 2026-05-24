@@ -235,6 +235,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
   private formatDiagnostics(d: SyncDiagnostics): string {
     const lines = [
+      `Version: ${this.plugin.manifest.version}`,
       `Status: ${d.state}`,
       `Running: ${d.running ? "yes" : "no"}`,
       `Tracked docs (revMap): ${d.revMapSize}`,
