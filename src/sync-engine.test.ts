@@ -2205,6 +2205,63 @@ describe("SyncEngine", () => {
     });
   });
 
+  describe("binary file sync - parallel push", () => {
+    it("pushes K binaries in parallel chunks: wall time is roughly ceil(K/3) slots, not K slots", async () => {
+      // With K=6 binaries and PARALLEL_BINARY_PUSH=3, we expect ~2 rounds of 3 concurrent
+      // uploads. Each putAttachment takes ~30ms. Total should be ≤ 3 rounds * 30ms = 90ms,
+      // well below the sequential 6 * 30ms = 180ms.
+      const SLOT_MS = 30;
+      const K = 6;
+
+      for (let i = 0; i < K; i++) {
+        vault._addBinaryFile(`images/img${i}.png`, new Uint8Array([i]).buffer);
+      }
+
+      // Pre-seed revMap with mtime:0 for all files so mtime-skip never fires.
+      const store = new TestStateStore();
+      const revMapSeed: Record<string, unknown> = {};
+      for (let i = 0; i < K; i++) {
+        revMapSeed[`file/images/img${i}.png`] = { state: "known", rev: "1-stub", mtime: 0 };
+      }
+      store.set("vault-sync-revmap", JSON.stringify(revMapSeed));
+
+      const parEngine = makeEngine(settings, vaultAdapter, store);
+      parEngine.onStateChange = () => {};
+      parEngine.onError = () => {};
+      const parClient = getClient(parEngine);
+
+      // Remote has all stubs so pullAllRemote won't delete them.
+      parClient.allDocs.mockResolvedValue({
+        total_rows: K,
+        rows: Array.from({ length: K }, (_, i) => ({
+          id: `file/images/img${i}.png`,
+          key: `file/images/img${i}.png`,
+          value: { rev: "1-stub" },
+        })),
+      });
+      parClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      parClient.get = vi.fn().mockResolvedValue({ _id: "placeholder", _rev: "1-stub", content: null, mtime: 0 });
+
+      // Each putAttachment takes SLOT_MS ms
+      parClient.putAttachment = vi.fn().mockImplementation(async () => {
+        await new Promise((r) => setTimeout(r, SLOT_MS));
+        return { ok: true, id: "placeholder", rev: "2-ok" };
+      });
+
+      const start = Date.now();
+      await parEngine.fullSync();
+      const elapsed = Date.now() - start;
+
+      // Sequential would take K * SLOT_MS = 180ms; parallel ceil(K/3) * SLOT_MS = 60ms.
+      // Allow 3x headroom for CI jitter.
+      const sequentialMs = K * SLOT_MS;
+      expect(elapsed).toBeLessThan(sequentialMs);
+      expect(parClient.putAttachment).toHaveBeenCalledTimes(K);
+
+      parEngine.stop();
+    });
+  });
+
   describe("handleRemoteDelete - empty parent folder cleanup", () => {
     // Helper: set up engine with a pre-populated revMap (simulates previously synced files),
     // then trigger fullSync where the remote no longer has those docs → handleRemoteDelete fires.

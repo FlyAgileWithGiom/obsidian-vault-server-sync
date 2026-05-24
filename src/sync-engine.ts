@@ -99,6 +99,8 @@ const PARALLEL_TEXT_APPLY = 5;
 const BINARY_PULL_RETRIES = 3;
 const BINARY_PULL_TIMEOUT_MS = 120_000;
 const BINARY_PUSH_TIMEOUT_MS = 120_000;
+// Lower than PARALLEL_BINARY_PULLS because mobile upload bandwidth is typically more constrained.
+const PARALLEL_BINARY_PUSH = 3;
 // Chunk size for binary metadata pre-fetch (POST _all_docs). A single POST with
 // 7000+ keys timed out (30s default) on slow CouchDB connections — see GitHub #15.
 const META_BATCH_SIZE = 500;
@@ -875,8 +877,10 @@ export class SyncEngine {
       remoteRevs,
     );
 
-    // Phase 3: push genuinely new files, delete locally any tombstoned ones
+    // Phase 3: push genuinely new files, delete locally any tombstoned ones.
+    // Binary files are collected separately and pushed in parallel batches of PARALLEL_BINARY_PUSH.
     const batch: CouchDoc[] = [];
+    const binaryToPush: VaultFile[] = [];
 
     for (let fi = 0; fi < files.length; fi++) {
       const file = files[fi];
@@ -909,9 +913,7 @@ export class SyncEngine {
         if (this.isBinaryDoc(docId)) {
           if (this.settings.disableBinaryPush) { await this.yield(); continue; }
           if (this.unsyncableFiles.has(file.path)) { await this.yield(); continue; }
-          await this.pushBinaryFile(file);
-          this.emitCounts();
-          await this.yield();
+          binaryToPush.push(file);
         } else {
           await this.pushTextFile(file);
           this.emitCounts();
@@ -936,10 +938,7 @@ export class SyncEngine {
       if (this.isBinaryDoc(docId)) {
         if (this.settings.disableBinaryPush) { await this.yield(); continue; }
         if (this.unsyncableFiles.has(file.path)) { await this.yield(); continue; }
-        // Binary files need attachment PUT, not bulk_docs
-        await this.pushBinaryFile(file);
-        this.emitCounts();
-        await this.yield();
+        binaryToPush.push(file);
       } else {
         let content: string;
         try {
@@ -974,6 +973,16 @@ export class SyncEngine {
     if (batch.length > 0) {
       await this.pushBatch(batch);
       this.emitCounts();
+    }
+
+    // Phase 4: push binary files in parallel chunks of PARALLEL_BINARY_PUSH.
+    // Mirrors the pull pattern: Promise.allSettled so one failure doesn't abort the batch.
+    // pushBinaryFile already swallows per-file errors via setError — fulfilled results are no-ops.
+    for (let batchStart = 0; batchStart < binaryToPush.length; batchStart += PARALLEL_BINARY_PUSH) {
+      const chunk = binaryToPush.slice(batchStart, batchStart + PARALLEL_BINARY_PUSH);
+      await Promise.allSettled(chunk.map((f) => this.pushBinaryFile(f)));
+      this.emitCounts();
+      await this.yield();
     }
   }
 
