@@ -514,3 +514,146 @@ describe("PouchDbSyncStrategy — remote URL construction", () => {
     void MockBridge;
   });
 });
+
+describe("PouchDbSyncStrategy — isFirstRun() branching", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    lastSyncHandle = null;
+    lastReplicateHandle = null;
+    pouchConstructorCalls = [];
+  });
+
+  it("start() with doc_count=0 runs replicate.from before startLiveSync", async () => {
+    const PouchDB = (await import("pouchdb-browser")).default;
+    const replicateSpy = vi.spyOn(PouchDB.prototype.replicate, "from");
+    const syncSpy = vi.spyOn(PouchDB.prototype, "sync");
+
+    // Default mock info returns doc_count: 0
+    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
+    strategy.register(makePlugin());
+    await strategy.start();
+
+    // replicate.from must be called (migration path)
+    expect(replicateSpy).toHaveBeenCalled();
+    // After replicate 'complete', live sync must start
+    expect(syncSpy).toHaveBeenCalled();
+    // And order: replicate before sync
+    expect(replicateSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      syncSpy.mock.invocationCallOrder[0],
+    );
+
+    replicateSpy.mockRestore();
+    syncSpy.mockRestore();
+    strategy.stop();
+  });
+
+  it("start() with doc_count>0 skips replicate.from and goes directly to live sync", async () => {
+    const PouchDB = (await import("pouchdb-browser")).default;
+    vi.spyOn(PouchDB.prototype, "info").mockResolvedValueOnce({
+      db_name: "test",
+      doc_count: 5,
+      update_seq: 0,
+    });
+    const replicateSpy = vi.spyOn(PouchDB.prototype.replicate, "from");
+    const syncSpy = vi.spyOn(PouchDB.prototype, "sync");
+
+    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
+    strategy.register(makePlugin());
+    await strategy.start();
+
+    expect(replicateSpy).not.toHaveBeenCalled();
+    expect(syncSpy).toHaveBeenCalled();
+
+    replicateSpy.mockRestore();
+    syncSpy.mockRestore();
+    strategy.stop();
+  });
+
+  it("start() sets state to 'ok' after successful migration", async () => {
+    // doc_count: 0 → migration → complete → ok
+    const onStateChange = vi.fn();
+    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
+    strategy.onStateChange = onStateChange;
+    strategy.register(makePlugin());
+    await strategy.start();
+
+    expect(onStateChange).toHaveBeenCalledWith("ok");
+    strategy.stop();
+  });
+});
+
+describe("PouchDbSyncStrategy — cleanupLegacyRevMap()", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    lastSyncHandle = null;
+    lastReplicateHandle = null;
+    pouchConstructorCalls = [];
+  });
+
+  it("calls localStorage.removeItem for vault-sync-revmap and vault-sync-last-seq after initial pull", async () => {
+    const removedKeys: string[] = [];
+    const originalLS = global.localStorage;
+    Object.defineProperty(global, "localStorage", {
+      value: {
+        removeItem: (key: string) => { removedKeys.push(key); },
+        getItem: () => null,
+        setItem: () => {},
+        clear: () => {},
+      },
+      configurable: true,
+      writable: true,
+    });
+
+    // doc_count: 0 → triggers runInitialPull → on complete → cleanupLegacyRevMap
+    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
+    strategy.register(makePlugin());
+    await strategy.start();
+
+    expect(removedKeys).toContain("vault-sync-revmap");
+    expect(removedKeys).toContain("vault-sync-last-seq");
+
+    // Restore
+    Object.defineProperty(global, "localStorage", {
+      value: originalLS,
+      configurable: true,
+      writable: true,
+    });
+    strategy.stop();
+  });
+
+  it("does NOT call localStorage.removeItem when doc_count > 0 (no migration)", async () => {
+    const PouchDB = (await import("pouchdb-browser")).default;
+    vi.spyOn(PouchDB.prototype, "info").mockResolvedValueOnce({
+      db_name: "test",
+      doc_count: 10,
+      update_seq: 0,
+    });
+
+    const removedKeys: string[] = [];
+    const originalLS = global.localStorage;
+    Object.defineProperty(global, "localStorage", {
+      value: {
+        removeItem: (key: string) => { removedKeys.push(key); },
+        getItem: () => null,
+        setItem: () => {},
+        clear: () => {},
+      },
+      configurable: true,
+      writable: true,
+    });
+
+    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
+    strategy.register(makePlugin());
+    await strategy.start();
+
+    expect(removedKeys).not.toContain("vault-sync-revmap");
+    expect(removedKeys).not.toContain("vault-sync-last-seq");
+
+    Object.defineProperty(global, "localStorage", {
+      value: originalLS,
+      configurable: true,
+      writable: true,
+    });
+    strategy.stop();
+  });
+});
