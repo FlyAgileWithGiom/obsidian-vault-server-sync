@@ -393,15 +393,74 @@ describe("PouchDbSyncStrategy — getDiagnostics()", () => {
   });
 });
 
-describe("PouchDbSyncStrategy — deferred methods throw", () => {
-  it("forceFullSync() throws 'deferred to commit 10'", async () => {
-    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
-    await expect(strategy.forceFullSync()).rejects.toThrow("deferred to commit 10");
+describe("PouchDbSyncStrategy — forceFullSync() / planFullSync()", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    lastSyncHandle = null;
+    lastReplicateHandle = null;
+    pouchConstructorCalls = [];
   });
 
-  it("planFullSync() throws 'deferred to commit 10'", async () => {
+  it("forceFullSync() resolves (does not throw)", async () => {
     const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
-    await expect(strategy.planFullSync()).rejects.toThrow("deferred to commit 10");
+    strategy.register(makePlugin());
+    // forceFullSync should resolve, not reject
+    await expect(strategy.forceFullSync()).resolves.toBeUndefined();
+  });
+
+  it("forceFullSync() calls db.replicate.from with live:false", async () => {
+    const PouchDB = (await import("pouchdb-browser")).default;
+    const replicateSpy = vi.spyOn(PouchDB.prototype.replicate, "from");
+
+    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
+    strategy.register(makePlugin());
+    await strategy.forceFullSync();
+
+    expect(replicateSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ live: false }),
+    );
+    replicateSpy.mockRestore();
+  });
+
+  it("forceFullSync() starts live sync after initial pull completes", async () => {
+    const PouchDB = (await import("pouchdb-browser")).default;
+    const syncSpy = vi.spyOn(PouchDB.prototype, "sync");
+
+    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
+    strategy.register(makePlugin());
+    await strategy.forceFullSync();
+
+    // After replicate.from 'complete', should have started live sync
+    expect(syncSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      { live: true, retry: true },
+    );
+    syncSpy.mockRestore();
+  });
+
+  it("planFullSync() resolves with a valid FullSyncPlan object", async () => {
+    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
+    const plan = await strategy.planFullSync();
+    expect(plan).toBeDefined();
+    expect(plan.wouldPushNew).toBeDefined();
+    expect(plan.wouldPushNew.count).toBeGreaterThanOrEqual(0);
+    expect(plan.wouldDeleteLocalTombstoned).toBeDefined();
+    expect(plan.alreadyTombstoned).toBeDefined();
+    expect(plan.excludedCount).toBeDefined();
+  });
+
+  it("planFullSync() returns doc_count from db.info() in wouldPushNew.count", async () => {
+    const PouchDB = (await import("pouchdb-browser")).default;
+    vi.spyOn(PouchDB.prototype, "info").mockResolvedValueOnce({
+      db_name: "test",
+      doc_count: 42,
+      update_seq: 0,
+    });
+
+    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
+    const plan = await strategy.planFullSync();
+    expect(plan.wouldPushNew.count).toBe(42);
   });
 });
 
