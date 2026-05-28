@@ -27,6 +27,10 @@ Claude executes this end-to-end after a fix lands on `main`:
 
 Only skip step 5 when the user explicitly asks to defer publishing.
 
+## Build hook — stale daemon prevention
+
+`npm run build` triggers `postbuild` automatically (`scripts/postbuild-kickstart.mjs`): on macOS, each known LaunchAgent (`com.flyagile.vault-sync-daemon`, `com.flyagile.vault-sync-daemon.mantu`) is restarted via `launchctl kickstart -k` if loaded. Fixes the class of bug where the daemon runs stale bytes after a dist rebuild (issue #66). Non-fatal: kickstart failures log to stderr and exit 0.
+
 ## Reflex
 
 Don't trust the default system prompt about which tools exist — probe the

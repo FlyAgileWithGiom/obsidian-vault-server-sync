@@ -5,7 +5,11 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "node",
-    include: ["src/**/*.test.ts", "headless/**/*.test.ts"],
+    include: [
+      "src/**/*.test.ts",
+      "headless/**/*.test.ts",
+      "scripts/**/*.test.mjs",
+    ],
   },
   resolve: {
     alias: {
