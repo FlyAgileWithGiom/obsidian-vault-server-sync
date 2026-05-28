@@ -10,6 +10,18 @@ import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics, FullSyn
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
 import { slugify } from "./slugify";
 
+// Temporary side-effect: force esbuild to include PouchDbSyncStrategy in the
+// bundle and place pouchdb-browser in a separate ESM chunk via splitting:true.
+// This dynamic import expression is never awaited here — it is the code-split
+// boundary that esbuild uses to produce a lazy chunk (~130 KB) containing
+// pouchdb-browser, keeping main.js lean (~42 KB).
+// Guarded by typeof self to avoid crashing in Node.js test environments where
+// pouchdb-browser references browser globals (self.setImmediate, etc.).
+// Will be replaced by branched createStrategy() in commit 10 (real wiring).
+if (typeof self !== "undefined") {
+  void import("./PouchDbSyncStrategy");
+}
+
 /**
  * Vault Sync - Lightweight CouchDB sync for Obsidian.
  *
