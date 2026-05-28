@@ -61,6 +61,8 @@ import type { Plugin, EventRef } from "obsidian";
 import { CouchClient, CouchError } from "./couch-client";
 import type { SyncStrategy } from "./sync-strategy";
 import { ATTACHMENT_NAME, contentTypeForPath, isBinaryPath } from "./binary-ext";
+import { pathToDocId, docIdToPath, DOC_PREFIX } from "./doc-id";
+import { buildTextDoc } from "./doc-builder";
 import type {
   VaultSyncSettings,
   CouchDoc,
@@ -80,10 +82,10 @@ import type {
 
 const REVMAP_KEY = "vault-sync-revmap";
 const SEQ_KEY = "vault-sync-last-seq";
-const DOC_PREFIX = "file/";
+// DOC_PREFIX, pathToDocId, docIdToPath imported from ./doc-id (re-exported for allDocs range queries)
+// ATTACHMENT_NAME, contentTypeForPath, isBinaryPath imported from ./binary-ext
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
-// ATTACHMENT_NAME imported from ./binary-ext
 const PARALLEL_BINARY_PULLS = 5;
 const BINARY_PULL_RETRIES = 3;
 const BINARY_PULL_TIMEOUT_MS = 120_000;
@@ -91,20 +93,6 @@ const BINARY_PULL_TIMEOUT_MS = 120_000;
 // 7000+ keys timed out (30s default) on slow CouchDB connections — see GitHub #15.
 const META_BATCH_SIZE = 500;
 const META_TIMEOUT_MS = 60_000;
-
-// contentTypeForPath imported from ./binary-ext
-
-/**
- * Convert a vault file path to a CouchDB doc ID.
- * Always produces NFC-normalized output so the same logical path always
- * yields the same docId regardless of the source platform's encoding
- * (macOS HFS+/APFS stores filenames in NFD, most other platforms NFC).
- * Without this, "Productivité" pushed from Mac (NFD) and "Productivité"
- * pushed from iOS (NFC) become two distinct docs.
- */
-function pathToDocId(path: string): string {
-  return `${DOC_PREFIX}${path.normalize("NFC")}`;
-}
 
 /**
  * Last-write-wins decision by mtime. Returns "local" or "remote" indicating
@@ -116,11 +104,7 @@ export function lwwWinner(localMtime: number, remoteMtime: number): "local" | "r
   return localMtime >= remoteMtime ? "local" : "remote";
 }
 
-/** Convert a CouchDB doc ID back to a vault file path (NFC-normalized) */
-function docIdToPath(docId: string): string {
-  const raw = docId.startsWith(DOC_PREFIX) ? docId.slice(DOC_PREFIX.length) : docId;
-  return raw.normalize("NFC");
-}
+// docIdToPath imported from ./doc-id
 
 /**
  * Returns true when a CouchDB 404 error represents a tombstone ("deleted") rather
@@ -863,7 +847,7 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
           throw e; // Non-recoverable: propagate
         }
 
-        batch.push({ _id: docId, content, mtime: file.mtime });
+        batch.push(buildTextDoc(file, content));
 
         // Flush in small chunks to avoid nginx 413
         if (batch.length >= 10) {
@@ -1518,11 +1502,7 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
         throw e; // Non-recoverable: propagate
       }
 
-      const doc: CouchDoc = {
-        _id: docId,
-        content,
-        mtime: file.mtime,
-      };
+      const doc: CouchDoc = { ...buildTextDoc(file, content) };
 
       // Always pass _rev when we have a revMap entry — avoids 409 storm after migration
       // (mtime:0 entries still have the correct rev from the legacy string value).
