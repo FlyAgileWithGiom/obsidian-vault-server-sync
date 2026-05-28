@@ -13,7 +13,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "postbuild": "node scripts/postbuild-kickstart.mjs",
-    "sync:status": "python3 scripts/sync-status.py"
+    "sync:status": "python3 scripts/sync-status.py",
+    "build:release": "mkdir -p dist/release && esbuild src/main.ts --bundle --external:obsidian --external:electron --external:@codemirror/* --external:@lezer/* --format=cjs --target=es2020 --outfile=dist/release/main.js --define:global=globalThis --minify && cp manifest.json styles.css dist/release/ 2>/dev/null; true"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
