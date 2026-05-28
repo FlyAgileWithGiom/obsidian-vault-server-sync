@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Plugin, Vault, TFile } from "./__mocks__/obsidian";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
-import { SyncEngine } from "./sync-engine";
+import { CustomFetchSyncStrategy as SyncEngine } from "./sync-engine";
 
 // Import the plugin class — obsidian is aliased to the mock via vitest.config.ts
 import VaultSyncPlugin from "./main";
@@ -9,7 +9,7 @@ import VaultSyncPlugin from "./main";
 // The plugin uses syncEngine?.updateSettings — mock it so saveSettings doesn't throw
 // when syncEngine is not initialised.
 vi.mock("./sync-engine", () => ({
-  SyncEngine: vi.fn().mockImplementation(() => ({
+  CustomFetchSyncStrategy: vi.fn().mockImplementation(() => ({
     isRunning: vi.fn().mockReturnValue(false),
     start: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn(),

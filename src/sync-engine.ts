@@ -185,7 +185,7 @@ function isRecoverableReadError(e: unknown): { recoverable: boolean; code?: stri
  * - Stores rev map in StateStore to survive plugin reloads without re-fetching
  * - All network calls go through CouchClient (transport-injected, no PouchDB)
  */
-export class SyncEngine {
+export class CustomFetchSyncStrategy {
   private client: CouchClient;
   private revMap: RevMap = {};
   private lastSeq: string | number = 0;
@@ -886,7 +886,7 @@ export class SyncEngine {
 
   private isBinaryDoc(docId: string): boolean {
     const ext = docId.split(".").pop()?.toLowerCase() ?? "";
-    return SyncEngine.BINARY_EXTENSIONS.has(ext);
+    return CustomFetchSyncStrategy.BINARY_EXTENSIONS.has(ext);
   }
 
   private async pullAllRemote(remoteRevs: Map<string, string>, opts: { bypassOrphanGuard?: boolean } = {}): Promise<void> {

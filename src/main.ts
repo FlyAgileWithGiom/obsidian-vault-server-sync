@@ -1,6 +1,6 @@
 import { Notice, Plugin } from "obsidian";
 import { CouchClient } from "./couch-client";
-import { SyncEngine } from "./sync-engine";
+import { CustomFetchSyncStrategy } from "./sync-engine";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
 import { ObsidianStateStore } from "./ObsidianStateStore";
 import { ObsidianTransport } from "./ObsidianTransport";
@@ -18,7 +18,7 @@ import { slugify } from "./slugify";
  */
 export default class VaultSyncPlugin extends Plugin {
   settings: VaultSyncSettings = { ...DEFAULT_SETTINGS };
-  private syncEngine!: SyncEngine;
+  private syncEngine!: CustomFetchSyncStrategy;
   private ribbonEl: HTMLElement | null = null;
   private statusBarEl: HTMLElement | null = null;
   private syncState: SyncState = "idle";
@@ -39,7 +39,7 @@ export default class VaultSyncPlugin extends Plugin {
     const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
     const stateStore = new ObsidianStateStore();
     const transport = new ObsidianTransport();
-    this.syncEngine = new SyncEngine(this.settings, vaultAdapter, stateStore, transport);
+    this.syncEngine = new CustomFetchSyncStrategy(this.settings, vaultAdapter, stateStore, transport);
     this.syncEngine.onStateChange = (state) => this.updateState(state);
     this.syncEngine.onCountsChange = (counts) => this.updateCounts(counts);
     this.syncEngine.onError = (msg) => this.handleSyncError(msg);

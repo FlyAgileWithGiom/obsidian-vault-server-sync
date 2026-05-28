@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { SyncEngine, lwwWinner } from "./sync-engine";
+import { CustomFetchSyncStrategy as SyncEngine, lwwWinner } from "./sync-engine";
 import { CouchClient } from "./couch-client";
 import { Vault, TFile } from "./__mocks__/obsidian";
 import type {

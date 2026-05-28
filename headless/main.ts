@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
-import { SyncEngine } from "../src/sync-engine";
+import { CustomFetchSyncStrategy } from "../src/sync-engine";
 import { FilesystemVaultAdapter } from "./VaultAdapter";
 import { JsonStateStore } from "./StateStore";
 import { FetchTransport } from "./FetchTransport";
@@ -59,7 +59,7 @@ const DEBOUNCE_MS = 100;
 export function createWatcher(
   absVaultRoot: string,
   excludePatterns: string[],
-  engine: Pick<SyncEngine, "handleLocalChange" | "handleLocalDelete">,
+  engine: Pick<CustomFetchSyncStrategy, "handleLocalChange" | "handleLocalDelete">,
 ): fs.FSWatcher {
   const debounce = new Map<string, ReturnType<typeof setTimeout>>();
   // macOS FSEvents emits a spurious event with rawFilename === basename(vaultRoot)
@@ -96,7 +96,7 @@ export function createWatcher(
 function handleFsEvent(
   filePath: string,
   rel: string,
-  engine: Pick<SyncEngine, "handleLocalChange" | "handleLocalDelete">,
+  engine: Pick<CustomFetchSyncStrategy, "handleLocalChange" | "handleLocalDelete">,
 ): void {
   let stat: ReturnType<typeof fs.statSync> | null = null;
   try {
@@ -133,7 +133,7 @@ async function main(): Promise<void> {
   const stateStore = new JsonStateStore(path.join(absVaultRoot, STATE_FILENAME));
   const transport = new FetchTransport();
 
-  const engine = new SyncEngine(settings, vaultAdapter, stateStore, transport);
+  const engine = new CustomFetchSyncStrategy(settings, vaultAdapter, stateStore, transport);
 
   engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
   engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);
