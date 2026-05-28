@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Platform, Plugin } from "obsidian";
 import { CouchClient } from "./couch-client";
 import { CustomFetchSyncStrategy } from "./sync-engine";
 import type { SyncStrategy } from "./sync-strategy";
@@ -9,18 +9,6 @@ import { VaultSyncSettingTab } from "./settings-tab";
 import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics, FullSyncPlan } from "./types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
 import { slugify } from "./slugify";
-
-// Temporary side-effect: force esbuild to include PouchDbSyncStrategy in the
-// bundle and place pouchdb-browser in a separate ESM chunk via splitting:true.
-// This dynamic import expression is never awaited here — it is the code-split
-// boundary that esbuild uses to produce a lazy chunk (~130 KB) containing
-// pouchdb-browser, keeping main.js lean (~42 KB).
-// Guarded by typeof self to avoid crashing in Node.js test environments where
-// pouchdb-browser references browser globals (self.setImmediate, etc.).
-// Will be replaced by branched createStrategy() in commit 10 (real wiring).
-if (typeof self !== "undefined") {
-  void import("./PouchDbSyncStrategy");
-}
 
 /**
  * Vault Sync - Lightweight CouchDB sync for Obsidian.
@@ -118,11 +106,25 @@ export default class VaultSyncPlugin extends Plugin {
   // --- Strategy factory ---
 
   /**
-   * Creates the active sync strategy. Currently always returns CustomFetchSyncStrategy.
-   * In commit 10, this will branch on Platform.isMobile and settings.syncStrategy
-   * to return PouchDbSyncStrategy on iOS.
+   * Creates the active sync strategy.
+   *
+   * Decision tree:
+   *   override === 'pouchdb'               → PouchDbSyncStrategy (forced on all platforms)
+   *   override === 'auto' && isMobile      → PouchDbSyncStrategy (iOS default path)
+   *   override === 'custom' || desktop     → CustomFetchSyncStrategy
+   *
+   * Dynamic import keeps pouchdb-browser (~130 KB) out of the main.js bundle.
+   * esbuild splitting:true places it in a separate chunk loaded only when needed.
    */
   private async createStrategy(): Promise<SyncStrategy> {
+    const override = this.settings.syncStrategy ?? 'auto';
+    const usePouch = override === 'pouchdb' || (override === 'auto' && Platform.isMobile);
+
+    if (usePouch) {
+      const { PouchDbSyncStrategy } = await import("./PouchDbSyncStrategy");
+      return new PouchDbSyncStrategy(this.settings, this.app);
+    }
+
     const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
     const stateStore = new ObsidianStateStore();
     const transport = new ObsidianTransport();

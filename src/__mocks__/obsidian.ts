@@ -219,3 +219,12 @@ export class Notice {
 export class App {
   vault = new Vault();
 }
+
+/**
+ * Platform mock — defaults to desktop (isMobile: false).
+ * Tests that need mobile behaviour should set Platform.isMobile = true
+ * before instantiating the object under test, and reset after.
+ */
+export const Platform = {
+  isMobile: false,
+};
