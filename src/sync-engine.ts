@@ -57,7 +57,12 @@
  * (Trous A/B/C/D and S14/S15).
  */
 
+import type { Plugin, EventRef } from "obsidian";
 import { CouchClient, CouchError } from "./couch-client";
+import type { SyncStrategy } from "./sync-strategy";
+import { ATTACHMENT_NAME, contentTypeForPath, isBinaryPath } from "./binary-ext";
+import { pathToDocId, docIdToPath, DOC_PREFIX } from "./doc-id";
+import { buildTextDoc } from "./doc-builder";
 import type {
   VaultSyncSettings,
   CouchDoc,
@@ -77,7 +82,8 @@ import type {
 
 const REVMAP_KEY = "vault-sync-revmap";
 const SEQ_KEY = "vault-sync-last-seq";
-const DOC_PREFIX = "file/";
+// DOC_PREFIX, pathToDocId, docIdToPath imported from ./doc-id (re-exported for allDocs range queries)
+// ATTACHMENT_NAME, contentTypeForPath, isBinaryPath imported from ./binary-ext
 /**
  * Path prefixes that are NEVER synced, regardless of user configuration.
  * Critical for protecting the vault from re-importing sync internals — including
@@ -90,7 +96,6 @@ const ALWAYS_EXCLUDED_PREFIXES: readonly string[] = [
 ];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
-const ATTACHMENT_NAME = "data.bin";
 const PARALLEL_BINARY_PULLS = 5;
 // Mirrors PARALLEL_BINARY_PULLS for text apply. Sequential apply within a batch
 // serializes the whole pull on pathological cases (cloud-sync interception, huge
@@ -110,37 +115,6 @@ const META_TIMEOUT_MS = 60_000;
 // remote rev index; pagination lets emitCounts tick between pages.
 const FULLSYNC_SCAN_PAGE_SIZE = 2000;
 
-const CONTENT_TYPE_MAP: Record<string, string> = {
-  png: "image/png",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  gif: "image/gif",
-  webp: "image/webp",
-  pdf: "application/pdf",
-  mp3: "audio/mpeg",
-  m4a: "audio/mp4",
-  wav: "audio/wav",
-  mp4: "video/mp4",
-  mov: "video/quicktime",
-};
-
-function contentTypeForPath(path: string): string {
-  const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  return CONTENT_TYPE_MAP[ext] ?? "application/octet-stream";
-}
-
-/**
- * Convert a vault file path to a CouchDB doc ID.
- * Always produces NFC-normalized output so the same logical path always
- * yields the same docId regardless of the source platform's encoding
- * (macOS HFS+/APFS stores filenames in NFD, most other platforms NFC).
- * Without this, "Productivité" pushed from Mac (NFD) and "Productivité"
- * pushed from iOS (NFC) become two distinct docs.
- */
-function pathToDocId(path: string): string {
-  return `${DOC_PREFIX}${path.normalize("NFC")}`;
-}
-
 /**
  * Last-write-wins decision by mtime. Returns "local" or "remote" indicating
  * which side wins the conflict. Equal mtime defaults to "local" (we already
@@ -151,11 +125,7 @@ export function lwwWinner(localMtime: number, remoteMtime: number): "local" | "r
   return localMtime >= remoteMtime ? "local" : "remote";
 }
 
-/** Convert a CouchDB doc ID back to a vault file path (NFC-normalized) */
-function docIdToPath(docId: string): string {
-  const raw = docId.startsWith(DOC_PREFIX) ? docId.slice(DOC_PREFIX.length) : docId;
-  return raw.normalize("NFC");
-}
+// docIdToPath imported from ./doc-id
 
 /**
  * Returns true when a CouchDB 404 error represents a tombstone ("deleted") rather
@@ -206,7 +176,7 @@ function isRecoverableReadError(e: unknown): { recoverable: boolean; code?: stri
  * - Stores rev map in StateStore to survive plugin reloads without re-fetching
  * - All network calls go through CouchClient (transport-injected, no PouchDB)
  */
-export class SyncEngine {
+export class CustomFetchSyncStrategy implements SyncStrategy {
   private client: CouchClient;
   private revMap: RevMap = {};
   private lastSeq: string | number = 0;
@@ -226,6 +196,10 @@ export class SyncEngine {
   private currentState: SyncState = "idle";
   /** Files skipped due to recoverable read errors (EAGAIN, EACCES, EIO, ENOENT). Cleared on successful read. */
   private unsyncableFiles: Map<string, { reason: string; firstSeen: number; retryAfter: number }> = new Map();
+  /** Vault event refs registered via register(); unregistered on stop(). */
+  private eventRefs: EventRef[] = [];
+  /** Plugin ref stored during register() for vault.offref() in stop(). */
+  private plugin: Plugin | null = null;
   /** Consecutive network-failure count per binary file path. Cleared on success or forceFullSync. */
   private binaryPushFailureCounts = new Map<string, number>();
   /** After this many consecutive network (non-409, non-tombstone) failures, skip until forceFullSync. */
@@ -249,6 +223,54 @@ export class SyncEngine {
   ) {
     this.client = new CouchClient(settings, transport);
     this.loadPersistedState();
+  }
+
+  /**
+   * Register vault event handlers (Shape b: strategy owns its subscriptions).
+   * Called once by main.ts after construction, before start().
+   * The plugin auto-cleans these on unload; stop() also cleans them manually
+   * so the strategy can be stopped and restarted within the same plugin instance.
+   */
+  register(plugin: Plugin): void {
+    this.plugin = plugin;
+    const vault = plugin.app.vault;
+
+    // vault.on() returns EventRef; plugin.registerEvent() registers it for auto-cleanup on unload.
+    // We also store EventRefs for manual cleanup in stop().
+    const addEvent = (ref: EventRef) => {
+      plugin.registerEvent(ref);
+      this.eventRefs.push(ref);
+    };
+
+    addEvent(
+      vault.on("modify", (file) => {
+        const entry = this.vault.getEntryByPath(file.path);
+        if (entry) this.handleLocalChange(entry);
+      })
+    );
+    addEvent(
+      vault.on("create", (file) => {
+        const entry = this.vault.getEntryByPath(file.path);
+        if (entry) this.handleLocalChange(entry);
+      })
+    );
+    addEvent(
+      vault.on("delete", (file) => {
+        const entry = this.vault.getEntryByPath(file.path);
+        if (entry) this.handleLocalDelete(entry);
+      })
+    );
+    addEvent(
+      vault.on("rename", (file, oldPath) => {
+        const entry = this.vault.getEntryByPath(file.path);
+        if (entry) this.handleLocalRename(entry, oldPath);
+      })
+    );
+  }
+
+  /** Test connectivity to CouchDB. */
+  async testConnection(): Promise<boolean> {
+    return this.client.ping();
   }
 
   private normalizePath(path: string): string {
@@ -409,6 +431,16 @@ export class SyncEngine {
     }
     this.recentRemoteTimers.clear();
     this.recentRemotePaths.clear();
+    // Unregister vault event handlers registered in register()
+    if (this.plugin && this.eventRefs.length > 0) {
+      const vault = this.plugin.app.vault as typeof this.plugin.app.vault & { offref?: (ref: EventRef) => void };
+      if (vault.offref) {
+        for (const ref of this.eventRefs) {
+          vault.offref(ref);
+        }
+      }
+      this.eventRefs = [];
+    }
     this.setState("idle");
   }
 
@@ -959,7 +991,7 @@ export class SyncEngine {
           throw e; // Non-recoverable: propagate
         }
 
-        batch.push({ _id: docId, content, mtime: file.mtime });
+        batch.push(buildTextDoc(file, content));
 
         // Flush in small chunks to avoid nginx 413
         if (batch.length >= 10) {
@@ -1130,19 +1162,10 @@ export class SyncEngine {
    * Uses batched _all_docs with include_docs to avoid N+1 individual GETs.
    * This is critical for mobile where 14K individual requests would fail silently.
    */
-  /** Skip binary extensions that have no text content in CouchDB */
-  private static readonly BINARY_EXTENSIONS = new Set([
-    "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "svgz", "ico",
-    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-    "mp3", "m4a", "wav", "ogg", "flac",
-    "mp4", "mov", "avi", "mkv", "webm",
-    "zip", "tar", "gz", "rar", "7z",
-    "bin", "heic", "drawing", "writing",
-  ]);
-
+  /** Binary extension detection delegates to shared binary-ext module. */
   private isBinaryDoc(docId: string): boolean {
-    const ext = docId.split(".").pop()?.toLowerCase() ?? "";
-    return SyncEngine.BINARY_EXTENSIONS.has(ext);
+    // docId is "file/<path>" — isBinaryPath handles extension extraction
+    return isBinaryPath(docId);
   }
 
   private async pullAllRemote(remoteRevs: Map<string, string>, opts: { bypassOrphanGuard?: boolean } = {}): Promise<void> {
@@ -1763,11 +1786,7 @@ export class SyncEngine {
         throw e; // Non-recoverable: propagate
       }
 
-      const doc: CouchDoc = {
-        _id: docId,
-        content,
-        mtime: file.mtime,
-      };
+      const doc: CouchDoc = { ...buildTextDoc(file, content) };
 
       // Always pass _rev when we have a revMap entry — avoids 409 storm after migration
       // (mtime:0 entries still have the correct rev from the legacy string value).
@@ -1916,7 +1935,7 @@ export class SyncEngine {
         const prev = this.binaryPushFailureCounts.get(file.path) ?? 0;
         const next = prev + 1;
         this.binaryPushFailureCounts.set(file.path, next);
-        if (next >= SyncEngine.BINARY_PUSH_MAX_FAILURES) {
+        if (next >= CustomFetchSyncStrategy.BINARY_PUSH_MAX_FAILURES) {
           this.unsyncableFiles.set(file.path, {
             reason: "push-network",
             firstSeen: this.unsyncableFiles.get(file.path)?.firstSeen ?? Date.now(),
@@ -2022,3 +2041,6 @@ export class SyncEngine {
     return this.settings.excludePatterns.some((pattern) => path.startsWith(pattern));
   }
 }
+
+/** @deprecated Use CustomFetchSyncStrategy. Kept for backward compat with tests added in main. */
+export { CustomFetchSyncStrategy as SyncEngine };

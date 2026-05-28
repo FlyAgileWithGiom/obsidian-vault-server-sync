@@ -1,6 +1,7 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Platform, Plugin } from "obsidian";
 import { CouchClient } from "./couch-client";
-import { SyncEngine } from "./sync-engine";
+import { CustomFetchSyncStrategy } from "./sync-engine";
+import type { SyncStrategy } from "./sync-strategy";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
 import { ObsidianStateStore } from "./ObsidianStateStore";
 import { ObsidianTransport } from "./ObsidianTransport";
@@ -18,8 +19,7 @@ import { slugify } from "./slugify";
  */
 export default class VaultSyncPlugin extends Plugin {
   settings: VaultSyncSettings = { ...DEFAULT_SETTINGS };
-  private syncEngine!: SyncEngine;
-  private vaultAdapter!: ObsidianVaultAdapter;
+  private strategy!: SyncStrategy;
   private ribbonEl: HTMLElement | null = null;
   private statusBarEl: HTMLElement | null = null;
   private syncState: SyncState = "idle";
@@ -44,7 +44,14 @@ export default class VaultSyncPlugin extends Plugin {
       await this.saveSettings();
     }
 
-    this.buildEngine();
+    this.strategy = await this.createStrategy();
+    this.strategy.onStateChange = (state) => this.updateState(state);
+    this.strategy.onCountsChange = (counts) => this.updateCounts(counts);
+    this.strategy.onError = (msg) => this.handleSyncError(msg);
+    this.strategy.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    // Shape b: strategy registers its own vault event handlers
+    this.strategy.register(this);
+    this.engineVaultName = this.app.vault.getName();
 
     // Ribbon icon for sync toggle
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "Vault Sync", () => {
@@ -99,38 +106,6 @@ export default class VaultSyncPlugin extends Plugin {
       callback: () => this.replaceLocalFromServer(),
     });
 
-    // Register vault events for local change tracking.
-    // Convert raw TAbstractFile → VaultEntry before delegating so syncEngine
-    // receives the `kind` discriminator it requires (bug: raw TAbstractFile has
-    // no `kind`, causing all local-change handlers to silently return).
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        const entry = this.vaultAdapter.getEntryByPath(file.path);
-        if (entry) this.syncEngine.handleLocalChange(entry);
-      })
-    );
-
-    this.registerEvent(
-      this.app.vault.on("create", (file) => {
-        const entry = this.vaultAdapter.getEntryByPath(file.path);
-        if (entry) this.syncEngine.handleLocalChange(entry);
-      })
-    );
-
-    this.registerEvent(
-      this.app.vault.on("delete", (file) => {
-        const entry = this.vaultAdapter.getEntryByPath(file.path);
-        if (entry) this.syncEngine.handleLocalDelete(entry);
-      })
-    );
-
-    this.registerEvent(
-      this.app.vault.on("rename", (file, oldPath) => {
-        const entry = this.vaultAdapter.getEntryByPath(file.path);
-        if (entry) this.syncEngine.handleLocalRename(entry, oldPath);
-      })
-    );
-
     // Auto-start if configured
     if (this.settings.couchDbUrl && this.settings.couchDbName) {
       // Delay start slightly to let Obsidian finish loading on mobile
@@ -143,28 +118,13 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   /**
-   * Construct (or reconstruct) the SyncEngine bound to the CURRENT vault.
-   * Captures the vault name so refreshIfVaultChanged() can detect drift.
-   */
-  private buildEngine(): void {
-    this.vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
-    const stateStore = new ObsidianStateStore();
-    const transport = new ObsidianTransport();
-    this.syncEngine = new SyncEngine(this.settings, this.vaultAdapter, stateStore, transport);
-    this.syncEngine.onStateChange = (state) => this.updateState(state);
-    this.syncEngine.onCountsChange = (counts) => this.updateCounts(counts);
-    this.syncEngine.onError = (msg) => this.handleSyncError(msg);
-    this.syncEngine.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
-    this.engineVaultName = this.app.vault.getName();
-  }
-
-  /**
-   * Rebuild the engine if the active vault has changed since onload.
+   * Rebuild the strategy if the active vault has changed since onload.
    *
    * Obsidian iOS keeps the plugin instance alive across vault switches —
    * onunload/onload are not called. Without this check, the captured
-   * SyncEngine + adapter keep pointing at the old vault and the diagnostics
-   * panel (and any other read) shows stale data. See issue #56.
+   * strategy keeps pointing at the old vault. refreshIfVaultChanged() compares
+   * this snapshot to the live vault name and rebuilds the strategy when they diverge.
+   * See issue #56.
    *
    * Returns true when a rebuild happened, false otherwise.
    */
@@ -172,14 +132,20 @@ export default class VaultSyncPlugin extends Plugin {
     const current = this.app.vault.getName();
     if (current === this.engineVaultName) return false;
 
-    this.syncEngine?.stop();
+    this.strategy?.stop();
     await this.loadSettings();
     // Re-derive DB name for the new vault if user hasn't set one explicitly.
     if (!this.settings.couchDbName) {
       this.settings.couchDbName = `vault-${slugify(current)}`;
       await this.saveSettings();
     }
-    this.buildEngine();
+    this.strategy = await this.createStrategy();
+    this.strategy.onStateChange = (state) => this.updateState(state);
+    this.strategy.onCountsChange = (counts) => this.updateCounts(counts);
+    this.strategy.onError = (msg) => this.handleSyncError(msg);
+    this.strategy.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    this.strategy.register(this);
+    this.engineVaultName = current;
     this.notifyDiagnosticsListeners();
 
     // Auto-restart sync for the new vault if it's configured.
@@ -195,6 +161,34 @@ export default class VaultSyncPlugin extends Plugin {
       this.startupTimer = null;
     }
     this.stopSync();
+  }
+
+  // --- Strategy factory ---
+
+  /**
+   * Creates the active sync strategy.
+   *
+   * Decision tree:
+   *   override === 'pouchdb'               → PouchDbSyncStrategy (forced on all platforms)
+   *   override === 'auto' && isMobile      → PouchDbSyncStrategy (iOS default path)
+   *   override === 'custom' || desktop     → CustomFetchSyncStrategy
+   *
+   * Dynamic import keeps pouchdb-browser (~130 KB) out of the main.js bundle.
+   * esbuild splitting:true places it in a separate chunk loaded only when needed.
+   */
+  private async createStrategy(): Promise<SyncStrategy> {
+    const override = this.settings.syncStrategy ?? 'auto';
+    const usePouch = override === 'pouchdb' || (override === 'auto' && Platform.isMobile);
+
+    if (usePouch) {
+      const { PouchDbSyncStrategy } = await import("./PouchDbSyncStrategy");
+      return new PouchDbSyncStrategy(this.settings, this.app);
+    }
+
+    const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
+    const stateStore = new ObsidianStateStore();
+    const transport = new ObsidianTransport();
+    return new CustomFetchSyncStrategy(this.settings, vaultAdapter, stateStore, transport);
   }
 
   // --- Settings persistence ---
@@ -255,22 +249,22 @@ export default class VaultSyncPlugin extends Plugin {
       VAULT_SYNC_CONFIG_FILE,
       JSON.stringify(this.settings, null, 2)
     );
-    this.syncEngine?.updateSettings(this.settings);
+    this.strategy?.updateSettings(this.settings);
   }
 
   // --- Sync control ---
 
   private async startSync(): Promise<void> {
-    if (this.syncEngine.isRunning()) return;
-    await this.syncEngine.start();
+    if (this.strategy.isRunning()) return;
+    await this.strategy.start();
   }
 
   private stopSync(): void {
-    this.syncEngine.stop();
+    this.strategy.stop();
   }
 
   private toggleSync(): void {
-    if (this.syncEngine.isRunning()) {
+    if (this.strategy.isRunning()) {
       this.stopSync();
       new Notice("Vault Sync stopped");
     } else {
@@ -281,7 +275,7 @@ export default class VaultSyncPlugin extends Plugin {
 
   /** Public: called from settings tab and resume-sync command */
   async resumeFullSync(): Promise<void> {
-    await this.syncEngine.resumeFullSync();
+    await this.strategy.resumeFullSync();
   }
 
   /** Public: called from settings tab */
@@ -289,7 +283,7 @@ export default class VaultSyncPlugin extends Plugin {
     // Delegate end-to-end to the engine — it owns stop/clearState/ensureDb/
     // fullSync({bypassOrphanGuard:true})/poll lifecycle. Routing through a
     // plain start() here drops the bypass flag and leaves revMap empty.
-    await this.syncEngine.forceFullSync();
+    await this.strategy.forceFullSync();
   }
 
   /**
@@ -298,7 +292,7 @@ export default class VaultSyncPlugin extends Plugin {
    * Called from the settings tab and from the replace-local-from-server command.
    */
   async replaceLocalFromServer(): Promise<void> {
-    await this.syncEngine.replaceLocalFromServer();
+    await (this.strategy as CustomFetchSyncStrategy).replaceLocalFromServer();
   }
 
   /**
@@ -307,12 +301,12 @@ export default class VaultSyncPlugin extends Plugin {
    * Called from the settings tab "Preview Full sync" button.
    */
   async previewFullSync(): Promise<FullSyncPlan> {
-    return this.syncEngine.planFullSync({ bypassOrphanGuard: true });
+    return this.strategy.planFullSync({ bypassOrphanGuard: true });
   }
 
   /** Public: diagnostics for settings tab observability on mobile */
   getDiagnostics(): SyncDiagnostics {
-    return this.syncEngine.getDiagnostics();
+    return this.strategy.getDiagnostics();
   }
 
   subscribeDiagnostics(listener: () => void): void {

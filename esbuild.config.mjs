@@ -1,14 +1,19 @@
 import esbuild from "esbuild";
-import { copyFileSync, chmodSync, existsSync } from "fs";
+import { copyFileSync, chmodSync, existsSync, readdirSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
 const prod = process.argv[2] === "production";
 const PLUGIN_DIR = join(homedir(), "ObsidianNotes/.obsidian/plugins/fly-vault-sync");
+const PLUGIN_OUT = "dist/plugin";
 
 function deploy() {
   if (existsSync(PLUGIN_DIR)) {
-    for (const f of ["main.js", "manifest.json", "styles.css"]) {
+    // Copy all JS chunks from dist/plugin/ plus manifest and styles from root
+    for (const f of readdirSync(PLUGIN_OUT)) {
+      copyFileSync(join(PLUGIN_OUT, f), join(PLUGIN_DIR, f));
+    }
+    for (const f of ["manifest.json", "styles.css"]) {
       copyFileSync(f, join(PLUGIN_DIR, f));
     }
     console.log("Deployed to vault plugin dir");
@@ -16,13 +21,17 @@ function deploy() {
 }
 
 // --- Obsidian plugin build ---
+// ESM + splitting: pouchdb-browser is placed in a separate chunk via dynamic import.
+// The dynamic import expression in main.ts ensures esbuild splits pouchdb-browser
+// into a lazy chunk (~130 KB) instead of inlining it into main.js (~42 KB).
 const pluginContext = await esbuild.context({
   entryPoints: ["src/main.ts"],
   bundle: true,
+  splitting: true,          // enable code splitting (requires ESM)
+  format: "esm",            // splitting requires ESM output
+  outdir: PLUGIN_OUT,       // splitting requires outdir, not outfile
   external: ["obsidian", "electron", "@codemirror/*", "@lezer/*"],
-  format: "cjs",
   target: "es2020",
-  outfile: "main.js",
   sourcemap: prod ? false : "inline",
   treeShaking: true,
   minify: prod,
@@ -36,6 +45,7 @@ const pluginContext = await esbuild.context({
 });
 
 // --- Headless daemon build ---
+// Headless daemon remains CJS Node — never imports PouchDbSyncStrategy.
 const headlessContext = await esbuild.context({
   entryPoints: ["headless/main.ts"],
   bundle: true,
