@@ -6,6 +6,11 @@ export default defineConfig({
     globals: true,
     environment: "node",
     include: ["src/**/*.test.ts", "headless/**/*.test.ts"],
+    environmentMatchGlobs: [
+      // Bridge and strategy tests need browser globals (localStorage, document, indexedDB)
+      ["src/PouchDb*.test.ts", "jsdom"],
+      ["src/strategy-factory.test.ts", "jsdom"],
+    ],
   },
   resolve: {
     alias: {
