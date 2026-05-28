@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/Users/guillaume/.nvm/versions/node/v22.19.0/bin/node</string>
-        <string>/Users/guillaume/dev/tools/mcp/servers/mac-vault-sync/dist/headless.js</string>
+        <string>/Users/guillaume/dev/tools/mcp/servers/obsidian-vault-server-sync/dist/headless.js</string>
         <string>/Users/guillaume/ObsidianNotes</string>
     </array>
 
