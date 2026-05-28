@@ -1,5 +1,5 @@
 {
-  "name": "mac-vault-sync",
+  "name": "obsidian-vault-server-sync",
   "version": "1.13.0",
   "description": "Lightweight CouchDB sync for Obsidian vaults",
   "main": "main.js",
