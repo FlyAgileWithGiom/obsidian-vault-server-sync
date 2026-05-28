@@ -209,6 +209,7 @@ export class Setting {
   addText(): this { return this; }
   addTextArea(): this { return this; }
   addButton(): this { return this; }
+  addDropdown(): this { return this; }
 }
 
 export class Notice {
