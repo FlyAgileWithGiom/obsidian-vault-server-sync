@@ -471,8 +471,8 @@ describe("VaultSyncPlugin.previewFullSync", () => {
     };
 
     const planFullSync = vi.fn().mockResolvedValue(mockPlan);
-    // Inject a mock syncEngine with planFullSync
-    (plugin as unknown as { syncEngine: unknown }).syncEngine = {
+    // Inject a mock strategy with planFullSync
+    (plugin as unknown as { strategy: unknown }).strategy = {
       planFullSync,
     };
 

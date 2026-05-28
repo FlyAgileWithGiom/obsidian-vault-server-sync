@@ -1,6 +1,7 @@
 import { Notice, Plugin } from "obsidian";
 import { CouchClient } from "./couch-client";
 import { CustomFetchSyncStrategy } from "./sync-engine";
+import type { SyncStrategy } from "./sync-strategy";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
 import { ObsidianStateStore } from "./ObsidianStateStore";
 import { ObsidianTransport } from "./ObsidianTransport";
@@ -18,7 +19,7 @@ import { slugify } from "./slugify";
  */
 export default class VaultSyncPlugin extends Plugin {
   settings: VaultSyncSettings = { ...DEFAULT_SETTINGS };
-  private syncEngine!: CustomFetchSyncStrategy;
+  private strategy!: SyncStrategy;
   private ribbonEl: HTMLElement | null = null;
   private statusBarEl: HTMLElement | null = null;
   private syncState: SyncState = "idle";
@@ -36,16 +37,13 @@ export default class VaultSyncPlugin extends Plugin {
       await this.saveSettings();
     }
 
-    const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
-    const stateStore = new ObsidianStateStore();
-    const transport = new ObsidianTransport();
-    this.syncEngine = new CustomFetchSyncStrategy(this.settings, vaultAdapter, stateStore, transport);
-    this.syncEngine.onStateChange = (state) => this.updateState(state);
-    this.syncEngine.onCountsChange = (counts) => this.updateCounts(counts);
-    this.syncEngine.onError = (msg) => this.handleSyncError(msg);
-    this.syncEngine.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    this.strategy = await this.createStrategy();
+    this.strategy.onStateChange = (state) => this.updateState(state);
+    this.strategy.onCountsChange = (counts) => this.updateCounts(counts);
+    this.strategy.onError = (msg) => this.handleSyncError(msg);
+    this.strategy.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
     // Shape b: strategy registers its own vault event handlers
-    this.syncEngine.register(this);
+    this.strategy.register(this);
 
     // Ribbon icon for sync toggle
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "Vault Sync", () => {
@@ -103,6 +101,20 @@ export default class VaultSyncPlugin extends Plugin {
       this.startupTimer = null;
     }
     this.stopSync();
+  }
+
+  // --- Strategy factory ---
+
+  /**
+   * Creates the active sync strategy. Currently always returns CustomFetchSyncStrategy.
+   * In commit 10, this will branch on Platform.isMobile and settings.syncStrategy
+   * to return PouchDbSyncStrategy on iOS.
+   */
+  private async createStrategy(): Promise<SyncStrategy> {
+    const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
+    const stateStore = new ObsidianStateStore();
+    const transport = new ObsidianTransport();
+    return new CustomFetchSyncStrategy(this.settings, vaultAdapter, stateStore, transport);
   }
 
   // --- Settings persistence ---
@@ -163,22 +175,22 @@ export default class VaultSyncPlugin extends Plugin {
       VAULT_SYNC_CONFIG_FILE,
       JSON.stringify(this.settings, null, 2)
     );
-    this.syncEngine?.updateSettings(this.settings);
+    this.strategy?.updateSettings(this.settings);
   }
 
   // --- Sync control ---
 
   private async startSync(): Promise<void> {
-    if (this.syncEngine.isRunning()) return;
-    await this.syncEngine.start();
+    if (this.strategy.isRunning()) return;
+    await this.strategy.start();
   }
 
   private stopSync(): void {
-    this.syncEngine.stop();
+    this.strategy.stop();
   }
 
   private toggleSync(): void {
-    if (this.syncEngine.isRunning()) {
+    if (this.strategy.isRunning()) {
       this.stopSync();
       new Notice("Vault Sync stopped");
     } else {
@@ -189,7 +201,7 @@ export default class VaultSyncPlugin extends Plugin {
 
   /** Public: called from settings tab and resume-sync command */
   async resumeFullSync(): Promise<void> {
-    await this.syncEngine.resumeFullSync();
+    await this.strategy.resumeFullSync();
   }
 
   /** Public: called from settings tab */
@@ -197,7 +209,7 @@ export default class VaultSyncPlugin extends Plugin {
     // Delegate end-to-end to the engine — it owns stop/clearState/ensureDb/
     // fullSync({bypassOrphanGuard:true})/poll lifecycle. Routing through a
     // plain start() here drops the bypass flag and leaves revMap empty.
-    await this.syncEngine.forceFullSync();
+    await this.strategy.forceFullSync();
   }
 
   /**
@@ -206,12 +218,12 @@ export default class VaultSyncPlugin extends Plugin {
    * Called from the settings tab "Preview Full sync" button.
    */
   async previewFullSync(): Promise<FullSyncPlan> {
-    return this.syncEngine.planFullSync({ bypassOrphanGuard: true });
+    return this.strategy.planFullSync({ bypassOrphanGuard: true });
   }
 
   /** Public: diagnostics for settings tab observability on mobile */
   getDiagnostics(): SyncDiagnostics {
-    return this.syncEngine.getDiagnostics();
+    return this.strategy.getDiagnostics();
   }
 
   subscribeDiagnostics(listener: () => void): void {
