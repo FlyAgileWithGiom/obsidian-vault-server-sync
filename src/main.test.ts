@@ -17,6 +17,7 @@ vi.mock("./sync-engine", () => ({
     forceFullSync: vi.fn().mockResolvedValue(undefined),
     resumeFullSync: vi.fn().mockResolvedValue(undefined),
     updateSettings: vi.fn(),
+    register: vi.fn(),
     handleLocalChange: vi.fn(),
     handleLocalDelete: vi.fn(),
     handleLocalRename: vi.fn(),
@@ -432,39 +433,23 @@ describe("vault event handlers", () => {
     vi.useRealTimers();
   });
 
-  it("wraps TFile in VaultEntry(kind:'file') before passing to handleLocalChange on vault modify", async () => {
+  it("delegates vault event registration to strategy.register() (Shape b)", async () => {
     const plugin = makePlugin();
     // vault.getName() is called in onload() to derive the DB name
     (plugin.app.vault as unknown as { getName(): string }).getName = () => "test-vault";
-    // Register a file so vaultAdapter.getEntryByPath can resolve it
-    plugin.app.vault._addFile("test.md", "hello");
 
     // Stub DOM methods that onload() calls (node env has no document)
     (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeEl());
     (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeEl());
-
-    // Capture vault.on callbacks so we can fire them manually
-    const capturedHandlers: Record<string, (...args: unknown[]) => void> = {};
-    plugin.app.vault.on = vi.fn(
-      (event: string, cb: (...args: unknown[]) => void) => {
-        capturedHandlers[event] = cb;
-        return { unload: () => {} };
-      }
-    ) as unknown as typeof plugin.app.vault.on;
 
     await plugin.onload();
 
     // Get the SyncEngine instance created inside onload()
     const syncEngineInstance = vi.mocked(SyncEngine).mock.results.at(-1)!.value;
 
-    // Simulate Obsidian firing the "modify" event with a raw TFile (no `kind` property)
-    const tfile = new TFile("test.md");
-    capturedHandlers["modify"]!(tfile);
-
-    // The handler must have converted the TFile to a proper VaultEntry before delegating
-    expect(syncEngineInstance.handleLocalChange).toHaveBeenCalledWith(
-      expect.objectContaining({ kind: "file", path: "test.md" })
-    );
+    // Shape b: strategy.register(plugin) is called so the strategy owns vault event subscriptions.
+    // main.ts must NOT register vault events directly — that responsibility is in the strategy.
+    expect(syncEngineInstance.register).toHaveBeenCalledWith(plugin);
   });
 });
 

@@ -44,6 +44,8 @@ export default class VaultSyncPlugin extends Plugin {
     this.syncEngine.onCountsChange = (counts) => this.updateCounts(counts);
     this.syncEngine.onError = (msg) => this.handleSyncError(msg);
     this.syncEngine.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    // Shape b: strategy registers its own vault event handlers
+    this.syncEngine.register(this);
 
     // Ribbon icon for sync toggle
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "Vault Sync", () => {
@@ -83,38 +85,6 @@ export default class VaultSyncPlugin extends Plugin {
       name: "Force full sync",
       callback: () => this.forceFullSync(),
     });
-
-    // Register vault events for local change tracking.
-    // Convert raw TAbstractFile → VaultEntry before delegating so syncEngine
-    // receives the `kind` discriminator it requires (bug: raw TAbstractFile has
-    // no `kind`, causing all local-change handlers to silently return).
-    this.registerEvent(
-      this.app.vault.on("modify", (file) => {
-        const entry = vaultAdapter.getEntryByPath(file.path);
-        if (entry) this.syncEngine.handleLocalChange(entry);
-      })
-    );
-
-    this.registerEvent(
-      this.app.vault.on("create", (file) => {
-        const entry = vaultAdapter.getEntryByPath(file.path);
-        if (entry) this.syncEngine.handleLocalChange(entry);
-      })
-    );
-
-    this.registerEvent(
-      this.app.vault.on("delete", (file) => {
-        const entry = vaultAdapter.getEntryByPath(file.path);
-        if (entry) this.syncEngine.handleLocalDelete(entry);
-      })
-    );
-
-    this.registerEvent(
-      this.app.vault.on("rename", (file, oldPath) => {
-        const entry = vaultAdapter.getEntryByPath(file.path);
-        if (entry) this.syncEngine.handleLocalRename(entry, oldPath);
-      })
-    );
 
     // Auto-start if configured
     if (this.settings.couchDbUrl && this.settings.couchDbName) {

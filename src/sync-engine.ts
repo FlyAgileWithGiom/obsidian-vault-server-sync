@@ -57,7 +57,9 @@
  * (Trous A/B/C/D and S14/S15).
  */
 
+import type { Plugin, EventRef } from "obsidian";
 import { CouchClient, CouchError } from "./couch-client";
+import type { SyncStrategy } from "./sync-strategy";
 import type {
   VaultSyncSettings,
   CouchDoc,
@@ -185,7 +187,7 @@ function isRecoverableReadError(e: unknown): { recoverable: boolean; code?: stri
  * - Stores rev map in StateStore to survive plugin reloads without re-fetching
  * - All network calls go through CouchClient (transport-injected, no PouchDB)
  */
-export class CustomFetchSyncStrategy {
+export class CustomFetchSyncStrategy implements SyncStrategy {
   private client: CouchClient;
   private revMap: RevMap = {};
   private lastSeq: string | number = 0;
@@ -205,6 +207,10 @@ export class CustomFetchSyncStrategy {
   private currentState: SyncState = "idle";
   /** Files skipped due to recoverable read errors (EAGAIN, EACCES, EIO, ENOENT). Cleared on successful read. */
   private unsyncableFiles: Map<string, { reason: string; firstSeen: number; retryAfter: number }> = new Map();
+  /** Vault event refs registered via register(); unregistered on stop(). */
+  private eventRefs: EventRef[] = [];
+  /** Plugin ref stored during register() for vault.offref() in stop(). */
+  private plugin: Plugin | null = null;
 
   /** Callback to update UI state */
   onStateChange: (state: SyncState) => void = () => {};
@@ -221,6 +227,54 @@ export class CustomFetchSyncStrategy {
   ) {
     this.client = new CouchClient(settings, transport);
     this.loadPersistedState();
+  }
+
+  /**
+   * Register vault event handlers (Shape b: strategy owns its subscriptions).
+   * Called once by main.ts after construction, before start().
+   * The plugin auto-cleans these on unload; stop() also cleans them manually
+   * so the strategy can be stopped and restarted within the same plugin instance.
+   */
+  register(plugin: Plugin): void {
+    this.plugin = plugin;
+    const vault = plugin.app.vault;
+
+    // vault.on() returns EventRef; plugin.registerEvent() registers it for auto-cleanup on unload.
+    // We also store EventRefs for manual cleanup in stop().
+    const addEvent = (ref: EventRef) => {
+      plugin.registerEvent(ref);
+      this.eventRefs.push(ref);
+    };
+
+    addEvent(
+      vault.on("modify", (file) => {
+        const entry = this.vault.getEntryByPath(file.path);
+        if (entry) this.handleLocalChange(entry);
+      })
+    );
+    addEvent(
+      vault.on("create", (file) => {
+        const entry = this.vault.getEntryByPath(file.path);
+        if (entry) this.handleLocalChange(entry);
+      })
+    );
+    addEvent(
+      vault.on("delete", (file) => {
+        const entry = this.vault.getEntryByPath(file.path);
+        if (entry) this.handleLocalDelete(entry);
+      })
+    );
+    addEvent(
+      vault.on("rename", (file, oldPath) => {
+        const entry = this.vault.getEntryByPath(file.path);
+        if (entry) this.handleLocalRename(entry, oldPath);
+      })
+    );
+  }
+
+  /** Test connectivity to CouchDB. */
+  async testConnection(): Promise<boolean> {
+    return this.client.ping();
   }
 
   private normalizePath(path: string): string {
@@ -362,6 +416,16 @@ export class CustomFetchSyncStrategy {
     }
     this.recentRemoteTimers.clear();
     this.recentRemotePaths.clear();
+    // Unregister vault event handlers registered in register()
+    if (this.plugin && this.eventRefs.length > 0) {
+      const vault = this.plugin.app.vault as typeof this.plugin.app.vault & { offref?: (ref: EventRef) => void };
+      if (vault.offref) {
+        for (const ref of this.eventRefs) {
+          vault.offref(ref);
+        }
+      }
+      this.eventRefs = [];
+    }
     this.setState("idle");
   }
 
