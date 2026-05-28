@@ -12,6 +12,7 @@
     "build:headless": "node -e \"import('./esbuild.config.mjs')\"",
     "test": "vitest run",
     "test:watch": "vitest",
+    "postbuild": "node scripts/postbuild-kickstart.mjs",
     "sync:status": "python3 scripts/sync-status.py"
   },
   "devDependencies": {

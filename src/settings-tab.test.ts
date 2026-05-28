@@ -6,8 +6,9 @@
  *   onDiagnosticsChange event. During an active sync, the engine fires ~20
  *   events per batch (per-doc), causing DOM thrash that freezes the mobile
  *   WebView renderer.
- * - Two fixes: (1) persist the <pre> element across renders, only update
- *   textContent; (2) throttle the subscription handler to ~250 ms.
+ * - Fix: persist the <pre> element across renders, only update textContent.
+ *   Coalescing via rAF was removed in #42 because rAF callbacks don't fire
+ *   during sync on iOS Obsidian either — only synchronous renders work.
  *
  * These tests are written in RED first (TDD), before the implementation.
  */
@@ -133,6 +134,7 @@ function makePluginMock(diagnosticsOverrides: Partial<SyncDiagnostics> = {}): Va
   const listeners = new Set<() => void>();
 
   const plugin = {
+    manifest: { version: "0.0.0-test" },
     settings: {
       couchDbUrl: "https://sync.example.com",
       couchDbName: "vault-test",
@@ -174,33 +176,7 @@ function makeTab(plugin: VaultSyncPlugin): VaultSyncSettingTab {
   (tab as unknown as { diagnosticsPre: null }).diagnosticsPre = null;
   (tab as unknown as { previewEl: null }).previewEl = null;
   (tab as unknown as { unsubDiagnostics: null }).unsubDiagnostics = null;
-  // rAF-based throttle field (replaces setTimeout-based timer)
-  (tab as unknown as { renderRafPending: boolean }).renderRafPending = false;
   return tab;
-}
-
-// ---------------------------------------------------------------------------
-// rAF mock helpers — vitest node env has no requestAnimationFrame
-// ---------------------------------------------------------------------------
-
-let rafCallbacks: Array<() => void> = [];
-
-function installRafMock(): void {
-  rafCallbacks = [];
-  (global as unknown as Record<string, unknown>).requestAnimationFrame = (cb: () => void) => {
-    rafCallbacks.push(cb);
-    return rafCallbacks.length;
-  };
-}
-
-function flushRaf(): void {
-  const cbs = rafCallbacks;
-  rafCallbacks = [];
-  cbs.forEach((c) => c());
-}
-
-function removeRafMock(): void {
-  delete (global as unknown as Record<string, unknown>).requestAnimationFrame;
 }
 
 // ---------------------------------------------------------------------------
@@ -249,60 +225,52 @@ describe("VaultSyncSettingTab — diagnostics no-teardown invariant", () => {
   });
 });
 
-describe("VaultSyncSettingTab — diagnostics throttle (rAF-based)", () => {
+describe("VaultSyncSettingTab — diagnostics live render (sync)", () => {
   let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
   let tab: VaultSyncSettingTab;
 
   beforeEach(() => {
-    // rAF mock replaces the old vi.useFakeTimers() approach now that coalescing
-    // uses requestAnimationFrame instead of setTimeout (iOS WKWebView fix, #39).
-    installRafMock();
     settingConstructorCount = 0;
     plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
     tab = makeTab(plugin);
     tab.display();
+    // Reset counts AFTER display() which builds initial DOM and does initial render
+    settingConstructorCount = 0;
+    (plugin.getDiagnostics as ReturnType<typeof vi.fn>).mockClear();
   });
 
   afterEach(() => {
     tab.hide();
-    removeRafMock();
     vi.clearAllTimers();
   });
 
-  it("10 rapid onDiagnosticsChange events produce fewer than 10 renders before rAF flush", () => {
-    const renderSpy = vi.spyOn(
-      tab as unknown as { renderDiagnostics: () => void },
-      "renderDiagnostics"
-    );
-
-    // Fire 10 events via the subscribed handler
+  it("10 handler calls produce exactly 10 getDiagnostics calls (no coalescing)", () => {
     for (let i = 0; i < 10; i++) {
       (plugin as unknown as { _fireListeners: () => void })._fireListeners();
     }
-
-    // Without flushing rAF, no render has fired yet — rAF coalesces all 10 events.
-    // Events must be coalesced (fewer than 10 renders for 10 rapid events)
-    expect(renderSpy.mock.calls.length).toBeLessThan(10);
+    // Sync render: every handler call immediately triggers a render
+    expect(plugin.getDiagnostics).toHaveBeenCalledTimes(10);
   });
 
-  it("the final diagnostics state IS rendered after the rAF flush", () => {
-    // Update diagnostics to a distinctive value
+  it("pre.textContent reflects latest data immediately after a single handler call (no rAF needed)", () => {
     (plugin as unknown as { _setDiagnostics: (d: Partial<SyncDiagnostics>) => void })
       ._setDiagnostics({ state: "syncing", revMapSize: 12345 });
 
-    // Fire 10 rapid events
-    for (let i = 0; i < 10; i++) {
-      (plugin as unknown as { _fireListeners: () => void })._fireListeners();
-    }
+    // A single handler fire should synchronously update the pre
+    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
 
-    // Flush the rAF — the single queued render must reflect latest state
-    flushRaf();
-
-    // The pre element's textContent must reflect the latest data
     const pre = (tab as unknown as { diagnosticsPre: MockHTMLElement }).diagnosticsPre;
     expect(pre).not.toBeNull();
     expect(pre!.textContent).toContain("syncing");
     expect(pre!.textContent).toContain("12345");
+  });
+
+  it("50 handler calls → Setting constructor count is still 0 (pre reused, no DOM rebuild)", () => {
+    for (let i = 0; i < 50; i++) {
+      (plugin as unknown as { _fireListeners: () => void })._fireListeners();
+    }
+    // settingConstructorCount was reset after display() — should remain 0
+    expect(settingConstructorCount).toBe(0);
   });
 });
 
@@ -336,102 +304,12 @@ describe("VaultSyncSettingTab — diagnostics text updates correctly", () => {
   });
 });
 
-// ---------------------------------------------------------------------------
-// RED tests — rAF-based diagnostics updates (#39)
-// These tests FAIL with the current setTimeout-based implementation.
-// ---------------------------------------------------------------------------
-
-describe("VaultSyncSettingTab — rAF coalescing (#39)", () => {
-  let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
-  let tab: VaultSyncSettingTab;
-
-  beforeEach(() => {
-    installRafMock();
-    settingConstructorCount = 0;
-    plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
-    tab = makeTab(plugin);
-    tab.display();
-    // Reset spy count AFTER display() which does the initial render
-    (plugin.getDiagnostics as ReturnType<typeof vi.fn>).mockClear();
-  });
-
-  afterEach(() => {
-    tab.hide();
-    removeRafMock();
-    vi.clearAllTimers();
-  });
-
-  it("50 rapid handler invocations produce exactly one getDiagnostics call after flushRaf", () => {
-    // Fire handler 50 times without flushing rAF
-    for (let i = 0; i < 50; i++) {
-      (plugin as unknown as { _fireListeners: () => void })._fireListeners();
-    }
-    // No render should have happened yet — rAF callback not executed
-    expect(plugin.getDiagnostics).toHaveBeenCalledTimes(0);
-
-    // Flush the rAF — exactly one render expected
-    flushRaf();
-    expect(plugin.getDiagnostics).toHaveBeenCalledTimes(1);
-  });
-
-  it("renderRafPending is false after rAF flush (allows next event to schedule)", () => {
-    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
-    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(true);
-
-    flushRaf();
-    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(false);
-
-    // Triggering another event should schedule a new rAF
-    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
-    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(true);
-  });
-});
-
-describe("VaultSyncSettingTab — state reset on duplicate display() (#39)", () => {
-  let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
-  let tab: VaultSyncSettingTab;
-
-  beforeEach(() => {
-    installRafMock();
-    settingConstructorCount = 0;
-    plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
-    tab = makeTab(plugin);
-  });
-
-  afterEach(() => {
-    tab.hide();
-    removeRafMock();
-    vi.clearAllTimers();
-  });
-
-  it("second display() resets renderRafPending so next handler can schedule a render", () => {
-    tab.display();
-
-    // Fire handler but do NOT flush — rAF is pending
-    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
-    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(true);
-
-    // iOS resume-from-background: display() called again without hide()
-    // Must reset renderRafPending so the next handler invocation isn't permanently gated
-    tab.display();
-    expect((tab as unknown as { renderRafPending: boolean }).renderRafPending).toBe(false);
-
-    // A new handler invocation after second display() must be able to schedule a render
-    (plugin as unknown as { _fireListeners: () => void })._fireListeners();
-    flushRaf();
-
-    const pre = (tab as unknown as { diagnosticsPre: MockHTMLElement }).diagnosticsPre;
-    expect(pre).not.toBeNull();
-    expect(pre!.textContent).toBeTruthy();
-  });
-});
 
 describe("VaultSyncSettingTab — detached-pre fallback (#39)", () => {
   let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
   let tab: VaultSyncSettingTab;
 
   beforeEach(() => {
-    installRafMock();
     settingConstructorCount = 0;
     plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
     tab = makeTab(plugin);
@@ -440,7 +318,6 @@ describe("VaultSyncSettingTab — detached-pre fallback (#39)", () => {
 
   afterEach(() => {
     tab.hide();
-    removeRafMock();
     vi.clearAllTimers();
   });
 
@@ -454,9 +331,8 @@ describe("VaultSyncSettingTab — detached-pre fallback (#39)", () => {
     preBefore.parentElement = null;
     expect(diagnosticsEl.children).not.toContain(preBefore);
 
-    // Trigger a render via handler + rAF flush
+    // Trigger a render via handler — sync, no rAF needed
     (plugin as unknown as { _fireListeners: () => void })._fireListeners();
-    flushRaf();
 
     const preAfter = (tab as unknown as { diagnosticsPre: MockHTMLElement }).diagnosticsPre!;
     // The pre must be a NEW element (old one was detached)
@@ -510,5 +386,134 @@ describe("VaultSyncSettingTab — Last render timestamp in formatDiagnostics (#3
     expect(match1).not.toBeNull();
     expect(match2).not.toBeNull();
     expect(match1![1]).not.toBe(match2![1]);
+  });
+});
+
+describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visible (#52)", () => {
+  // Eliminated hypotheses:
+  //   H2 (getDiagnostics omits fields): sync-engine.ts:263-266 explicitly returns all four fields.
+  //   H6 (stale build): grep -c "avgFetchMs" main.js returns 2 — code is shipped.
+  // Culprit: the `if (d.avgFetchMs !== null)` conditional in formatDiagnostics hides the
+  // instrumentation lines whenever no text-pull batches have completed (pullTextDocs ran
+  // with an empty list, e.g. during the binary-only phase, or allDocsByKeys threw every time).
+  // prod getDiagnostics() always returns avgFetchMs: null (never undefined), so the condition
+  // is always false until the first successful batch — making the lines invisible precisely
+  // when they would be most informative. The existing 1.13.4 test used undefined (not null)
+  // via makeDiagnosticsSnapshot omission, so it never exercised the null path.
+
+  it("Avg fetch line is present even when avgFetchMs is null (0 samples)", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d: SyncDiagnostics = {
+      running: true,
+      state: "syncing",
+      revMapSize: 8072,
+      knownRevMapSize: 8072,
+      lastSeq: "72347-abc",
+      pullProgress: null,
+      pullSkipped: 0,
+      pullApplied: 0,
+      pendingPushCount: 0,
+      lastError: null,
+      unsyncableCount: 0,
+      unsyncableSample: [],
+      avgFetchMs: null,
+      fetchSampleCount: 0,
+      avgApplyMs: null,
+      applySampleCount: 0,
+    };
+
+    const output = formatDiagnostics(d);
+    expect(output).toMatch(/Avg fetch \(text pull\)/);
+    expect(output).toContain("0 samples");
+  });
+
+  it("Avg apply line is present even when avgApplyMs is null (0 samples)", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d: SyncDiagnostics = {
+      running: true,
+      state: "syncing",
+      revMapSize: 8072,
+      knownRevMapSize: 8072,
+      lastSeq: "72347-abc",
+      pullProgress: null,
+      pullSkipped: 0,
+      pullApplied: 0,
+      pendingPushCount: 0,
+      lastError: null,
+      unsyncableCount: 0,
+      unsyncableSample: [],
+      avgFetchMs: null,
+      fetchSampleCount: 0,
+      avgApplyMs: null,
+      applySampleCount: 0,
+    };
+
+    const output = formatDiagnostics(d);
+    expect(output).toMatch(/Avg apply:/);
+    expect(output).toContain("0 samples");
+  });
+});
+
+describe("VaultSyncSettingTab — unsyncable visibility (#P3)", () => {
+  it("formatDiagnostics contains 'Unsyncable:' when unsyncableCount > 0", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d = makeDiagnosticsSnapshot({
+      unsyncableCount: 2,
+      unsyncableSample: ["path/to/file.jpeg", "other/image.png"],
+    });
+
+    const output = formatDiagnostics(d);
+    expect(output).toContain("Unsyncable:");
+    expect(output).toContain("2");
+    expect(output).toContain("path/to/file.jpeg");
+    expect(output).toContain("other/image.png");
+  });
+
+  it("formatDiagnostics contains 'Unsyncable: 0' and no sample line when unsyncableCount is 0", () => {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const d = makeDiagnosticsSnapshot({ unsyncableCount: 0, unsyncableSample: [] });
+
+    const output = formatDiagnostics(d);
+    expect(output).toContain("Unsyncable: 0");
+    expect(output).not.toContain("Unsyncable sample:");
+  });
+});
+
+describe("VaultSyncSettingTab — manifest version in Diagnostics panel", () => {
+  it("formatDiagnostics output contains 'Version: ' as the first line", () => {
+    const plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+    // Provide a manifest version on the plugin mock
+    (plugin as unknown as { manifest: { version: string } }).manifest = { version: "1.13.8" };
+
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: VaultSyncPlugin }).plugin = plugin;
+
+    const formatDiagnostics = (
+      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
+    ).formatDiagnostics.bind(tab);
+
+    const output = formatDiagnostics(makeDiagnosticsSnapshot());
+    expect(output).toContain("Version: ");
+    expect(output.split("\n")[0]).toMatch(/^Version: /);
   });
 });

@@ -5,7 +5,11 @@ export default defineConfig({
   test: {
     globals: true,
     environment: "node",
-    include: ["src/**/*.test.ts", "headless/**/*.test.ts"],
+    include: [
+      "src/**/*.test.ts",
+      "headless/**/*.test.ts",
+      "scripts/**/*.test.mjs",
+    ],
     environmentMatchGlobs: [
       // Bridge and strategy tests need browser globals (localStorage, document, indexedDB)
       ["src/PouchDb*.test.ts", "jsdom"],

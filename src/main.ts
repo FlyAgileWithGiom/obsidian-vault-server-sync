@@ -26,6 +26,13 @@ export default class VaultSyncPlugin extends Plugin {
   private syncCounts: SyncCounts = { pendingPush: 0, pendingPull: 0 };
   private diagnosticsListeners: Set<() => void> = new Set();
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
+  /**
+   * Vault name the engine was last initialised for. On iOS Obsidian, switching
+   * vault does NOT trigger onunload/onload, so the captured adapter + state keep
+   * pointing at the old vault. refreshIfVaultChanged() compares this snapshot
+   * to the live vault name and rebuilds the engine when they diverge (issue #56).
+   */
+  private engineVaultName: string = "";
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -44,6 +51,7 @@ export default class VaultSyncPlugin extends Plugin {
     this.strategy.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
     // Shape b: strategy registers its own vault event handlers
     this.strategy.register(this);
+    this.engineVaultName = this.app.vault.getName();
 
     // Ribbon icon for sync toggle
     this.ribbonEl = this.addRibbonIcon("refresh-cw", "Vault Sync", () => {
@@ -84,6 +92,20 @@ export default class VaultSyncPlugin extends Plugin {
       callback: () => this.forceFullSync(),
     });
 
+    // "merge-with-server" is the preferred name for force-full-sync (semantically accurate).
+    // The old "force-full-sync" id is kept so existing keybindings survive a rename.
+    this.addCommand({
+      id: "merge-with-server",
+      name: "Merge with server",
+      callback: () => this.forceFullSync(),
+    });
+
+    this.addCommand({
+      id: "replace-local-from-server",
+      name: "Replace local from server (destructive)",
+      callback: () => this.replaceLocalFromServer(),
+    });
+
     // Auto-start if configured
     if (this.settings.couchDbUrl && this.settings.couchDbName) {
       // Delay start slightly to let Obsidian finish loading on mobile
@@ -93,6 +115,44 @@ export default class VaultSyncPlugin extends Plugin {
         this.startSync();
       }, STARTUP_DELAY_MS);
     }
+  }
+
+  /**
+   * Rebuild the strategy if the active vault has changed since onload.
+   *
+   * Obsidian iOS keeps the plugin instance alive across vault switches —
+   * onunload/onload are not called. Without this check, the captured
+   * strategy keeps pointing at the old vault. refreshIfVaultChanged() compares
+   * this snapshot to the live vault name and rebuilds the strategy when they diverge.
+   * See issue #56.
+   *
+   * Returns true when a rebuild happened, false otherwise.
+   */
+  async refreshIfVaultChanged(): Promise<boolean> {
+    const current = this.app.vault.getName();
+    if (current === this.engineVaultName) return false;
+
+    this.strategy?.stop();
+    await this.loadSettings();
+    // Re-derive DB name for the new vault if user hasn't set one explicitly.
+    if (!this.settings.couchDbName) {
+      this.settings.couchDbName = `vault-${slugify(current)}`;
+      await this.saveSettings();
+    }
+    this.strategy = await this.createStrategy();
+    this.strategy.onStateChange = (state) => this.updateState(state);
+    this.strategy.onCountsChange = (counts) => this.updateCounts(counts);
+    this.strategy.onError = (msg) => this.handleSyncError(msg);
+    this.strategy.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    this.strategy.register(this);
+    this.engineVaultName = current;
+    this.notifyDiagnosticsListeners();
+
+    // Auto-restart sync for the new vault if it's configured.
+    if (this.settings.couchDbUrl && this.settings.couchDbName) {
+      this.startSync().catch((e) => this.handleSyncError((e as Error).message));
+    }
+    return true;
   }
 
   onunload(): void {
@@ -224,6 +284,15 @@ export default class VaultSyncPlugin extends Plugin {
     // fullSync({bypassOrphanGuard:true})/poll lifecycle. Routing through a
     // plain start() here drops the bypass flag and leaves revMap empty.
     await this.strategy.forceFullSync();
+  }
+
+  /**
+   * Public: DESTRUCTIVE — deletes all locally-tracked files then re-downloads from
+   * the server. Use when local has artifacts that must not be pushed.
+   * Called from the settings tab and from the replace-local-from-server command.
+   */
+  async replaceLocalFromServer(): Promise<void> {
+    await (this.strategy as CustomFetchSyncStrategy).replaceLocalFromServer();
   }
 
   /**

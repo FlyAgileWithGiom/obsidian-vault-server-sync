@@ -84,15 +84,36 @@ const REVMAP_KEY = "vault-sync-revmap";
 const SEQ_KEY = "vault-sync-last-seq";
 // DOC_PREFIX, pathToDocId, docIdToPath imported from ./doc-id (re-exported for allDocs range queries)
 // ATTACHMENT_NAME, contentTypeForPath, isBinaryPath imported from ./binary-ext
+/**
+ * Path prefixes that are NEVER synced, regardless of user configuration.
+ * Critical for protecting the vault from re-importing sync internals — including
+ * Dropbox/iCloud "conflicted copy" variants like
+ * ".vault-sync-state (Guillaume's conflicted copy 2026-05-23).json".
+ * See issue #55: prefix-match (not exact) catches every variant.
+ */
+const ALWAYS_EXCLUDED_PREFIXES: readonly string[] = [
+  ".vault-sync-state",
+];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB - skip larger files for now (TODO: chunked upload)
 const PULL_BATCH_SIZE = 20; // Smaller batches to avoid timeout on mobile with large docs
 const PARALLEL_BINARY_PULLS = 5;
+// Mirrors PARALLEL_BINARY_PULLS for text apply. Sequential apply within a batch
+// serializes the whole pull on pathological cases (cloud-sync interception, huge
+// content); chunked Promise.allSettled keeps throughput resilient. See issue #57.
+const PARALLEL_TEXT_APPLY = 5;
 const BINARY_PULL_RETRIES = 3;
 const BINARY_PULL_TIMEOUT_MS = 120_000;
+const BINARY_PUSH_TIMEOUT_MS = 120_000;
+// Lower than PARALLEL_BINARY_PULLS because mobile upload bandwidth is typically more constrained.
+const PARALLEL_BINARY_PUSH = 3;
 // Chunk size for binary metadata pre-fetch (POST _all_docs). A single POST with
 // 7000+ keys timed out (30s default) on slow CouchDB connections — see GitHub #15.
 const META_BATCH_SIZE = 500;
 const META_TIMEOUT_MS = 60_000;
+// Page size for the initial remote-index scan in fullSync. A single unbounded
+// allDocs over 7000+ ids stayed silent for 30-60s on iOS while building the
+// remote rev index; pagination lets emitCounts tick between pages.
+const FULLSYNC_SCAN_PAGE_SIZE = 2000;
 
 /**
  * Last-write-wins decision by mtime. Returns "local" or "remote" indicating
@@ -179,6 +200,13 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
   private eventRefs: EventRef[] = [];
   /** Plugin ref stored during register() for vault.offref() in stop(). */
   private plugin: Plugin | null = null;
+  /** Consecutive network-failure count per binary file path. Cleared on success or forceFullSync. */
+  private binaryPushFailureCounts = new Map<string, number>();
+  /** After this many consecutive network (non-409, non-tombstone) failures, skip until forceFullSync. */
+  private static readonly BINARY_PUSH_MAX_FAILURES = 3;
+  /** Ring buffers for pull throughput instrumentation (max 50 samples each) */
+  private fetchMsSamples: number[] = [];
+  private applyMsSamples: number[] = [];
 
   /** Callback to update UI state */
   onStateChange: (state: SyncState) => void = () => {};
@@ -275,7 +303,26 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
       lastError: this.lastError,
       unsyncableCount: this.unsyncableFiles.size,
       unsyncableSample: [...this.unsyncableFiles.keys()].slice(0, 5),
+      avgFetchMs: this.avgOf(this.fetchMsSamples),
+      fetchSampleCount: this.fetchMsSamples.length,
+      avgApplyMs: this.avgOf(this.applyMsSamples),
+      applySampleCount: this.applyMsSamples.length,
     };
+  }
+
+  private avgOf(samples: number[]): number | null {
+    if (samples.length === 0) return null;
+    return samples.reduce((s, v) => s + v, 0) / samples.length;
+  }
+
+  private recordFetch(ms: number): void {
+    this.fetchMsSamples.push(ms);
+    if (this.fetchMsSamples.length > 50) this.fetchMsSamples.shift();
+  }
+
+  private recordApply(ms: number): void {
+    this.applyMsSamples.push(ms);
+    if (this.applyMsSamples.length > 50) this.applyMsSamples.shift();
   }
 
   private setState(state: SyncState): void {
@@ -403,6 +450,8 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
     console.log("[vault-sync] Clearing revMap and lastSeq");
     this.revMap = {};
     this.lastSeq = 0;
+    this.binaryPushFailureCounts.clear();
+    this.unsyncableFiles.clear();
     this.persistState();
   }
 
@@ -453,6 +502,59 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
       this.running = false;
       this.setState("error");
       this.setError(`Resume sync failed: ${(e as Error).message}`);
+    }
+  }
+
+  /**
+   * DESTRUCTIVE: deletes every FS file currently tracked by revMap, then re-pulls
+   * everything from the server. The server is the source of truth.
+   *
+   * Use when local has artifacts (orphan files from past failed syncs) that must
+   * NOT be propagated to the server — Force full sync would push them.
+   *
+   * Untracked files (not in revMap) are PRESERVED — they're the user's own work
+   * that sync never touched.
+   */
+  async replaceLocalFromServer(): Promise<void> {
+    this.stop();
+
+    if (!this.client.isConfigured()) { this.setState("not-configured"); return; }
+    this.running = true;
+    this.setState("syncing");
+
+    // Phase 1: delete every tracked file from FS.
+    // Iterate a snapshot of the revMap keys so the loop is not affected by
+    // clearState() which we call right after.
+    // Emit progress every 10 files so the UI clock keeps ticking during large vaults.
+    const trackedDocIds = Object.keys(this.revMap);
+    let deleteCount = 0;
+    for (const docId of trackedDocIds) {
+      const path = docIdToPath(docId);
+      if (this.isExcluded(path)) continue;
+      const normalized = this.normalizePath(path);
+      const file = this.vault.getEntryByPath(normalized);
+      if (file && file.kind === "file") {
+        try { await this.vault.deleteFile(file); } catch { /* best effort, continue */ }
+        await this.cleanupEmptyParents(normalized);
+      }
+      deleteCount++;
+      if (deleteCount % 10 === 0) {
+        this.emitCounts();
+        await this.yield();
+      }
+    }
+
+    // Phase 2: clear sync state and run a full server-first pull (bypassOrphanGuard=true).
+    this.clearState();
+    try {
+      await this.client.ensureDb();
+      await this.fullSync({ bypassOrphanGuard: true });
+      this.setState("ok");
+      this.startPolling();
+    } catch (e) {
+      this.running = false;
+      this.setState("error");
+      this.setError(`Replace local from server failed: ${(e as Error).message}`);
     }
   }
 
@@ -627,14 +729,31 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
   async fullSync(opts: { bypassOrphanGuard?: boolean } = {}): Promise<void> {
     this.setState("syncing");
     try {
-      // Fetch remote rev index (no content) -- lightweight, ~15K rows with just id+rev
-      const remoteIndex = await this.client.allDocs({
-        startkey: DOC_PREFIX,
-        endkey: `${DOC_PREFIX}￿`,
-      });
+      // Fetch remote rev index (no content) -- lightweight metadata only.
+      // Paginated so the diagnostics clock ticks across the scan: a single
+      // unbounded allDocs over 7000+ ids took 30-60s of complete UI silence
+      // on iOS. We use limit = PAGE_SIZE + 1 as a lookahead: when the last
+      // call returns fewer than that, we've hit the end. The lookahead row
+      // becomes the next startkey (inclusive), so no row is dropped.
       const remoteRevs = new Map<string, string>();
-      for (const row of remoteIndex.rows) {
-        remoteRevs.set(row.id, row.value.rev);
+      const endkey = `${DOC_PREFIX}￿`;
+      let startkey: string = DOC_PREFIX;
+      while (true) {
+        const page = await this.client.allDocs({
+          startkey,
+          endkey,
+          limit: FULLSYNC_SCAN_PAGE_SIZE + 1,
+        });
+        const rows = page.rows;
+        const lookaheadHit = rows.length > FULLSYNC_SCAN_PAGE_SIZE;
+        const consumed = lookaheadHit ? rows.slice(0, FULLSYNC_SCAN_PAGE_SIZE) : rows;
+        for (const row of consumed) {
+          remoteRevs.set(row.id, row.value.rev);
+        }
+        this.emitCounts();
+        if (!lookaheadHit) break;
+        await this.yield();
+        startkey = rows[FULLSYNC_SCAN_PAGE_SIZE].id;
       }
 
       await this.reconcileLocalDeletes(remoteRevs);
@@ -772,8 +891,28 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
       }
     }
 
-    // Phase 3: push genuinely new files, delete locally any tombstoned ones
+    // Phase 2.5: bulk content-compare for files that are on remote but not in revMap.
+    // This is the hot path after clearState() (e.g. forceFullSync): all files are in
+    // remoteRevs but revMap is empty, so the steady-state mtime-skip can't fire.
+    // Without this phase every file would go through pushTextFile (N individual GETs),
+    // even if local content is identical to remote. Bulk fetch + string compare avoids
+    // re-pushing unchanged content.
+    //
+    // Steady-state push (revMap populated): fast path via mtime skip (line below).
+    // Post-clearState push (revMap empty): this bulk compare avoids re-pushing identical
+    // content — only files with local changes go through the bulkDocs push path.
+    const handledByBulkCompare = await this.bulkPushExistingRemoteDocs(
+      files.filter((f) => {
+        const docId = pathToDocId(f.path);
+        return remoteRevs.has(docId) && !this.revMap[docId] && !this.isBinaryDoc(docId);
+      }),
+      remoteRevs,
+    );
+
+    // Phase 3: push genuinely new files, delete locally any tombstoned ones.
+    // Binary files are collected separately and pushed in parallel batches of PARALLEL_BINARY_PUSH.
     const batch: CouchDoc[] = [];
+    const binaryToPush: VaultFile[] = [];
 
     for (let fi = 0; fi < files.length; fi++) {
       const file = files[fi];
@@ -782,12 +921,16 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
       if (fi % 100 === 99) await this.yield();
 
       if (remoteRevs.has(docId)) {
+        // Skip files already resolved by bulk content-compare (Phase 2.5)
+        if (handledByBulkCompare.has(docId)) continue;
+
         // Trou A fix: skip push only when file has not changed since last sync.
         // mtime:0 means migration default (unknown mtime) — treat as changed → push.
         const entry = this.revMap[docId];
         // Tombstoned entries: the file was deleted locally; delete remotely instead of pushing
         if (entry?.state === "tombstoned") {
           await this.handleRemoteDelete(docId);
+          this.emitCounts();
           continue;
         }
         // Orphan entries: skip push (no FS file to push from)
@@ -801,10 +944,11 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
         // For changed files, delegate to pushTextFile/pushBinaryFile which handle rev correctly.
         if (this.isBinaryDoc(docId)) {
           if (this.settings.disableBinaryPush) { await this.yield(); continue; }
-          await this.pushBinaryFile(file);
-          await this.yield();
+          if (this.unsyncableFiles.has(file.path)) { await this.yield(); continue; }
+          binaryToPush.push(file);
         } else {
           await this.pushTextFile(file);
+          this.emitCounts();
           await this.yield();
         }
         continue;
@@ -813,6 +957,7 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
       if (tombstoneIds.has(docId)) {
         // Server has a tombstone — do not resurrect; delete locally
         await this.handleRemoteDelete(docId);
+        this.emitCounts();
         continue;
       }
 
@@ -824,9 +969,8 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
       // Genuinely new file, not on remote
       if (this.isBinaryDoc(docId)) {
         if (this.settings.disableBinaryPush) { await this.yield(); continue; }
-        // Binary files need attachment PUT, not bulk_docs
-        await this.pushBinaryFile(file);
-        await this.yield();
+        if (this.unsyncableFiles.has(file.path)) { await this.yield(); continue; }
+        binaryToPush.push(file);
       } else {
         let content: string;
         try {
@@ -852,6 +996,7 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
         // Flush in small chunks to avoid nginx 413
         if (batch.length >= 10) {
           await this.pushBatch(batch.splice(0));
+          this.emitCounts();
           await this.yield();
         }
       }
@@ -859,7 +1004,118 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
 
     if (batch.length > 0) {
       await this.pushBatch(batch);
+      this.emitCounts();
     }
+
+    // Phase 4: push binary files in parallel chunks of PARALLEL_BINARY_PUSH.
+    // Uses pushBinaryWithLock to serialize against concurrent handleLocalChange PUTs for the
+    // same file — prevents the pushAllLocal/event-handler race that causes 409 conflicts.
+    // Promise.allSettled ensures one failure doesn't abort the remaining chunk.
+    for (let batchStart = 0; batchStart < binaryToPush.length; batchStart += PARALLEL_BINARY_PUSH) {
+      const chunk = binaryToPush.slice(batchStart, batchStart + PARALLEL_BINARY_PUSH);
+      await Promise.allSettled(chunk.map((f) => this.pushBinaryWithLock(f)));
+      this.emitCounts();
+      await this.yield();
+    }
+  }
+
+  /**
+   * Phase 2.5 helper: bulk fetch remote content for text files that are in remoteRevs
+   * but have no revMap entry (typical after clearState). Compare local vs remote content:
+   * - If equal: populate revMap as "known" (skip push entirely).
+   * - If different: queue for bulkDocs push with the remote _rev to avoid 409 conflicts.
+   * - If chunk fetch fails: log warning, return empty set so main loop handles as fallback.
+   *
+   * Binary files are excluded — they have attachments, not inline content.
+   *
+   * Returns a Set of docIds that were fully handled (either matched or pushed via bulkDocs).
+   * The main loop checks this set and skips those docIds to avoid double-push.
+   */
+  private async bulkPushExistingRemoteDocs(
+    needCompareFiles: VaultFile[],
+    remoteRevs: Map<string, string>,
+  ): Promise<Set<string>> {
+    const handled = new Set<string>();
+    if (needCompareFiles.length === 0) return handled;
+
+    // Process in META_BATCH_SIZE chunks to stay within CouchDB request limits.
+    for (let i = 0; i < needCompareFiles.length; i += META_BATCH_SIZE) {
+      const chunk = needCompareFiles.slice(i, i + META_BATCH_SIZE);
+      const chunkIds = chunk.map((f) => pathToDocId(f.path));
+
+      let batchResult;
+      try {
+        batchResult = await this.client.allDocsByKeys(chunkIds, META_TIMEOUT_MS);
+      } catch (e) {
+        // Network blip or server error: skip this chunk, let per-file path handle it.
+        console.warn(`[vault-sync] Bulk content-compare chunk failed (${(e as Error).message}); falling back to per-file path for ${chunk.length} files`);
+        continue;
+      }
+
+      // Build a lookup from the batch result for O(1) access per file.
+      const remoteByDocId = new Map<string, { rev: string; content: string | null | undefined }>();
+      for (const row of batchResult.rows) {
+        if (!row.error && row.doc && !row.doc.deleted) {
+          remoteByDocId.set(row.id, { rev: row.doc._rev!, content: row.doc.content });
+        }
+      }
+
+      const diffBatch: CouchDoc[] = [];
+
+      for (const file of chunk) {
+        const docId = pathToDocId(file.path);
+        const remote = remoteByDocId.get(docId);
+
+        if (!remote) {
+          // Error or missing doc: safety net — let per-file path handle it.
+          continue;
+        }
+
+        if (remote.content === undefined || remote.content === null) {
+          // Binary doc stored without inline content (attachment-only): skip.
+          // The per-file pushBinaryFile path handles these correctly.
+          continue;
+        }
+
+        // Read local content.
+        let localContent: string;
+        try {
+          localContent = await this.vault.readText(file);
+          this.unsyncableFiles.delete(file.path);
+        } catch (e) {
+          const check = isRecoverableReadError(e);
+          if (check.recoverable) {
+            this.unsyncableFiles.set(file.path, {
+              reason: check.code ?? "unknown",
+              firstSeen: this.unsyncableFiles.get(file.path)?.firstSeen ?? Date.now(),
+              retryAfter: Date.now() + 60_000,
+            });
+            // Don't mark as handled — per-file path will retry next sync.
+            continue;
+          }
+          throw e; // Non-recoverable: propagate
+        }
+
+        if (localContent === remote.content) {
+          // Content matches: no push needed. Populate revMap so mtime-skip fires next sync.
+          this.revMap[docId] = { state: "known", rev: remote.rev, mtime: file.mtime };
+          handled.add(docId);
+        } else {
+          // Content differs: queue for bulkDocs with _rev to avoid 409 conflicts.
+          diffBatch.push({ _id: docId, _rev: remote.rev, content: localContent, mtime: file.mtime });
+          handled.add(docId);
+        }
+      }
+
+      // Flush diff batch in chunks of 10 (same limit as Phase 3 new-file pushes).
+      for (let j = 0; j < diffBatch.length; j += 10) {
+        await this.pushBatch(diffBatch.slice(j, j + 10));
+        this.emitCounts();
+        await this.yield();
+      }
+    }
+
+    return handled;
   }
 
   private async pushBatch(batch: CouchDoc[]): Promise<void> {
@@ -983,7 +1239,9 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
       let docs: (CouchDoc | null)[];
 
       try {
+        const fetchStart = performance.now();
         const result = await this.client.allDocsByKeys(batchKeys);
+        this.recordFetch(performance.now() - fetchStart);
         docs = result.rows.map((row) => (row.error || !row.doc) ? null : row.doc);
       } catch {
         // Batch failed -- fall back to individual GETs
@@ -997,27 +1255,44 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
         }
       }
 
-      for (const doc of docs) {
-        if (doc) {
-          try {
+      // Apply docs in parallel chunks of PARALLEL_TEXT_APPLY. Mirrors the binary
+      // pull path. Errors are isolated per-doc via Promise.allSettled so one slow
+      // or failing doc does not block siblings in the chunk.
+      for (let chunkStart = 0; chunkStart < docs.length; chunkStart += PARALLEL_TEXT_APPLY) {
+        const chunk = docs.slice(chunkStart, chunkStart + PARALLEL_TEXT_APPLY);
+        const results = await Promise.allSettled(
+          chunk.map(async (doc) => {
+            if (!doc) return null;
+            const applyStart = performance.now();
             await this.applyRemoteDoc(doc);
-            if (doc._rev) {
-              this.revMap[doc._id] = { state: "known", rev: doc._rev, mtime: doc.mtime ?? 0 };
+            this.recordApply(performance.now() - applyStart);
+            return doc;
+          })
+        );
+
+        for (let j = 0; j < results.length; j++) {
+          const result = results[j];
+          const doc = chunk[j];
+          if (result.status === "fulfilled") {
+            const appliedDoc = result.value;
+            if (appliedDoc && appliedDoc._rev) {
+              this.revMap[appliedDoc._id] = { state: "known", rev: appliedDoc._rev, mtime: appliedDoc.mtime ?? 0 };
               this.pullApplied++;
+            } else if (!appliedDoc) {
+              // doc was null (allDocsByKeys row had error or missing doc)
+              this.pullSkipped++;
             }
-          } catch (e) {
+          } else {
             failCount++;
             this.pullSkipped++;
-            if (failCount <= 3) {
-              this.setError(`Pull ${doc._id.slice(0, 40)}: ${(e as Error).message?.slice(0, 80)}`);
+            if (failCount <= 3 && doc) {
+              this.setError(`Pull ${doc._id.slice(0, 40)}: ${(result.reason as Error).message?.slice(0, 80)}`);
             }
           }
-        } else {
-          this.pullSkipped++;
+          this.pullFetched++;
+          this.pullCount--;
+          this.emitCounts();
         }
-        this.pullFetched++;
-        this.pullCount--;
-        this.emitCounts();
       }
       await this.yield();
       this.persistState();
@@ -1045,6 +1320,15 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
         // Metadata chunk failed (e.g. timeout) — track affected docs, don't abort full pull.
         console.warn(`[vault-sync] Binary metadata chunk [${offset}..${offset + chunk.length - 1}] failed: ${(e as Error).message}`);
         for (const id of chunk) metaFailedDocIds.add(id);
+      }
+      // Surface progress so the diagnostics clock keeps ticking across chunk
+      // boundaries — on iOS with thousands of binary docs each chunk can take
+      // many seconds, and without this the UI looks frozen even though work
+      // is in flight. yield() is gated on "more chunks to come" so it never
+      // dangles past the final iteration (matters under vi.useFakeTimers).
+      this.emitCounts();
+      if (offset + META_BATCH_SIZE < docIds.length) {
+        await this.yield();
       }
     }
 
@@ -1541,6 +1825,20 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
     }
   }
 
+  /**
+   * Acquire pushLocks[file.path] then call pushBinaryFile, mirroring pushFile's lock pattern.
+   * Prevents a concurrent handleLocalChange PUT from racing with pushAllLocal's batch PUT.
+   */
+  private async pushBinaryWithLock(file: VaultFile): Promise<void> {
+    const key = file.path;
+    const prev = this.pushLocks.get(key) ?? Promise.resolve();
+    const settled = prev.catch(() => {});
+    const next = settled.then(() => this.pushBinaryFile(file));
+    const swallowed = next.catch(() => {});
+    this.pushLocks.set(key, swallowed);
+    await next;
+  }
+
   private async pushBinaryFile(file: VaultFile): Promise<void> {
     try {
       const docId = pathToDocId(file.path);
@@ -1591,15 +1889,19 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
         }
       }
 
-      const MAX_RETRIES = 3;
+      // Higher cap than the old 3 to absorb brief write storms under slow connections.
+      const MAX_RETRIES = 5;
       let attachmentRev = rev;
       for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
         try {
-          const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, attachmentRev, data, contentType);
+          const result = await this.client.putAttachment(docId, ATTACHMENT_NAME, attachmentRev, data, contentType, BINARY_PUSH_TIMEOUT_MS);
           if (result.ok && result.rev) {
             this.revMap[docId] = { state: "known", rev: result.rev, mtime: file.mtime };
             this.persistState();
           }
+          // Successful push: clear network-failure tracking for this file
+          this.binaryPushFailureCounts.delete(file.path);
+          this.unsyncableFiles.delete(file.path);
           break;
         } catch (e) {
           if (isTombstone404(e)) {
@@ -1607,7 +1909,9 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
             await this.handleRemoteDelete(docId);
             return;
           } else if (e instanceof CouchError && e.status === 409 && attempt < MAX_RETRIES - 1) {
-            // Rev became stale between stub PUT and attachment PUT — refetch and retry
+            // Rev became stale between stub PUT and attachment PUT — refetch and retry.
+            // Backoff: min(2^attempt * 100ms, 2000ms) — exponential ramp caps congestion storms.
+            await new Promise((r) => setTimeout(r, Math.min(2 ** attempt * 100, 2000)));
             const fresh = await this.client.get(docId);
             attachmentRev = fresh._rev ?? "";
             const curEntry: RevMapEntry | undefined = this.revMap[docId];
@@ -1623,6 +1927,22 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
       }
     } catch (e) {
       this.setError(`Binary push failed for ${file.path}: ${(e as Error).message}`);
+      // Track consecutive network failures (exclude 409 conflicts — those are expected transients).
+      // After BINARY_PUSH_MAX_FAILURES, mark unsyncable so pushAllLocal skips the file until
+      // a forceFullSync clears the counter (see clearState()).
+      const is409 = e instanceof CouchError && e.status === 409;
+      if (!is409) {
+        const prev = this.binaryPushFailureCounts.get(file.path) ?? 0;
+        const next = prev + 1;
+        this.binaryPushFailureCounts.set(file.path, next);
+        if (next >= CustomFetchSyncStrategy.BINARY_PUSH_MAX_FAILURES) {
+          this.unsyncableFiles.set(file.path, {
+            reason: "push-network",
+            firstSeen: this.unsyncableFiles.get(file.path)?.firstSeen ?? Date.now(),
+            retryAfter: Date.now() + 60_000,
+          });
+        }
+      }
     }
   }
 
@@ -1717,6 +2037,10 @@ export class CustomFetchSyncStrategy implements SyncStrategy {
   // --- Utilities ---
 
   private isExcluded(path: string): boolean {
+    if (ALWAYS_EXCLUDED_PREFIXES.some((prefix) => path.startsWith(prefix))) return true;
     return this.settings.excludePatterns.some((pattern) => path.startsWith(pattern));
   }
 }
+
+/** @deprecated Use CustomFetchSyncStrategy. Kept for backward compat with tests added in main. */
+export { CustomFetchSyncStrategy as SyncEngine };

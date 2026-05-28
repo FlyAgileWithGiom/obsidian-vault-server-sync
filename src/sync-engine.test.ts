@@ -439,6 +439,237 @@ describe("SyncEngine", () => {
         ])
       );
     });
+
+    it("emits onCountsChange at least once during pushAllLocal (push progress signal is live)", async () => {
+      // Set up 5 new local files (not on remote) to push.
+      // onCountsChange is the discriminating signal: it fires ONLY via emitCounts(),
+      // never from setState() transitions, so it cleanly isolates push-phase progress.
+      vault._addFile("notes/a.md", "aaa", 1000);
+      vault._addFile("notes/b.md", "bbb", 2000);
+      vault._addFile("notes/c.md", "ccc", 3000);
+      vault._addFile("notes/d.md", "ddd", 4000);
+      vault._addFile("notes/e.md", "eee", 5000);
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.bulkDocs.mockResolvedValue([
+        { ok: true, id: "file/notes/a.md", rev: "1-a" },
+        { ok: true, id: "file/notes/b.md", rev: "1-b" },
+        { ok: true, id: "file/notes/c.md", rev: "1-c" },
+        { ok: true, id: "file/notes/d.md", rev: "1-d" },
+        { ok: true, id: "file/notes/e.md", rev: "1-e" },
+      ]);
+      client.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+      let countsEmitCount = 0;
+      engine.onCountsChange = () => { countsEmitCount++; };
+
+      await engine.forceFullSync();
+
+      // Before fix: 0 onCountsChange calls during push (diagnostic stream dead).
+      // After fix: ≥ 1 call (at least after the tail pushBatch flush).
+      expect(countsEmitCount).toBeGreaterThanOrEqual(1);
+    });
+
+    it("revMapSize advances monotonically across onCountsChange events during pushAllLocal", async () => {
+      // Set up 15 new local files — forces two batch flushes (10 + 5) so we capture
+      // at least 2 snapshots and can verify the revMap grows between them.
+      const fileNames = Array.from({ length: 15 }, (_, i) => `notes/f${i}.md`);
+      for (const name of fileNames) {
+        vault._addFile(name, `content-${name}`, 1000 + fileNames.indexOf(name));
+      }
+
+      const client = getClient(engine);
+      client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+      client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+      // bulkDocs returns ok results for whatever batch it receives
+      client.bulkDocs.mockImplementation((batch: CouchDoc[]) =>
+        Promise.resolve(batch.map((d) => ({ ok: true, id: d._id, rev: "1-x" })))
+      );
+      client.changes.mockResolvedValue({ last_seq: "15", results: [] });
+
+      const capturedRevMapSizes: number[] = [];
+      engine.onCountsChange = () => {
+        capturedRevMapSizes.push(engine.getDiagnostics().revMapSize);
+      };
+
+      await engine.forceFullSync();
+
+      // Must have captured at least 2 snapshots (from the two batch flushes)
+      expect(capturedRevMapSizes.length).toBeGreaterThanOrEqual(2);
+
+      // Values must be non-decreasing (UI would see growing revMapSize, not a stale value)
+      for (let i = 1; i < capturedRevMapSizes.length; i++) {
+        expect(capturedRevMapSizes[i]).toBeGreaterThanOrEqual(capturedRevMapSizes[i - 1]);
+      }
+
+      // The final revMapSize must be larger than the first (proves growth happened)
+      const first = capturedRevMapSizes[0];
+      const last = capturedRevMapSizes[capturedRevMapSizes.length - 1];
+      expect(last).toBeGreaterThan(first);
+    });
+
+    // ---------------------------------------------------------------------------
+    // Phase 2.5: bulk content-compare for files in remoteRevs without revMap entry
+    // ---------------------------------------------------------------------------
+    describe("bulk content-compare (Phase 2.5)", () => {
+      it("does not push files when local content matches remote (no re-push after clearState)", async () => {
+        // Simulate post-clearState scenario: 5 files exist locally AND on remote,
+        // but revMap is empty (just cleared). Local content matches remote exactly.
+        // Expected: no per-file put for these files; revMap populated as "known".
+        vault._addFile("notes/a.md", "hello", 1000);
+        vault._addFile("notes/b.md", "hello", 2000);
+        vault._addFile("notes/c.md", "hello", 3000);
+        vault._addFile("notes/d.md", "hello", 4000);
+        vault._addFile("notes/e.md", "hello", 5000);
+
+        const client = getClient(engine);
+        // allDocs returns all 5 docIds (they exist on remote)
+        client.allDocs.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "2-a" } },
+            { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "2-b" } },
+            { id: "file/notes/c.md", key: "file/notes/c.md", value: { rev: "2-c" } },
+            { id: "file/notes/d.md", key: "file/notes/d.md", value: { rev: "2-d" } },
+            { id: "file/notes/e.md", key: "file/notes/e.md", value: { rev: "2-e" } },
+          ],
+        });
+        // allDocsByKeys (include_docs=true) returns remote content identical to local
+        client.allDocsByKeys.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "2-a" }, doc: { _id: "file/notes/a.md", _rev: "2-a", content: "hello", mtime: 900 } },
+            { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "2-b" }, doc: { _id: "file/notes/b.md", _rev: "2-b", content: "hello", mtime: 900 } },
+            { id: "file/notes/c.md", key: "file/notes/c.md", value: { rev: "2-c" }, doc: { _id: "file/notes/c.md", _rev: "2-c", content: "hello", mtime: 900 } },
+            { id: "file/notes/d.md", key: "file/notes/d.md", value: { rev: "2-d" }, doc: { _id: "file/notes/d.md", _rev: "2-d", content: "hello", mtime: 900 } },
+            { id: "file/notes/e.md", key: "file/notes/e.md", value: { rev: "2-e" }, doc: { _id: "file/notes/e.md", _rev: "2-e", content: "hello", mtime: 900 } },
+          ],
+        });
+        client.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+        // forceFullSync: clearState() → fullSync (empty revMap, all 5 files in remoteRevs)
+        await engine.forceFullSync();
+
+        // No push payloads for these 5 files (neither via bulkDocs nor per-file put)
+        const allBulkCalls: CouchDoc[][] = client.bulkDocs.mock.calls as CouchDoc[][];
+        const pushedIds = allBulkCalls.flatMap((args) => args[0]).map((d) => d._id);
+        expect(pushedIds).not.toContain("file/notes/a.md");
+        expect(pushedIds).not.toContain("file/notes/b.md");
+        expect(pushedIds).not.toContain("file/notes/c.md");
+        expect(pushedIds).not.toContain("file/notes/d.md");
+        expect(pushedIds).not.toContain("file/notes/e.md");
+
+        // Per-file put must NOT be called — no per-file push for matching content
+        const putCallIds = (client.put.mock.calls as Array<[CouchDoc]>)
+          .map(([doc]) => doc._id);
+        expect(putCallIds).not.toContain("file/notes/a.md");
+        expect(putCallIds).not.toContain("file/notes/b.md");
+        expect(putCallIds).not.toContain("file/notes/c.md");
+        expect(putCallIds).not.toContain("file/notes/d.md");
+        expect(putCallIds).not.toContain("file/notes/e.md");
+
+        // revMap must be populated for all 5 files as "known" (by bulk compare)
+        const diag = engine.getDiagnostics();
+        expect(diag.revMapSize).toBe(5);
+        expect(diag.knownRevMapSize).toBe(5);
+      });
+
+      it("pushes only files where local content differs from remote, skips matching ones", async () => {
+        // 5 files on remote; 3 match local content, 2 differ.
+        // Expected: bulkDocs called with exactly the 2 diff files.
+        vault._addFile("notes/match1.md", "same", 1000);
+        vault._addFile("notes/match2.md", "same", 2000);
+        vault._addFile("notes/match3.md", "same", 3000);
+        vault._addFile("notes/diff1.md", "local-version", 4000);
+        vault._addFile("notes/diff2.md", "local-version", 5000);
+
+        const client = getClient(engine);
+        client.allDocs.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/match1.md", key: "file/notes/match1.md", value: { rev: "2-m1" } },
+            { id: "file/notes/match2.md", key: "file/notes/match2.md", value: { rev: "2-m2" } },
+            { id: "file/notes/match3.md", key: "file/notes/match3.md", value: { rev: "2-m3" } },
+            { id: "file/notes/diff1.md",  key: "file/notes/diff1.md",  value: { rev: "2-d1" } },
+            { id: "file/notes/diff2.md",  key: "file/notes/diff2.md",  value: { rev: "2-d2" } },
+          ],
+        });
+        client.allDocsByKeys.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/match1.md", key: "file/notes/match1.md", value: { rev: "2-m1" }, doc: { _id: "file/notes/match1.md", _rev: "2-m1", content: "same", mtime: 900 } },
+            { id: "file/notes/match2.md", key: "file/notes/match2.md", value: { rev: "2-m2" }, doc: { _id: "file/notes/match2.md", _rev: "2-m2", content: "same", mtime: 900 } },
+            { id: "file/notes/match3.md", key: "file/notes/match3.md", value: { rev: "2-m3" }, doc: { _id: "file/notes/match3.md", _rev: "2-m3", content: "same", mtime: 900 } },
+            { id: "file/notes/diff1.md",  key: "file/notes/diff1.md",  value: { rev: "2-d1" }, doc: { _id: "file/notes/diff1.md",  _rev: "2-d1", content: "remote-version", mtime: 900 } },
+            { id: "file/notes/diff2.md",  key: "file/notes/diff2.md",  value: { rev: "2-d2" }, doc: { _id: "file/notes/diff2.md",  _rev: "2-d2", content: "remote-version", mtime: 900 } },
+          ],
+        });
+        client.bulkDocs.mockImplementation((batch: CouchDoc[]) =>
+          Promise.resolve(batch.map((d) => ({ ok: true, id: d._id, rev: "3-x" })))
+        );
+        client.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+        await engine.forceFullSync();
+
+        // Exactly the 2 diff files must be pushed; matching files must NOT be pushed
+        const allBulkCalls: CouchDoc[][] = client.bulkDocs.mock.calls as CouchDoc[][];
+        const pushedIds = allBulkCalls.flatMap((args) => args[0]).map((d) => d._id);
+        expect(pushedIds).toContain("file/notes/diff1.md");
+        expect(pushedIds).toContain("file/notes/diff2.md");
+        expect(pushedIds).not.toContain("file/notes/match1.md");
+        expect(pushedIds).not.toContain("file/notes/match2.md");
+        expect(pushedIds).not.toContain("file/notes/match3.md");
+
+        // Push payload for diff files must include _rev to avoid 409 conflicts
+        const diffPush = allBulkCalls.flatMap((args) => args[0]).find((d) => d._id === "file/notes/diff1.md");
+        expect(diffPush?._rev).toBe("2-d1");
+      });
+
+      it("falls back to per-file path (pushTextFile via put) when allDocsByKeys chunk throws", async () => {
+        // Safety net: if the bulk content-compare fetch fails, existing per-file
+        // path handles those files — no data loss.
+        // pushTextFile calls client.put() (not bulkDocs), so we assert put() is called.
+        vault._addFile("notes/a.md", "hello", 1000);
+        vault._addFile("notes/b.md", "hello", 2000);
+        vault._addFile("notes/c.md", "hello", 3000);
+        vault._addFile("notes/d.md", "hello", 4000);
+        vault._addFile("notes/e.md", "hello", 5000);
+
+        const client = getClient(engine);
+        client.allDocs.mockResolvedValue({
+          total_rows: 5,
+          rows: [
+            { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "2-a" } },
+            { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "2-b" } },
+            { id: "file/notes/c.md", key: "file/notes/c.md", value: { rev: "2-c" } },
+            { id: "file/notes/d.md", key: "file/notes/d.md", value: { rev: "2-d" } },
+            { id: "file/notes/e.md", key: "file/notes/e.md", value: { rev: "2-e" } },
+          ],
+        });
+        // Bulk content-compare throws (network blip)
+        client.allDocsByKeys.mockRejectedValue(new Error("network timeout"));
+        // client.get throws "not found" — pushTextFile pushes as new with no _rev
+        client.get.mockRejectedValue(new Error("not found"));
+        // client.put succeeds so the per-file fallback path can push
+        client.put.mockResolvedValue({ ok: true, id: "x", rev: "3-x" });
+        client.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+        // Must not throw — engine must degrade gracefully
+        await expect(engine.forceFullSync()).resolves.not.toThrow();
+
+        // Per-file fallback: client.put must be called for each of the 5 files
+        // (pushTextFile uses put, not bulkDocs, for per-file pushes)
+        const putCallIds = (client.put.mock.calls as Array<[CouchDoc]>)
+          .map(([doc]) => doc._id);
+        expect(putCallIds).toContain("file/notes/a.md");
+        expect(putCallIds).toContain("file/notes/b.md");
+        expect(putCallIds).toContain("file/notes/c.md");
+        expect(putCallIds).toContain("file/notes/d.md");
+        expect(putCallIds).toContain("file/notes/e.md");
+      });
+    });
   });
 
   describe("fullSync - pull", () => {
@@ -1677,7 +1908,8 @@ describe("SyncEngine", () => {
         "data.bin",
         expect.any(String), // rev from the put
         pngData,
-        "image/png"
+        "image/png",
+        expect.any(Number)
       );
     });
 
@@ -1702,7 +1934,8 @@ describe("SyncEngine", () => {
         "data.bin",
         expect.any(String),
         pngData,
-        "image/png"
+        "image/png",
+        expect.any(Number)
       );
     });
 
@@ -1749,7 +1982,8 @@ describe("SyncEngine", () => {
         "data.bin",
         "2-fresh",
         jpegData,
-        "image/jpeg"
+        "image/jpeg",
+        expect.any(Number)
       );
       // No error should be surfaced on successful retry
       expect(errors).toHaveLength(0);
@@ -1774,7 +2008,7 @@ describe("SyncEngine", () => {
       retryClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
 
       const { CouchError } = await import("./couch-client");
-      // All 3 putAttachment attempts fail with 409
+      // All putAttachment attempts fail with 409 — now retried 5 times with backoff
       retryClient.putAttachment = vi.fn()
         .mockRejectedValue(new CouchError(409, "Document update conflict."));
       // get() always returns a fresh-looking rev (but another client keeps winning)
@@ -1785,10 +2019,17 @@ describe("SyncEngine", () => {
         mtime: 1000,
       });
 
-      await retryEngine.start();
-      const file: VaultFile = { kind: "file", path: "images/persistent.jpeg", mtime: Date.now(), size: jpegData.byteLength };
-      retryEngine.handleLocalChange(file);
-      await new Promise((r) => setTimeout(r, 120));
+      // Use fake timers to avoid real backoff delays (100+200+400+800ms = 1500ms per cycle).
+      // Call fullSync() directly (not start()) to avoid the polling loop that would cause
+      // vi.runAllTimersAsync() to spin forever.
+      vi.useFakeTimers();
+      try {
+        const syncPromise = retryEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+      } finally {
+        vi.useRealTimers();
+      }
 
       // After MAX_RETRIES exhausted, error must be surfaced
       expect(retryErrors).toHaveLength(1);
@@ -1872,6 +2113,445 @@ describe("SyncEngine", () => {
       expect(stubErrors).toHaveLength(0);
 
       stubEngine.stop();
+    });
+
+    it("adds binary to unsyncableFiles after 3 consecutive network failures and skips on 4th fullSync", async () => {
+      // Network errors (timeout, 5xx) that are NOT 409 should be counted per file.
+      // After 3 failures the file must land in unsyncableFiles and be skipped on the next cycle.
+      const pngData = new Uint8Array([1, 2, 3]).buffer;
+      vault._addBinaryFile("images/flaky.png", pngData);
+
+      // Pre-seed revMap with mtime:0 so the "not changed since last sync" skip does not fire.
+      // mtime:0 is the migration default meaning "unknown mtime" → always attempt push.
+      const failStore = new TestStateStore();
+      failStore.set("vault-sync-revmap", JSON.stringify({ "file/images/flaky.png": { state: "known", rev: "1-stub", mtime: 0 } }));
+      const failEngine = makeEngine(settings, vaultAdapter, failStore);
+      failEngine.onStateChange = () => {};
+      const failErrors: string[] = [];
+      failEngine.onError = (msg) => failErrors.push(msg);
+      const failClient = getClient(failEngine);
+
+      const networkError = new Error("Request failed. The request timed out.");
+
+      // Remote has the stub doc (put succeeded), so pullAllRemote won't delete it locally.
+      // pushAllLocal sees the stub in remoteRevs, but revMap mtime:0 means "not changed since
+      // last sync" check fires only when entry.mtime > 0 && file.mtime <= entry.mtime.
+      // We force mtime:0 via the revMap pre-seed so it always pushes.
+      failClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/flaky.png", key: "file/images/flaky.png", value: { rev: "1-stub" } }],
+      });
+      failClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      // get() returns the stub doc
+      failClient.get = vi.fn().mockResolvedValue({ _id: "file/images/flaky.png", _rev: "1-stub", content: null, mtime: 0 });
+      // put() creates the stub doc
+      failClient.put = vi.fn().mockResolvedValue({ ok: true, id: "file/images/flaky.png", rev: "1-stub" });
+      // putAttachment always throws a network error
+      failClient.putAttachment = vi.fn().mockRejectedValue(networkError);
+
+      // Run fullSync 3 times → 3 consecutive failures → should be unsyncable
+      await failEngine.start();
+      // force 2 more fullSync cycles
+      await (failEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+      await (failEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+
+      // Now putAttachment should have been called 3 times total
+      expect(failClient.putAttachment).toHaveBeenCalledTimes(3);
+
+      // Reset putAttachment spy to detect if it's called on the 4th cycle
+      failClient.putAttachment.mockClear();
+
+      // 4th fullSync: file is now unsyncable, must NOT call putAttachment
+      await (failEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+      expect(failClient.putAttachment).not.toHaveBeenCalled();
+
+      failEngine.stop();
+    });
+
+    it("clears push-network unsyncable state after a successful push", async () => {
+      // After a network failure marks the file unsyncable, a successful push must clear it.
+      const pngData = new Uint8Array([1, 2]).buffer;
+      vault._addBinaryFile("images/recover.png", pngData);
+
+      // Pre-seed revMap with mtime:0 so mtime-skip never fires across the 3 failure cycles.
+      const recStore = new TestStateStore();
+      recStore.set("vault-sync-revmap", JSON.stringify({ "file/images/recover.png": { state: "known", rev: "1-stub", mtime: 0 } }));
+      const recEngine = makeEngine(settings, vaultAdapter, recStore);
+      recEngine.onStateChange = () => {};
+      recEngine.onError = () => {};
+      const recClient = getClient(recEngine);
+
+      const networkError = new Error("The request timed out.");
+      // allDocs returns the stub so pullAllRemote's remote-deletion check won't delete the local file.
+      recClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/recover.png", key: "file/images/recover.png", value: { rev: "1-stub" } }],
+      });
+      recClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      recClient.get = vi.fn().mockResolvedValue({ _id: "file/images/recover.png", _rev: "1-stub", content: null, mtime: 0 });
+      // First 3 calls fail, subsequent succeed
+      recClient.putAttachment = vi.fn()
+        .mockRejectedValueOnce(networkError)
+        .mockRejectedValueOnce(networkError)
+        .mockRejectedValueOnce(networkError)
+        .mockResolvedValue({ ok: true, id: "file/images/recover.png", rev: "2-ok" });
+
+      // 3 failing cycles → unsyncable
+      await recEngine.start();
+      await (recEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+      await (recEngine as unknown as { fullSync: () => Promise<void> }).fullSync();
+
+      // forceFullSync clears the failure counter and unsyncableFiles → putAttachment attempted again
+      recClient.putAttachment.mockClear();
+      await recEngine.forceFullSync();
+
+      // After forceFullSync, unsyncable state is cleared → putAttachment called again
+      expect(recClient.putAttachment).toHaveBeenCalled();
+
+      recEngine.stop();
+    });
+
+    it("applies exponential backoff before each 409 retry in binary push", async () => {
+      // 409 twice → success on 3rd attempt. The backoff sleeps between retries via setTimeout.
+      // Use fake timers to verify setTimeout is called with the expected durations without
+      // actually waiting: delay for attempt i is min(2^i * 100, 2000) ms.
+      vi.useFakeTimers();
+      try {
+        const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+        vault._addBinaryFile("images/backoff.jpeg", jpegData);
+
+        const backoffStore = new TestStateStore();
+        backoffStore.set("vault-sync-revmap", JSON.stringify({ "file/images/backoff.jpeg": { state: "known", rev: "1-stale", mtime: 0 } }));
+        const backoffEngine = makeEngine(settings, vaultAdapter, backoffStore);
+        backoffEngine.onStateChange = () => {};
+        const backoffErrors: string[] = [];
+        backoffEngine.onError = (msg) => backoffErrors.push(msg);
+        const backoffClient = getClient(backoffEngine);
+
+        const { CouchError } = await import("./couch-client");
+
+        backoffClient.allDocs.mockResolvedValue({
+          total_rows: 1,
+          rows: [{ id: "file/images/backoff.jpeg", key: "file/images/backoff.jpeg", value: { rev: "1-stale" } }],
+        });
+        backoffClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+        // get() returns fresh rev for 409 recovery
+        backoffClient.get = vi.fn().mockResolvedValue({ _id: "file/images/backoff.jpeg", _rev: "2-fresh", content: null, mtime: 0 });
+        // First two putAttachment calls 409, third succeeds
+        backoffClient.putAttachment = vi.fn()
+          .mockRejectedValueOnce(new CouchError(409, "Document update conflict."))
+          .mockRejectedValueOnce(new CouchError(409, "Document update conflict."))
+          .mockResolvedValueOnce({ ok: true, id: "file/images/backoff.jpeg", rev: "3-ok" });
+
+        const setTimeoutSpy = vi.spyOn(global, "setTimeout");
+
+        // Run fullSync; fake timers advance all scheduled sleeps immediately
+        const syncPromise = backoffEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+
+        // 3 total attempts: initial + 2 retries after 409
+        expect(backoffClient.putAttachment).toHaveBeenCalledTimes(3);
+        // No error on success
+        expect(backoffErrors).toHaveLength(0);
+
+        // Verify backoff sleeps were scheduled: at least 2 setTimeout calls with
+        // the expected durations (100ms for attempt 0 → 1, 200ms for attempt 1 → 2).
+        const sleepCalls = setTimeoutSpy.mock.calls.filter((args) => typeof args[1] === "number" && (args[1] === 100 || args[1] === 200));
+        expect(sleepCalls.length).toBeGreaterThanOrEqual(2);
+
+        backoffEngine.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("raises binary 409 retry cap to 5 attempts before surfacing an error", async () => {
+      // With MAX_RETRIES=5, a file that 409s on every attempt should be retried 5 times total.
+      const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+      vault._addBinaryFile("images/alwayscf.jpeg", jpegData);
+
+      const capStore = new TestStateStore();
+      capStore.set("vault-sync-revmap", JSON.stringify({ "file/images/alwayscf.jpeg": { state: "known", rev: "1-stale", mtime: 0 } }));
+      const capEngine = makeEngine(settings, vaultAdapter, capStore);
+      capEngine.onStateChange = () => {};
+      const capErrors: string[] = [];
+      capEngine.onError = (msg) => capErrors.push(msg);
+      const capClient = getClient(capEngine);
+
+      const { CouchError } = await import("./couch-client");
+
+      vi.useFakeTimers();
+      try {
+        capClient.allDocs.mockResolvedValue({
+          total_rows: 1,
+          rows: [{ id: "file/images/alwayscf.jpeg", key: "file/images/alwayscf.jpeg", value: { rev: "1-stale" } }],
+        });
+        capClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+        capClient.get = vi.fn().mockResolvedValue({ _id: "file/images/alwayscf.jpeg", _rev: "2-fresh", content: null, mtime: 0 });
+        // Always 409
+        capClient.putAttachment = vi.fn().mockRejectedValue(new CouchError(409, "Document update conflict."));
+
+        const syncPromise = capEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+
+        // 5 attempts (attempt 0..4), then exhausted → error surfaced
+        expect(capClient.putAttachment).toHaveBeenCalledTimes(5);
+        expect(capErrors).toHaveLength(1);
+        expect(capErrors[0]).toContain("Binary push failed for images/alwayscf.jpeg");
+      } finally {
+        vi.useRealTimers();
+        capEngine.stop();
+      }
+    });
+
+    it("409 error does NOT increment the push-network failure counter", async () => {
+      // The binaryPushFailureCounts counter must only increment on non-409 errors.
+      // 409 means a conflict that retry logic handles; it must not push the file
+      // toward the unsyncable threshold.
+      const jpegData = new Uint8Array([0xff, 0xd8]).buffer;
+      vault._addBinaryFile("images/conflict.jpeg", jpegData);
+
+      const cfStore = new TestStateStore();
+      cfStore.set("vault-sync-revmap", JSON.stringify({ "file/images/conflict.jpeg": { state: "known", rev: "1-old", mtime: 0 } }));
+      const cfEngine = makeEngine(settings, vaultAdapter, cfStore);
+      cfEngine.onStateChange = () => {};
+      cfEngine.onError = () => {};
+      const cfClient = getClient(cfEngine);
+
+      const { CouchError } = await import("./couch-client");
+
+      cfClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/conflict.jpeg", key: "file/images/conflict.jpeg", value: { rev: "1-old" } }],
+      });
+      // allDocsByKeys must return attachment metadata so pullBinaryDocs treats the file as
+      // "has attachment" → downloads it (state stays "known") rather than marking it "orphan"
+      // (which would skip it in pushAllLocal on the 2nd cycle via the orphan guard).
+      cfClient.allDocsByKeys = vi.fn().mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/conflict.jpeg", doc: { _id: "file/images/conflict.jpeg", _rev: "1-old", _attachments: { "data.bin": { content_type: "image/jpeg", length: 2 } } } }],
+      });
+      cfClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      cfClient.get = vi.fn().mockResolvedValue({ _id: "file/images/conflict.jpeg", _rev: "2-fresh", content: null, mtime: 0 });
+
+      // putAttachment always responds with a 409 — exhausts all retries but must NOT
+      // count toward the network-failure threshold.
+      vi.useFakeTimers();
+      try {
+        cfClient.putAttachment = vi.fn().mockRejectedValue(new CouchError(409, "Document update conflict."));
+
+        const syncPromise = cfEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise;
+
+        // After exhausting retries via 409s, run another full cycle.
+        // The file must still be attempted (not in unsyncableFiles) because
+        // 409 must NEVER bump the push-network counter.
+        cfClient.putAttachment.mockClear();
+        const syncPromise2 = cfEngine.fullSync();
+        await vi.runAllTimersAsync();
+        await syncPromise2;
+
+        // putAttachment attempted again on the 2nd cycle → counter stayed at 0
+        expect(cfClient.putAttachment).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+        cfEngine.stop();
+      }
+    });
+  });
+
+  describe("binary file sync - pushLocks race prevention", () => {
+    it("serializes pushAllLocal and handleLocalChange pushes for the same binary file", async () => {
+      // Setup: pushAllLocal has a binary in flight (putAttachment is pending).
+      // handleLocalChange fires for the same file.
+      // Without pushLocks in pushAllLocal, two putAttachment calls race.
+      // With pushLocks, the second push waits for the first to finish.
+
+      const pngData = new Uint8Array([1, 2, 3]).buffer;
+      vault._addBinaryFile("images/race.png", pngData);
+
+      const raceStore = new TestStateStore();
+      raceStore.set("vault-sync-revmap", JSON.stringify({ "file/images/race.png": { state: "known", rev: "1-stub", mtime: 0 } }));
+      const raceEngine = makeEngine(settings, vaultAdapter, raceStore);
+      raceEngine.onStateChange = () => {};
+      raceEngine.onError = () => {};
+      const raceClient = getClient(raceEngine);
+
+      raceClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/race.png", key: "file/images/race.png", value: { rev: "1-stub" } }],
+      });
+      raceClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      raceClient.get = vi.fn().mockResolvedValue({ _id: "file/images/race.png", _rev: "1-stub", content: null, mtime: 0 });
+
+      // Start the engine so handleLocalChange is accepted (running = true).
+      // Use start() → first fullSync completes immediately.
+      raceClient.putAttachment = vi.fn().mockResolvedValue({ ok: true, id: "file/images/race.png", rev: "2-ok" });
+      await raceEngine.start();
+      raceClient.putAttachment.mockClear();
+
+      // Now update mtime so pushAllLocal considers the file changed on the NEXT cycle.
+      // Need to re-add to vault since start() may have caused handleRemoteDelete to remove it.
+      vault._addBinaryFile("images/race.png", new Uint8Array([4, 5, 6]).buffer);
+      // Update allDocs to reflect the new rev from start()
+      raceClient.allDocs.mockResolvedValue({
+        total_rows: 1,
+        rows: [{ id: "file/images/race.png", key: "file/images/race.png", value: { rev: "2-ok" } }],
+      });
+      raceClient.get = vi.fn().mockResolvedValue({ _id: "file/images/race.png", _rev: "2-ok", content: null, mtime: 0 });
+      // Force the engine to treat the file as needing a push (revMap mtime:0 disables skip)
+      // The engine's internal revMap was updated by start(); we need to override it.
+      // Access internal revMap via type cast to set mtime:0
+      (raceEngine as unknown as { revMap: Record<string, unknown> }).revMap["file/images/race.png"] = { state: "known", rev: "2-ok", mtime: 0 };
+
+      // Install blocking mock for the race test
+      let resolveFirstPut!: () => void;
+      const firstPutPending = new Promise<void>((r) => { resolveFirstPut = r; });
+      let concurrentCalls = 0;
+      let maxConcurrentCalls = 0;
+      raceClient.putAttachment = vi.fn().mockImplementation(async () => {
+        concurrentCalls++;
+        maxConcurrentCalls = Math.max(maxConcurrentCalls, concurrentCalls);
+        await firstPutPending;
+        concurrentCalls--;
+        return { ok: true, id: "file/images/race.png", rev: "3-ok" };
+      });
+
+      // Start fullSync (which calls pushAllLocal → pushBinaryWithLock → putAttachment blocked)
+      const syncPromise = raceEngine.fullSync();
+
+      // Give the sync a moment to reach putAttachment (which is now blocking)
+      await new Promise((r) => setTimeout(r, 20));
+
+      // putAttachment is in flight — trigger a second push via handleLocalChange
+      const file: VaultFile = { kind: "file", path: "images/race.png", mtime: Date.now() + 1, size: pngData.byteLength };
+      raceEngine.handleLocalChange(file);
+
+      // Wait for debounce to fire (50ms) — second push should now be queued but NOT started yet
+      await new Promise((r) => setTimeout(r, 80));
+
+      // At this point, only 1 concurrent putAttachment should be in flight
+      expect(maxConcurrentCalls).toBe(1);
+
+      // Release the first put → first completes → second starts → resolves
+      resolveFirstPut();
+
+      // Wait for everything to settle
+      await syncPromise;
+      await new Promise((r) => setTimeout(r, 150));
+
+      // Both pushes completed (total 2 putAttachment calls), but never concurrently
+      expect(raceClient.putAttachment).toHaveBeenCalledTimes(2);
+      expect(maxConcurrentCalls).toBe(1);
+
+      raceEngine.stop();
+    });
+  });
+
+  describe("binary file sync - parallel push", () => {
+    it("pushes K binaries in parallel chunks: wall time is roughly ceil(K/3) slots, not K slots", async () => {
+      // With K=6 binaries and PARALLEL_BINARY_PUSH=3, we expect ~2 rounds of 3 concurrent
+      // uploads. Each putAttachment takes ~30ms. Total should be ≤ 3 rounds * 30ms = 90ms,
+      // well below the sequential 6 * 30ms = 180ms.
+      const SLOT_MS = 30;
+      const K = 6;
+
+      for (let i = 0; i < K; i++) {
+        vault._addBinaryFile(`images/img${i}.png`, new Uint8Array([i]).buffer);
+      }
+
+      // Pre-seed revMap with mtime:0 for all files so mtime-skip never fires.
+      const store = new TestStateStore();
+      const revMapSeed: Record<string, unknown> = {};
+      for (let i = 0; i < K; i++) {
+        revMapSeed[`file/images/img${i}.png`] = { state: "known", rev: "1-stub", mtime: 0 };
+      }
+      store.set("vault-sync-revmap", JSON.stringify(revMapSeed));
+
+      const parEngine = makeEngine(settings, vaultAdapter, store);
+      parEngine.onStateChange = () => {};
+      parEngine.onError = () => {};
+      const parClient = getClient(parEngine);
+
+      // Remote has all stubs so pullAllRemote won't delete them.
+      parClient.allDocs.mockResolvedValue({
+        total_rows: K,
+        rows: Array.from({ length: K }, (_, i) => ({
+          id: `file/images/img${i}.png`,
+          key: `file/images/img${i}.png`,
+          value: { rev: "1-stub" },
+        })),
+      });
+      parClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      parClient.get = vi.fn().mockResolvedValue({ _id: "placeholder", _rev: "1-stub", content: null, mtime: 0 });
+
+      // Each putAttachment takes SLOT_MS ms
+      parClient.putAttachment = vi.fn().mockImplementation(async () => {
+        await new Promise((r) => setTimeout(r, SLOT_MS));
+        return { ok: true, id: "placeholder", rev: "2-ok" };
+      });
+
+      const start = Date.now();
+      await parEngine.fullSync();
+      const elapsed = Date.now() - start;
+
+      // Sequential would take K * SLOT_MS = 180ms; parallel ceil(K/3) * SLOT_MS = 60ms.
+      // Allow 3x headroom for CI jitter.
+      const sequentialMs = K * SLOT_MS;
+      expect(elapsed).toBeLessThan(sequentialMs);
+      expect(parClient.putAttachment).toHaveBeenCalledTimes(K);
+
+      parEngine.stop();
+    });
+
+    it("one failing binary in a chunk does not abort the rest of the chunk (Promise.allSettled)", async () => {
+      // Promise.allSettled guarantees other files in the same chunk complete
+      // even when one throws. This is the load-bearing property of the parallel push design.
+      const K = 3; // Exactly one full chunk
+      for (let i = 0; i < K; i++) {
+        vault._addBinaryFile(`images/settle${i}.png`, new Uint8Array([i]).buffer);
+      }
+
+      const settleStore = new TestStateStore();
+      const revMapSeed: Record<string, unknown> = {};
+      for (let i = 0; i < K; i++) {
+        revMapSeed[`file/images/settle${i}.png`] = { state: "known", rev: "1-stub", mtime: 0 };
+      }
+      settleStore.set("vault-sync-revmap", JSON.stringify(revMapSeed));
+
+      const settleEngine = makeEngine(settings, vaultAdapter, settleStore);
+      settleEngine.onStateChange = () => {};
+      settleEngine.onError = () => {};
+      const settleClient = getClient(settleEngine);
+
+      settleClient.allDocs.mockResolvedValue({
+        total_rows: K,
+        rows: Array.from({ length: K }, (_, i) => ({
+          id: `file/images/settle${i}.png`,
+          key: `file/images/settle${i}.png`,
+          value: { rev: "1-stub" },
+        })),
+      });
+      settleClient.changes.mockResolvedValue({ last_seq: "0", results: [] });
+      settleClient.get = vi.fn().mockResolvedValue({ _id: "placeholder", _rev: "1-stub", content: null, mtime: 0 });
+
+      // First file in the chunk throws; others succeed.
+      let callIndex = 0;
+      settleClient.putAttachment = vi.fn().mockImplementation(async () => {
+        const idx = callIndex++;
+        if (idx === 0) throw new Error("network failure on first file");
+        return { ok: true, id: `file/images/settle${idx}.png`, rev: "2-ok" };
+      });
+
+      await settleEngine.fullSync();
+
+      // All K files attempted despite the first one failing
+      expect(settleClient.putAttachment).toHaveBeenCalledTimes(K);
+
+      settleEngine.stop();
     });
   });
 
@@ -3735,6 +4415,497 @@ describe("resumeFullSync (non-destructive)", () => {
     expect(pullCalls.length).toBe(0);
 
     eng.stop();
+  });
+});
+
+describe("replaceLocalFromServer", () => {
+  // Each test uses a fresh Vault/VaultAdapter/settings and pre-populated StateStore
+  // so it is isolated from the outer SyncEngine describe's beforeEach.
+  let rVault: Vault;
+  let rAdapter: TestVaultAdapter;
+  let rSettings: VaultSyncSettings;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    rVault = new Vault();
+    rAdapter = new TestVaultAdapter(rVault);
+    rSettings = makeSettings();
+  });
+
+  it("deletes tracked files only — untracked files are preserved", async () => {
+    // revMap tracks a.md and b.md; vault also has c.md (untracked).
+    // Server returns empty allDocs (server is empty for simplicity).
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/a.md": { state: "known", rev: "1-a", mtime: 1000 },
+      "file/b.md": { state: "known", rev: "1-b", mtime: 1000 },
+    }));
+    rVault._addFile("a.md", "content a", 1000);
+    rVault._addFile("b.md", "content b", 1000);
+    rVault._addFile("c.md", "untracked content", 2000);
+
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    // Server is empty
+    c.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await eng.replaceLocalFromServer();
+
+    // Tracked files must be deleted
+    expect(rAdapter.getEntryByPath("a.md")).toBeNull();
+    expect(rAdapter.getEntryByPath("b.md")).toBeNull();
+    // Untracked file must be preserved
+    expect(rAdapter.getEntryByPath("c.md")).not.toBeNull();
+
+    eng.stop();
+  });
+
+  it("pulls from server after wipe — server docs are re-downloaded", async () => {
+    // revMap has 2 entries; vault has those 2 files.
+    // Server has 3 docs: the 2 matching revMap + 1 new doc d.md.
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/a.md": { state: "known", rev: "1-a", mtime: 1000 },
+      "file/b.md": { state: "known", rev: "1-b", mtime: 1000 },
+    }));
+    rVault._addFile("a.md", "old a", 1000);
+    rVault._addFile("b.md", "old b", 1000);
+
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    // Server has all 3 docs
+    c.allDocs.mockResolvedValue({
+      total_rows: 3,
+      rows: [
+        { id: "file/a.md", key: "file/a.md", value: { rev: "2-a" } },
+        { id: "file/b.md", key: "file/b.md", value: { rev: "2-b" } },
+        { id: "file/d.md", key: "file/d.md", value: { rev: "1-d" } },
+      ],
+    });
+    // allDocsByKeys returns content for pull
+    c.allDocsByKeys.mockResolvedValue({
+      total_rows: 3,
+      rows: [
+        { id: "file/a.md", key: "file/a.md", value: { rev: "2-a" }, doc: { _id: "file/a.md", _rev: "2-a", content: "from server a", mtime: 2000 } },
+        { id: "file/b.md", key: "file/b.md", value: { rev: "2-b" }, doc: { _id: "file/b.md", _rev: "2-b", content: "from server b", mtime: 2000 } },
+        { id: "file/d.md", key: "file/d.md", value: { rev: "1-d" }, doc: { _id: "file/d.md", _rev: "1-d", content: "from server", mtime: 3000 } },
+      ],
+    });
+    c.changes.mockResolvedValue({ last_seq: "5", results: [] });
+
+    await eng.replaceLocalFromServer();
+
+    // All 3 server docs must exist in vault after the call
+    expect(rVault._getContent("a.md")).toBe("from server a");
+    expect(rVault._getContent("b.md")).toBe("from server b");
+    expect(rVault._getContent("d.md")).toBe("from server");
+
+    eng.stop();
+  });
+
+  it("does NOT push any tracked file during the run", async () => {
+    // revMap has 2 tracked files; vault has exactly those 2 files.
+    // After Phase 1 (wipe tracked) the vault files are gone, so pushAllLocal
+    // sees no tracked files in the vault → no push calls.
+    const store = new TestStateStore();
+    store.set("vault-sync-revmap", JSON.stringify({
+      "file/a.md": { state: "known", rev: "1-a", mtime: 1000 },
+      "file/b.md": { state: "known", rev: "1-b", mtime: 1000 },
+    }));
+    rVault._addFile("a.md", "content a", 1000);
+    rVault._addFile("b.md", "content b", 1000);
+
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    // Server mirrors the 2 tracked docs exactly
+    c.allDocs.mockResolvedValue({
+      total_rows: 2,
+      rows: [
+        { id: "file/a.md", key: "file/a.md", value: { rev: "1-a" } },
+        { id: "file/b.md", key: "file/b.md", value: { rev: "1-b" } },
+      ],
+    });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "3", results: [] });
+
+    await eng.replaceLocalFromServer();
+
+    // bulkDocs must not have been called with non-tombstone payloads.
+    // (pushAllLocal uses bulkDocs for text batch push; tombstone deletes use bulkDocs too
+    // but those are _deleted payloads which we don't produce here since there are no
+    // locally-deleted known files — the wipe is done outside the sync lifecycle.)
+    const bulkCalls = c.bulkDocs.mock.calls as Array<[CouchDoc[]]>;
+    const contentPushes = bulkCalls.flatMap(([batch]) => batch).filter((d) => !d._deleted);
+    expect(contentPushes).toHaveLength(0);
+
+    eng.stop();
+  });
+
+  it("emits onCountsChange during Phase 1 delete loop when vault has many tracked files", async () => {
+    // Pre-populate revMap with 60 tracked files and matching vault entries.
+    // This mirrors the iOS scenario where Phase 1 alone takes many seconds and
+    // the UI clock must keep ticking during the wipe, not only after Phase 2 starts.
+    const store = new TestStateStore();
+    const revMapEntries: Record<string, { state: string; rev: string; mtime: number }> = {};
+    for (let i = 0; i < 60; i++) {
+      revMapEntries[`file/notes/file${i}.md`] = { state: "known", rev: `1-${i}`, mtime: 1000 + i };
+    }
+    store.set("vault-sync-revmap", JSON.stringify(revMapEntries));
+
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    for (let i = 0; i < 60; i++) {
+      rVault._addFile(`notes/file${i}.md`, `content ${i}`, 1000 + i);
+    }
+
+    const c = getClient(eng);
+
+    // Track whether Phase 2 has started (allDocs is the first Phase 2 network call).
+    let phase2Started = false;
+    c.allDocs.mockImplementation(() => {
+      phase2Started = true;
+      return Promise.resolve({ total_rows: 0, rows: [] });
+    });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    // Count onCountsChange calls that fire BEFORE Phase 2 begins.
+    let countsBeforePhase2 = 0;
+    eng.onCountsChange = () => {
+      if (!phase2Started) countsBeforePhase2++;
+    };
+
+    await eng.replaceLocalFromServer();
+
+    // Before fix: 0 — emitCounts() is never called during the Phase 1 delete loop.
+    // After fix: ≥ 1 — emitCounts() fires periodically inside the loop.
+    expect(countsBeforePhase2).toBeGreaterThanOrEqual(1);
+
+    eng.stop();
+  });
+
+  it("emits onCountsChange between binary metadata chunks during Phase 2", async () => {
+    // Phase 2 of Replace runs fullSync → pullAllRemote → pullBinaryDocs.
+    // pullBinaryDocs fetches doc metadata in chunks of META_BATCH_SIZE (500) to
+    // stay within CouchDB request limits. With 1100 binary docs that means
+    // 3 sequential `allDocsByKeys` calls. On iOS each chunk can take several
+    // seconds; without progress emit between them the UI clock stays frozen
+    // for the entire metadata-fetch phase.
+    //
+    // 1100 .png docs returned from allDocs with no attachment data → meta loop
+    // runs in full, every doc classifies as binary orphan, no download happens.
+    // This isolates the meta-fetch loop as the signal source.
+    const store = new TestStateStore();
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    const TOTAL_BINARIES = 1100; // > 2*META_BATCH_SIZE so we get at least 3 chunks
+    const remoteRows = Array.from({ length: TOTAL_BINARIES }, (_, i) => ({
+      id: `file/img${i}.png`,
+      key: `file/img${i}.png`,
+      value: { rev: `1-r${i}` },
+    }));
+    c.allDocs.mockResolvedValue({ total_rows: TOTAL_BINARIES, rows: remoteRows });
+
+    // Mark each meta-chunk call so we can scope assertions to "between chunks".
+    const events: string[] = [];
+    c.allDocsByKeys.mockImplementation(async () => {
+      events.push("meta-chunk");
+      return { total_rows: 0, rows: [] };
+    });
+    c.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    eng.onCountsChange = () => events.push("emit");
+
+    await eng.replaceLocalFromServer();
+
+    const chunkIndices = events
+      .map((e, i) => (e === "meta-chunk" ? i : -1))
+      .filter((i) => i >= 0);
+    expect(chunkIndices.length).toBeGreaterThanOrEqual(3);
+
+    // Between every pair of consecutive meta-chunk events, at least one emit
+    // must have fired — otherwise the UI clock is frozen for that span.
+    for (let i = 0; i < chunkIndices.length - 1; i++) {
+      const between = events.slice(chunkIndices[i] + 1, chunkIndices[i + 1]);
+      expect(between).toContain("emit");
+    }
+
+    eng.stop();
+  });
+
+  it("emits onCountsChange between pages of the initial remote-index scan", async () => {
+    // Phase 2 begins with `client.allDocs({startkey, endkey})` to build the
+    // remote rev index. Before pagination this was a single network round-trip
+    // that on iOS with 7000+ docs took 30-60s of complete UI silence — no
+    // state change, no count emit, "Last render" frozen.
+    //
+    // After pagination the scan must walk pages and emit progress between them
+    // so the diagnostics clock keeps ticking.
+    const store = new TestStateStore();
+    const eng = new SyncEngine(rSettings, rAdapter, store, noopTransport);
+    const c = getClient(eng);
+
+    // 12000 docs forces multiple pages at any sane page size up to 6000.
+    // Each id is zero-padded so byte-wise sort matches numeric order.
+    const TOTAL = 12000;
+    const allRows: Array<{ id: string; key: string; value: { rev: string } }> = [];
+    for (let i = 0; i < TOTAL; i++) {
+      const id = `file/doc${String(i).padStart(6, "0")}.md`;
+      allRows.push({ id, key: id, value: { rev: `1-r${i}` } });
+    }
+
+    // Realistic CouchDB allDocs mock: honours startkey (inclusive) and limit.
+    // Any docId in the prefix range is matched.
+    const events: string[] = [];
+    c.allDocs.mockImplementation(async (opts: { startkey?: string; limit?: number }) => {
+      events.push("scan-page");
+      const startkey = opts.startkey ?? "";
+      const limit = opts.limit ?? allRows.length;
+      const startIdx = allRows.findIndex((r) => r.id >= startkey);
+      const slice = startIdx === -1 ? [] : allRows.slice(startIdx, startIdx + limit);
+      return { total_rows: allRows.length, rows: slice };
+    });
+    c.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    c.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    eng.onCountsChange = () => events.push("emit");
+
+    await eng.forceFullSync();
+
+    const pageIndices = events
+      .map((e, i) => (e === "scan-page" ? i : -1))
+      .filter((i) => i >= 0);
+
+    // Pagination must produce ≥ 2 scan-page calls for 12K docs.
+    expect(pageIndices.length).toBeGreaterThanOrEqual(2);
+
+    // Between every pair of consecutive pages, at least one emit must fire —
+    // otherwise the UI clock is frozen for that span.
+    for (let i = 0; i < pageIndices.length - 1; i++) {
+      const between = events.slice(pageIndices[i] + 1, pageIndices[i + 1]);
+      expect(between).toContain("emit");
+    }
+
+    eng.stop();
+  });
+});
+
+describe("pull throughput instrumentation", () => {
+  it("records avgFetchMs and avgApplyMs after a full sync that pulls text docs", async () => {
+    // Arrange: two text docs in the remote index with stale revs in revMap so orphan guard passes
+    const storeWithRevMap = new TestStateStore();
+    storeWithRevMap.set("vault-sync-revmap", JSON.stringify({
+      "file/notes/a.md": { rev: "0-old", mtime: 0 },
+      "file/notes/b.md": { rev: "0-old", mtime: 0 },
+    }));
+    const localVault = new Vault();
+    const localAdapter = new TestVaultAdapter(localVault);
+    const eng = new SyncEngine(makeSettings(), localAdapter, storeWithRevMap, noopTransport);
+    const client = getClient(eng);
+
+    client.allDocs.mockResolvedValue({
+      total_rows: 2,
+      rows: [
+        { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "1-a" } },
+        { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "1-b" } },
+      ],
+    });
+
+    // allDocsByKeys resolves after ~50ms to simulate fetch latency
+    client.allDocsByKeys.mockImplementation(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+      return {
+        total_rows: 2,
+        rows: [
+          { id: "file/notes/a.md", key: "file/notes/a.md", value: { rev: "1-a" }, doc: { _id: "file/notes/a.md", _rev: "1-a", content: "doc a", mtime: 1000 } },
+          { id: "file/notes/b.md", key: "file/notes/b.md", value: { rev: "1-b" }, doc: { _id: "file/notes/b.md", _rev: "1-b", content: "doc b", mtime: 1001 } },
+        ],
+      };
+    });
+
+    // createText resolves after ~30ms to simulate FS latency; vault.create is what TestVaultAdapter calls
+    const origCreate = localVault.create.bind(localVault);
+    localVault.create = async (path: unknown, content: unknown) => {
+      await new Promise((r) => setTimeout(r, 30));
+      return origCreate(path as never, content as never);
+    };
+
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+    client.ensureDb.mockResolvedValue(undefined);
+
+    // Act: forceFullSync triggers pullTextDocs
+    await eng.forceFullSync();
+
+    // Assert: metrics are non-null and in expected range
+    const diag = eng.getDiagnostics();
+    expect(diag.avgFetchMs).not.toBeNull();
+    expect(diag.avgApplyMs).not.toBeNull();
+    // fetch took ~50ms — allow wide range for CI variance
+    expect(diag.avgFetchMs!).toBeGreaterThan(10);
+    expect(diag.avgFetchMs!).toBeLessThan(500);
+    // apply took ~30ms per doc — allow wide range
+    expect(diag.avgApplyMs!).toBeGreaterThan(5);
+    expect(diag.avgApplyMs!).toBeLessThan(500);
+
+    eng.stop();
+  });
+});
+
+describe("parallel text apply (PARALLEL_TEXT_APPLY)", () => {
+  // Issue #57: pullTextDocs currently applies docs sequentially within each
+  // batch of 20. pullBinaryDocs already mirrors this with PARALLEL_BINARY_PULLS=5.
+  // Mirror the same pattern for text so pathological apply latency (cloud-sync
+  // interception, huge content) doesn't serialize the whole batch.
+
+  it("pulls K docs in roughly K/5 * apply_ms when applyRemoteDoc is slow", async () => {
+    const storeWithRevMap = new TestStateStore();
+    // Pre-populate revMap with stale revs so orphan guard passes for all 10 docs.
+    const revMap: Record<string, { state: string; rev: string; mtime: number }> = {};
+    for (let i = 0; i < 10; i++) {
+      revMap[`file/notes/n${i}.md`] = { state: "known", rev: "0-old", mtime: 0 };
+    }
+    storeWithRevMap.set("vault-sync-revmap", JSON.stringify(revMap));
+
+    const localVault = new Vault();
+    const localAdapter = new TestVaultAdapter(localVault);
+    const eng = new SyncEngine(makeSettings(), localAdapter, storeWithRevMap, noopTransport);
+    const client = getClient(eng);
+
+    const docRows = Array.from({ length: 10 }, (_, i) => ({
+      id: `file/notes/n${i}.md`, key: `file/notes/n${i}.md`, value: { rev: `1-${i}` },
+    }));
+    client.allDocs.mockResolvedValue({ total_rows: 10, rows: docRows });
+
+    client.allDocsByKeys.mockImplementation(async (keys: string[]) => {
+      return {
+        total_rows: keys.length,
+        rows: keys.map((id) => ({
+          id, key: id, value: { rev: id.includes("n") ? `1-${id.slice(-4, -3)}` : "1-x" },
+          doc: { _id: id, _rev: `1-${id.slice(-4, -3)}`, content: `content of ${id}`, mtime: 1000 },
+        })),
+      };
+    });
+
+    // modifyText / createText awaits 60ms — pathological "apply" cost.
+    // Sequential 10 docs => ~600ms. Parallel by 5 => ~120ms.
+    const origCreate = localVault.create.bind(localVault);
+    localVault.create = async (path: unknown, content: unknown) => {
+      await new Promise((r) => setTimeout(r, 60));
+      return origCreate(path as never, content as never);
+    };
+
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+    client.ensureDb.mockResolvedValue(undefined);
+
+    const t0 = performance.now();
+    await eng.forceFullSync();
+    const elapsed = performance.now() - t0;
+
+    // Parallel-by-5: 10 docs / 5 = 2 chunks, each ~60ms, plus fixed overhead.
+    // Sequential would be ~600ms+. Assert well under that to confirm parallelism.
+    // Allow generous slack for CI variance (200ms cap means parallelism is working).
+    expect(elapsed).toBeLessThan(300);
+
+    // All 10 docs were applied
+    for (let i = 0; i < 10; i++) {
+      expect(localVault.getAbstractFileByPath(`notes/n${i}.md`)).not.toBeNull();
+    }
+    eng.stop();
+  });
+});
+
+describe("built-in exclusions (.vault-sync-state*)", () => {
+  // Issue #55: even after relocating daemon state outside the vault, users with
+  // legacy `.vault-sync-state*` files (including Dropbox/iCloud "conflicted copy"
+  // variants) need protection against re-importing them on next sync. The exclusion
+  // must be BUILT-IN (not user-configurable) — clearing settings.excludePatterns
+  // must NOT disable this protection.
+
+  it("does not push .vault-sync-state.json even when user clears excludePatterns", async () => {
+    const v = new Vault();
+    v._addFile(".vault-sync-state.json", "{\"some\":\"state\"}", 1000);
+    v._addFile("notes/keep.md", "real content", 1000);
+    const va = new TestVaultAdapter(v);
+    const ss = new TestStateStore();
+    // User explicitly cleared all exclude patterns
+    const e = new SyncEngine(makeSettings({ excludePatterns: [] }), va, ss, noopTransport);
+    const client = getClient(e);
+    client.get.mockRejectedValue(new Error("not found"));
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/keep.md", rev: "1-a" }]);
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await e.start();
+
+    const pushedIds: string[] = [];
+    for (const call of client.bulkDocs.mock.calls) {
+      for (const doc of call[0]) pushedIds.push(doc._id);
+    }
+    expect(pushedIds).not.toContain("file/.vault-sync-state.json");
+    expect(pushedIds).toContain("file/notes/keep.md");
+    e.stop();
+  });
+
+  it("does not push Dropbox conflicted-copy variant .vault-sync-state (Guillaume's conflicted copy 2026-05-23).json", async () => {
+    // Literal pathological filename from the production incident (issue #54/#55).
+    const conflictedName = ".vault-sync-state (Guillaume's conflicted copy 2026-05-23).json";
+    const v = new Vault();
+    v._addFile(conflictedName, "{\"phantom\":\"state\"}", 1000);
+    v._addFile("notes/keep.md", "real content", 1000);
+    const va = new TestVaultAdapter(v);
+    const ss = new TestStateStore();
+    const e = new SyncEngine(makeSettings({ excludePatterns: [] }), va, ss, noopTransport);
+    const client = getClient(e);
+    client.get.mockRejectedValue(new Error("not found"));
+    client.allDocs.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.allDocsByKeys.mockResolvedValue({ total_rows: 0, rows: [] });
+    client.bulkDocs.mockResolvedValue([{ ok: true, id: "file/notes/keep.md", rev: "1-a" }]);
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await e.start();
+
+    const pushedIds: string[] = [];
+    for (const call of client.bulkDocs.mock.calls) {
+      for (const doc of call[0]) pushedIds.push(doc._id);
+    }
+    expect(pushedIds).not.toContain(`file/${conflictedName}`);
+    expect(pushedIds).toContain("file/notes/keep.md");
+    e.stop();
+  });
+
+  it("does not pull a remote .vault-sync-state*.json doc to FS", async () => {
+    const v = new Vault();
+    const va = new TestVaultAdapter(v);
+    const ss = new TestStateStore();
+    const e = new SyncEngine(makeSettings({ excludePatterns: [] }), va, ss, noopTransport);
+    const client = getClient(e);
+
+    // Server has a phantom state file (e.g. pushed by a misconfigured peer)
+    const phantomId = "file/.vault-sync-state (conflicted copy).json";
+    client.allDocs.mockResolvedValue({
+      total_rows: 1,
+      rows: [{ id: phantomId, key: phantomId, value: { rev: "1-x" } }],
+    });
+    client.allDocsByKeys.mockResolvedValue({
+      total_rows: 1,
+      rows: [{
+        id: phantomId, key: phantomId, value: { rev: "1-x" },
+        doc: { _id: phantomId, _rev: "1-x", content: "{}", mtime: 1000 },
+      }],
+    });
+    client.changes.mockResolvedValue({ last_seq: "1", results: [] });
+
+    await e.forceFullSync();
+
+    // The phantom file must NOT have been created locally
+    expect(v.getAbstractFileByPath(".vault-sync-state (conflicted copy).json")).toBeNull();
+    e.stop();
   });
 });
 

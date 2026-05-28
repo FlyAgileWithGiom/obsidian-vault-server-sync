@@ -1,4 +1,4 @@
-import { App, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, PluginSettingTab, Setting } from "obsidian";
 import type VaultSyncPlugin from "./main";
 import type { SyncDiagnostics, FullSyncPlan } from "./types";
 
@@ -11,10 +11,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   // Cached <pre> element — reused across renders to avoid DOM teardown on mobile.
   private diagnosticsPre: HTMLElement | null = null;
   private unsubDiagnostics: (() => void) | null = null;
-  // rAF-based coalescing flag: true while a requestAnimationFrame render is queued.
-  // Paint-driven coalescing aligns with the browser render cycle and fires reliably
-  // on iOS WKWebView where setTimeout can stall during engine bursts.
-  private renderRafPending = false;
   private previewEl: HTMLElement | null = null;
 
   constructor(app: App, private plugin: VaultSyncPlugin) {
@@ -22,10 +18,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   }
 
   hide(): void {
-    // Discard any queued rAF render so it doesn't fire after tab close.
-    // The rAF callback captures renderRafPending by closure; resetting the flag
-    // causes the callback to exit early even if the browser fires it late.
-    this.renderRafPending = false;
     // Clean up live update subscription when settings tab is closed.
     if (this.unsubDiagnostics) {
       this.unsubDiagnostics();
@@ -34,14 +26,17 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   }
 
   display(): void {
+    // On iOS Obsidian, vault switches don't reload the plugin (#56). Opening
+    // the settings panel is the natural moment to detect and recover from
+    // engine-vault drift. Fire-and-forget — UI builds immediately and the
+    // engine rebuild notifies diagnostics listeners on its own.
+    this.plugin.refreshIfVaultChanged?.().catch(() => { /* logged in handleSyncError */ });
+
     const { containerEl } = this;
     containerEl.empty();
     // containerEl.empty() destroys the previous <pre>; reset so renderDiagnostics
     // rebuilds the full DOM structure on next call.
     this.diagnosticsPre = null;
-    // Defensive reset: if iOS resume-from-background skipped hide(), a stale
-    // renderRafPending=true would permanently gate the next handler invocation.
-    this.renderRafPending = false;
 
     containerEl.createEl("h2", { text: "Vault Sync Settings" });
 
@@ -169,10 +164,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Force full sync")
-      .setDesc("Reset all sync state and re-fetch everything (destructive — use only after DB swap or to re-evaluate orphans/tombstones)")
+      .setName("Merge with server")
+      .setDesc("Push all local content + pull all server content. Conflicts resolved by last-modified. Local artifacts WILL be pushed to the server. Use when re-evaluating orphans or after DB swap.")
       .addButton((btn) =>
-        btn.setButtonText("Full sync").onClick(async () => {
+        btn.setButtonText("Merge").onClick(async () => {
           btn.setButtonText("Syncing...");
           btn.setDisabled(true);
           try {
@@ -182,9 +177,21 @@ export class VaultSyncSettingTab extends PluginSettingTab {
             btn.setButtonText("Error");
           }
           setTimeout(() => {
-            btn.setButtonText("Full sync");
+            btn.setButtonText("Merge");
             btn.setDisabled(false);
           }, 2000);
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Replace local from server")
+      .setDesc("Delete local files tracked by sync, then re-download from the server. Local files not yet synced will be LOST. Server is source of truth.")
+      .addButton((btn) =>
+        btn.setButtonText("Replace").onClick(() => {
+          const { revMapSize } = this.plugin.getDiagnostics();
+          new ReplaceConfirmModal(this.app, revMapSize, () => {
+            this.plugin.replaceLocalFromServer();
+          }).open();
         })
       );
 
@@ -237,25 +244,19 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     this.renderDiagnostics();
 
     // Subscribe to live updates while settings tab is open.
-    // The engine fires onDiagnosticsChange per-doc during pulls (~20 events/batch).
-    // Coalesce bursts with requestAnimationFrame so at most one render executes per
-    // paint frame. rAF is more reliable than setTimeout on iOS WKWebView, where
-    // timers can stall during heavy engine activity.
+    // Render synchronously on every event — rAF coalescing was removed in #42
+    // because rAF callbacks don't fire during sync on iOS Obsidian either.
+    // The cached <pre> (diagnosticsPre) makes each render a cheap textContent
+    // assignment, so synchronous rendering per event is affordable.
     if (this.unsubDiagnostics) this.unsubDiagnostics();
-    const handler = () => {
-      if (this.renderRafPending) return;
-      this.renderRafPending = true;
-      requestAnimationFrame(() => {
-        this.renderRafPending = false;
-        this.renderDiagnostics();
-      });
-    };
+    const handler = () => this.renderDiagnostics();
     this.plugin.subscribeDiagnostics(handler);
     this.unsubDiagnostics = () => this.plugin.unsubscribeDiagnostics(handler);
   }
 
   private formatDiagnostics(d: SyncDiagnostics): string {
     const lines = [
+      `Version: ${this.plugin.manifest.version}`,
       `Status: ${d.state}`,
       `Running: ${d.running ? "yes" : "no"}`,
       `Tracked docs (revMap): ${d.revMapSize}`,
@@ -266,10 +267,22 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       lines.push(`Pull progress: ${d.pullProgress.fetched} / ${d.pullProgress.total}`);
       lines.push(`Pull applied: ${d.pullApplied}, skipped: ${d.pullSkipped}`);
     }
+    // Always render throughput lines — "0 samples" is diagnostic when text pulls haven't fired yet
+    // (e.g. still in binary phase, or allDocsByKeys throwing). Hiding them when null masked the
+    // instrumentation from the user entirely, making it impossible to distinguish "not shipped"
+    // from "no text pulls ran" (issue #52).
+    const fetchLabel = d.avgFetchMs !== null ? `${Math.round(d.avgFetchMs)} ms` : "--";
+    lines.push(`Avg fetch (text pull): ${fetchLabel} (${d.fetchSampleCount} samples)`);
+    const applyLabel = d.avgApplyMs !== null ? `${Math.round(d.avgApplyMs)} ms` : "--";
+    lines.push(`Avg apply: ${applyLabel} (${d.applySampleCount} samples)`);
+    lines.push(`Unsyncable: ${d.unsyncableCount}`);
+    if (d.unsyncableCount > 0) {
+      lines.push(`Unsyncable sample: ${d.unsyncableSample.join(", ")}`);
+    }
     if (d.lastError) {
       lines.push(`Last error: ${d.lastError}`);
     }
-    // Render timestamp — empirical proof that renders are firing on the device.
+    // Render timestamp -- empirical proof that renders are firing on the device.
     // If this value doesn't update during sync, the render path is broken upstream.
     lines.push(`Last render: ${new Date().toLocaleTimeString()}`);
     return lines.join("\n");
@@ -279,7 +292,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     function fmtBucket(bucket: { count: number; sample: string[] }): string {
       if (bucket.count === 0) return "0";
       const samples = bucket.sample.join(", ");
-      return `${bucket.count} — ${samples}`;
+      return `${bucket.count} -- ${samples}`;
     }
 
     return [
@@ -355,7 +368,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     const text = this.formatDiagnostics(d);
 
     if (this.diagnosticsPre && this.diagnosticsPre.parentElement === this.diagnosticsEl) {
-      // Fast path: element exists and is still attached — just update the text.
+      // Fast path: element exists and is still attached -- just update the text.
       this.diagnosticsPre.textContent = text;
       return;
     }
@@ -400,5 +413,34 @@ export class VaultSyncSettingTab extends PluginSettingTab {
           setTimeout(() => btn.setButtonText("Copy"), 1500);
         })
       );
+  }
+}
+
+/**
+ * Confirmation modal shown before the destructive "Replace local from server" action.
+ * Requires explicit user confirmation before wiping local tracked files.
+ */
+class ReplaceConfirmModal extends Modal {
+  constructor(app: App, private trackedCount: number, private onConfirm: () => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.contentEl.createEl("h3", { text: "Replace local from server" });
+    this.contentEl.createEl("p", {
+      text: `This will delete ${this.trackedCount} local files and re-download them from the server. Local files not yet synced will be lost. Continue?`,
+    });
+    const btnRow = this.contentEl.createDiv({ cls: "modal-button-container" });
+    const cancelBtn = btnRow.createEl("button", { text: "Cancel" });
+    cancelBtn.onclick = () => this.close();
+    const confirmBtn = btnRow.createEl("button", { text: "Yes, replace local", cls: "mod-warning" });
+    confirmBtn.onclick = () => {
+      this.close();
+      this.onConfirm();
+    };
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
   }
 }

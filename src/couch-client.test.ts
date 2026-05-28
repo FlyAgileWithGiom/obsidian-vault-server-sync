@@ -235,5 +235,22 @@ describe("CouchClient", () => {
       const data = new ArrayBuffer(0);
       await expect(new CouchClient(makeSettings(), transport).putAttachment("file/img.png", "data", "1-abc", data, "image/png")).rejects.toThrow(CouchError);
     });
+
+    it("passes timeoutMs to transport.request", async () => {
+      const { transport, mock } = makeTransport(200, { ok: true, id: "file/image.png", rev: "2-xyz" });
+      const data = new ArrayBuffer(4);
+      const client = new CouchClient(makeSettings(), transport);
+      await client.putAttachment("file/image.png", "data.bin", "1-abc", data, "image/png", 30_000);
+      expect(mock.mock.calls[0][0].timeoutMs).toBe(30_000);
+    });
+
+    it("uses BINARY_PUSH_TIMEOUT_MS default when no timeoutMs supplied", async () => {
+      const { transport, mock } = makeTransport(200, { ok: true, id: "file/image.png", rev: "2-xyz" });
+      const data = new ArrayBuffer(4);
+      const client = new CouchClient(makeSettings(), transport);
+      await client.putAttachment("file/image.png", "data.bin", "1-abc", data, "image/png");
+      // Default must be a positive number (the exact constant lives in sync-engine)
+      expect(mock.mock.calls[0][0].timeoutMs).toBeGreaterThan(0);
+    });
   });
 });
