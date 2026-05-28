@@ -186,6 +186,15 @@ describe("resolveStatePath", () => {
     const b = resolveStatePath("/Users/alice/B", "vault-b", { platform: "darwin", home: "/Users/alice" });
     expect(a).not.toBe(b);
   });
+
+  it("stable slug: same couchDbName from different vault roots produces the same state path (cross-run identity)", () => {
+    // Two calls that differ only in vaultRoot but share the same dbName must
+    // resolve to the same path so a daemon restart on the same DB never creates
+    // a duplicate state file (regression guard for issue #54 migration).
+    const first  = resolveStatePath("/Users/alice/VaultA", "my-vault", { platform: "darwin", home: "/Users/alice" });
+    const second = resolveStatePath("/Users/alice/VaultB", "my-vault", { platform: "darwin", home: "/Users/alice" });
+    expect(first).toBe(second);
+  });
 });
 
 describe("migrateStateFile", () => {
