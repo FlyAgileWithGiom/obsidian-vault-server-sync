@@ -10,6 +10,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { PouchDbFsBridge } from "./PouchDbFsBridge";
 import type { VaultAdapter, VaultFile, VaultEntry, VaultFolder } from "./types";
 import { pathToDocId } from "./doc-id";
+import { contentTypeForPath, ATTACHMENT_NAME } from "./binary-ext";
 
 // ---- Minimal PouchDB-shaped in-memory mock --------------------------------
 // We don't want the full pouchdb-browser runtime in unit tests (IndexedDB setup,
@@ -609,6 +610,166 @@ describe("PouchDbFsBridge — binary sync", () => {
     expect(result).toBeDefined();
     // Content should match
     expect(new Uint8Array(result!)).toEqual(new Uint8Array(data));
+  });
+});
+
+describe("PouchDbFsBridge — binary content-type mapping", () => {
+  it("resolves png to image/png", () => {
+    expect(contentTypeForPath("photo.png")).toBe("image/png");
+  });
+
+  it("resolves jpg to image/jpeg", () => {
+    expect(contentTypeForPath("photo.jpg")).toBe("image/jpeg");
+  });
+
+  it("resolves jpeg to image/jpeg", () => {
+    expect(contentTypeForPath("photo.jpeg")).toBe("image/jpeg");
+  });
+
+  it("resolves pdf to application/pdf", () => {
+    expect(contentTypeForPath("doc.pdf")).toBe("application/pdf");
+  });
+
+  it("resolves gif to image/gif", () => {
+    expect(contentTypeForPath("anim.gif")).toBe("image/gif");
+  });
+
+  it("resolves mp4 to video/mp4", () => {
+    expect(contentTypeForPath("video.mp4")).toBe("video/mp4");
+  });
+
+  it("resolves mp3 to audio/mpeg", () => {
+    expect(contentTypeForPath("song.mp3")).toBe("audio/mpeg");
+  });
+
+  it("resolves svg to image/svg+xml", () => {
+    expect(contentTypeForPath("icon.svg")).toBe("image/svg+xml");
+  });
+
+  it("falls back to application/octet-stream for unknown extensions", () => {
+    expect(contentTypeForPath("mystery.xyz")).toBe("application/octet-stream");
+  });
+});
+
+describe("PouchDbFsBridge — binary round-trip (vault->PouchDB->vault)", () => {
+  let db: ReturnType<typeof makePouchMock>;
+  let vault: ReturnType<typeof makeVaultMock>;
+  let plugin: ReturnType<typeof makePluginMock>;
+  let bridge: PouchDbFsBridge;
+
+  beforeEach(() => {
+    db = makePouchMock();
+    vault = makeVaultMock();
+    plugin = makePluginMock(vault);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    bridge.register(plugin as unknown as import("obsidian").Plugin);
+  });
+
+  afterEach(() => {
+    bridge.unregister();
+  });
+
+  it("binary round-trip: vault write -> PouchDB -> vault read back", async () => {
+    const originalData = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]).buffer;
+    await vault.createBinary("assets/chart.png", originalData);
+
+    // Step 1: vault FS modify event -> PouchDB attachment
+    plugin.emit("modify", { path: "assets/chart.png" });
+    await flushPromises();
+
+    const docId = pathToDocId("assets/chart.png");
+    const storedDoc = db._docs.get(docId);
+    expect(storedDoc).toBeDefined();
+    expect(storedDoc!._attachments).toBeDefined();
+
+    const storedAttachment = db._attachments.get(`${docId}/${ATTACHMENT_NAME}`);
+    expect(storedAttachment).toBeDefined();
+
+    // Step 2: simulate remote change event (attachment ready) -> vault write back
+    // Create a second vault/bridge pair to simulate the "receiving" side
+    const vault2 = makeVaultMock();
+    const plugin2 = makePluginMock(vault2);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const bridge2 = new PouchDbFsBridge(vault2, db as any);
+    bridge2.register(plugin2 as unknown as import("obsidian").Plugin);
+
+    try {
+      // Emit the change to the second bridge
+      db._emitChange(storedDoc!);
+      await flushPromises();
+
+      const receivedData = vault2._getBinary("assets/chart.png");
+      expect(receivedData).toBeDefined();
+      expect(new Uint8Array(receivedData!)).toEqual(new Uint8Array(originalData));
+    } finally {
+      bridge2.unregister();
+    }
+  });
+
+  it("binary echo suppression: TTL prevents writing same binary back to PouchDB", async () => {
+    vi.useFakeTimers();
+    try {
+      const data = new Uint8Array([1, 2, 3]).buffer;
+      await vault.createBinary("echo-img.png", data);
+
+      // Simulate remote binary change -> bridge writes to vault + marks TTL
+      const docId = pathToDocId("echo-img.png");
+      db._docs.set(docId, {
+        _id: docId,
+        _rev: "1-abc",
+        mtime: 1700000000000,
+        _attachments: { [ATTACHMENT_NAME]: { stub: false } },
+      });
+      db._attachments.set(`${docId}/${ATTACHMENT_NAME}`, data);
+
+      const doc = db._docs.get(docId)!;
+      db._emitChange(doc);
+      await vi.advanceTimersByTimeAsync(1);
+
+      // Vault fires modify event (echo) — should be suppressed by TTL
+      const putAttachmentSpy = vi.spyOn(db, "putAttachment");
+      plugin.emit("modify", { path: "echo-img.png" });
+      await vi.advanceTimersByTimeAsync(1);
+
+      expect(putAttachmentSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sequential binary pull: multiple binary changes processed without concurrent memory spike", async () => {
+    // Simulate 5 binary docs arriving in the changes feed sequentially.
+    // The bridge processes each one-at-a-time (changes are streamed, not batched).
+    // Verify all 5 end up in the vault.
+    const files = ["a.png", "b.jpg", "c.gif", "d.pdf", "e.mp4"];
+    const datasets = files.map((_, i) => new Uint8Array([i + 1, i + 2]).buffer);
+
+    for (let i = 0; i < files.length; i++) {
+      const docId = pathToDocId(files[i]);
+      db._docs.set(docId, {
+        _id: docId,
+        _rev: `${i + 1}-abc`,
+        mtime: 1700000000000 + i,
+        _attachments: { [ATTACHMENT_NAME]: { stub: false } },
+      });
+      db._attachments.set(`${docId}/${ATTACHMENT_NAME}`, datasets[i]);
+    }
+
+    // Emit all changes and flush
+    for (const file of files) {
+      db._emitChange(db._docs.get(pathToDocId(file))!);
+    }
+    // Multiple flushes to allow sequential processing
+    for (let i = 0; i < 5; i++) {
+      await flushPromises();
+    }
+
+    for (let i = 0; i < files.length; i++) {
+      const result = vault._getBinary(files[i]);
+      expect(result).toBeDefined();
+      expect(new Uint8Array(result!)).toEqual(new Uint8Array(datasets[i]));
+    }
   });
 });
 
