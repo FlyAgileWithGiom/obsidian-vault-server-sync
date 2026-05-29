@@ -34,6 +34,7 @@ interface PouchChangeRow {
     _id: string;
     _rev?: string;
     _deleted?: boolean;
+    _conflicts?: string[];
     _attachments?: Record<string, unknown>;
     content?: string;
     mtime?: number;
@@ -239,7 +240,8 @@ export class PouchDbFsBridge {
     const path = docIdToPath(doc._id);
 
     const docId = doc._id;
-    const docRev = doc._rev ?? "";
+    let docRev = doc._rev ?? "";
+    let resolvedDoc = doc;
 
     // Skip deleted docs — handle tombstone by deleting from vault
     if (doc._deleted || doc.deleted) {
@@ -252,13 +254,21 @@ export class PouchDbFsBridge {
       return;
     }
 
+    // LWW-by-mtime conflict resolution: if PouchDB reports conflicts, pick
+    // the doc with the highest mtime as the winner before writing to vault.
+    if (doc._conflicts && doc._conflicts.length > 0) {
+      const winner = await this.resolveConflictsByMtime(doc);
+      resolvedDoc = winner;
+      docRev = winner._rev ?? docRev;
+    }
+
     if (isBinaryPath(path)) {
-      await this.applyRemoteBinaryChange(doc, path, docRev);
+      await this.applyRemoteBinaryChange(resolvedDoc, path, docRev);
       return;
     }
 
     // Text path
-    const content = typeof doc.content === "string" ? doc.content : null;
+    const content = typeof resolvedDoc.content === "string" ? resolvedDoc.content : null;
     if (content === null) return; // Malformed doc — skip
 
     // Level 2 echo-suppression: content equality guard
@@ -281,6 +291,58 @@ export class PouchDbFsBridge {
     } else {
       await this.vault.createText(path, content);
     }
+  }
+
+  /**
+   * LWW (Last-Write-Wins) conflict resolution by mtime.
+   *
+   * When PouchDB detects conflicts, it picks a winner arbitrarily by _rev string
+   * sort. This method overrides that by fetching all conflict revisions and
+   * picking the one with the highest mtime field. Losing revisions are deleted
+   * from PouchDB so the conflict tree stays clean.
+   *
+   * Called only when change.doc._conflicts is non-empty. Cost: one extra
+   * db.get({open_revs:"all"}) per conflicted doc — negligible in steady state.
+   */
+  private async resolveConflictsByMtime(
+    doc: NonNullable<PouchChangeRow["doc"]>,
+  ): Promise<NonNullable<PouchChangeRow["doc"]>> {
+    const allRevs = (doc._conflicts ?? []).concat(doc._rev ?? []);
+
+    // Fetch all revisions (winner + losing conflict revs)
+    let candidates: NonNullable<PouchChangeRow["doc"]>[];
+    try {
+      const rows = await (this.db as unknown as {
+        get(id: string, opts: { open_revs: string[] }): Promise<Array<{ ok: NonNullable<PouchChangeRow["doc"]> }>>;
+      }).get(doc._id, { open_revs: allRevs });
+      candidates = rows.map(r => r.ok).filter(Boolean);
+    } catch {
+      // If we can't fetch all revs, fall back to the change-feed winner
+      return doc;
+    }
+
+    if (candidates.length === 0) return doc;
+
+    // Pick the candidate with the highest mtime; break ties by _rev lexicographic order
+    const winner = candidates.reduce((best, curr) => {
+      const bestMtime = typeof best.mtime === "number" ? best.mtime : -Infinity;
+      const currMtime = typeof curr.mtime === "number" ? curr.mtime : -Infinity;
+      if (currMtime > bestMtime) return curr;
+      if (currMtime === bestMtime && (curr._rev ?? "") > (best._rev ?? "")) return curr;
+      return best;
+    });
+
+    // Delete all losing revisions so PouchDB's conflict tree stays clean
+    const losers = candidates.filter(c => c._rev !== winner._rev);
+    await Promise.all(
+      losers.map(loser =>
+        this.db.put({ ...loser, _deleted: true } as Parameters<typeof this.db.put>[0]).catch(() => {
+          // If delete fails (e.g., race condition), it's non-fatal — next sync will retry
+        }),
+      ),
+    );
+
+    return winner;
   }
 
   private async applyRemoteBinaryChange(

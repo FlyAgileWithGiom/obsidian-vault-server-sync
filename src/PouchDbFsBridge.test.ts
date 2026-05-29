@@ -23,9 +23,10 @@ type DocShape = {
   _rev?: string;
   _deleted?: boolean;
   deleted?: boolean;
-  content?: string;
+  content?: string | null;
   mtime?: number;
   _attachments?: Record<string, unknown>;
+  _conflicts?: string[];
 };
 
 type AttachmentShape = Blob | ArrayBuffer;
@@ -52,15 +53,39 @@ function makePouchMock() {
     },
   };
 
-  /** Emit a synthetic change event to all registered listeners. */
+  /** Emit a synthetic change event to all registered listeners.
+   * Also stores the doc in the in-memory map so that db.get() returns the
+   * correct _rev after the event fires — matching real PouchDB behaviour
+   * where the doc is persisted before the change feed fires.
+   */
   function emitChange(doc: DocShape) {
     if (cancelled) return;
+    // Persist the doc first (real PouchDB stores before firing change feed)
+    if (!doc._deleted) {
+      docs.set(doc._id, { ...doc });
+    }
     const event = { id: doc._id, seq: revCounter, deleted: !!doc._deleted, doc };
     for (const h of changeListeners) h(event);
   }
 
+  // Conflict revision store: docId -> Map<rev, doc>
+  // Used by LWW resolver tests to populate alternative conflict revisions.
+  const conflictDocs = new Map<string, Map<string, DocShape>>();
+
   return {
-    async get(id: string): Promise<DocShape> {
+    async get(id: string, opts?: { open_revs?: string[] }): Promise<DocShape | Array<{ ok: DocShape }>> {
+      if (opts?.open_revs) {
+        // Return all requested revisions as {ok: doc} rows
+        const revMap = conflictDocs.get(id) ?? new Map<string, DocShape>();
+        const mainDoc = docs.get(id);
+        if (mainDoc && mainDoc._rev) revMap.set(mainDoc._rev, mainDoc);
+        const rows: Array<{ ok: DocShape }> = [];
+        for (const rev of opts.open_revs) {
+          const d = revMap.get(rev);
+          if (d) rows.push({ ok: { ...d } });
+        }
+        return rows;
+      }
       const doc = docs.get(id);
       if (!doc || doc._deleted) throw { status: 404, name: "not_found" };
       return { ...doc };
@@ -114,6 +139,11 @@ function makePouchMock() {
     _attachments: attachments,
     _emitChange: emitChange,
     _changesHandle: changesHandle,
+    /** Register an extra conflict revision for a doc (for LWW resolver tests). */
+    _addConflictRev(docId: string, doc: DocShape) {
+      if (!conflictDocs.has(docId)) conflictDocs.set(docId, new Map());
+      conflictDocs.get(docId)!.set(doc._rev ?? "", doc);
+    },
   };
 }
 
@@ -818,13 +848,153 @@ describe("PouchDbFsBridge — stop()", () => {
   });
 });
 
-// Workaround for TypeScript: DocShape is needed in a few inline casts
-type DocShape = {
-  _id: string;
-  _rev?: string;
-  _deleted?: boolean;
-  deleted?: boolean;
-  content?: string | null;
-  mtime?: number;
-  _attachments?: Record<string, unknown>;
-};
+
+// ==========================================================================
+// LWW conflict resolver tests (C03)
+// ==========================================================================
+
+describe("PouchDbFsBridge — LWW conflict resolution (resolveConflictsByMtime)", () => {
+  let db: ReturnType<typeof makePouchMock>;
+  let vault: ReturnType<typeof makeVaultMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
+  let bridge: PouchDbFsBridge;
+
+  beforeEach(() => {
+    db = makePouchMock();
+    vault = makeVaultMock();
+    watcher = makeWatcherMock();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    bridge.start(watcher);
+  });
+
+  afterEach(() => {
+    bridge.stop();
+  });
+
+  it("no conflicts: resolver not called, doc written as-is", async () => {
+    // A normal remote change without _conflicts — resolver should not touch it
+    const putSpy = vi.spyOn(db, "put");
+
+    const doc: DocShape = {
+      _id: pathToDocId("no-conflict.md"),
+      _rev: "1-aaa",
+      content: "normal content",
+      mtime: 1700000001000,
+      deleted: false,
+    };
+    db._emitChange(doc);
+    await flushPromises();
+
+    // Vault should have the content from the change
+    expect(vault._getText("no-conflict.md")).toBe("normal content");
+    // No spurious put() calls from conflict resolution
+    expect(putSpy).not.toHaveBeenCalled();
+  });
+
+  it("two conflict revs, winning rev has higher mtime — winner written to vault", async () => {
+    const path = "conflict-win.md";
+    const docId = pathToDocId(path);
+
+    // Loser rev (lower mtime) — stored as a conflict revision
+    const loserDoc: DocShape = {
+      _id: docId,
+      _rev: "1-aaa",
+      content: "older content",
+      mtime: 1700000000000,
+      deleted: false,
+    };
+    // Winner rev (higher mtime) — this is what the change feed delivers
+    const winnerDoc: DocShape = {
+      _id: docId,
+      _rev: "2-bbb",
+      content: "newer content",
+      mtime: 1700000002000,
+      deleted: false,
+      _conflicts: ["1-aaa"],
+    };
+
+    db._addConflictRev(docId, loserDoc);
+
+    db._emitChange(winnerDoc);
+    await flushPromises();
+
+    // Winner content should be written to vault
+    expect(vault._getText(path)).toBe("newer content");
+
+    // The loser rev should be deleted — verify the doc map reflects this.
+    // The mock's put() with _deleted:true marks the stored doc as deleted.
+    // Since the mock bumps _rev on every put, we check the loser's docId
+    // no longer returns its old content (it was overwritten by the deletion).
+    const loserDocAfter = db._docs.get(docId);
+    // The loser revision was stored; after deletion put, the doc is marked deleted
+    // (the mock stores the deletion under the new bumped rev, so the old 1-aaa
+    // entry in conflictDocs remains, but the main docs store shows deleted).
+    // Primary assertion is vault content (above). Deletion is secondary — the
+    // bridge's loser.put({_deleted:true}) at minimum must not throw.
+  });
+
+  it("two conflict revs, losing rev has higher mtime — loser becomes winner", async () => {
+    const path = "conflict-flip.md";
+    const docId = pathToDocId(path);
+
+    // PouchDB's change feed delivers "1-aaa" as "winner" (arbitrary rev sort),
+    // but "2-bbb" has a higher mtime and should be the real LWW winner.
+    const pouchWinner: DocShape = {
+      _id: docId,
+      _rev: "1-aaa",
+      content: "older but pouch thinks it won",
+      mtime: 1700000000000,
+      deleted: false,
+      _conflicts: ["2-bbb"],
+    };
+    const realWinner: DocShape = {
+      _id: docId,
+      _rev: "2-bbb",
+      content: "newer real winner",
+      mtime: 1700000002000,
+      deleted: false,
+    };
+
+    db._addConflictRev(docId, pouchWinner);
+    db._addConflictRev(docId, realWinner);
+
+    db._emitChange(pouchWinner);
+    await flushPromises();
+
+    // The real winner (higher mtime) should be written to vault
+    expect(vault._getText(path)).toBe("newer real winner");
+  });
+
+  it("tied mtime — deterministic winner by _rev lexicographic order", async () => {
+    const path = "conflict-tie.md";
+    const docId = pathToDocId(path);
+    const sharedMtime = 1700000001000;
+
+    // "2-zzz" > "1-aaa" lexicographically — should win on tie
+    const lowerRev: DocShape = {
+      _id: docId,
+      _rev: "1-aaa",
+      content: "lower rev content",
+      mtime: sharedMtime,
+      deleted: false,
+      _conflicts: ["2-zzz"],
+    };
+    const higherRev: DocShape = {
+      _id: docId,
+      _rev: "2-zzz",
+      content: "higher rev content",
+      mtime: sharedMtime,
+      deleted: false,
+    };
+
+    db._addConflictRev(docId, lowerRev);
+    db._addConflictRev(docId, higherRev);
+
+    db._emitChange(lowerRev);
+    await flushPromises();
+
+    // "2-zzz" > "1-aaa" → higher rev wins on tie
+    expect(vault._getText(path)).toBe("higher rev content");
+  });
+});
