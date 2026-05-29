@@ -328,6 +328,7 @@ async function mainV2(absVaultRoot: string, settings: VaultSyncSettings): Promis
       console.log(`[vault-sync] Pending: ↑${pendingPush} ↓${pendingPull}`);
     }
   };
+  engine.onNotice = (msg) => console.log(`[vault-sync] ${msg}`);
 
   const statePath = resolveStatePath(absVaultRoot, settings.couchDbName);
   console.log(`[vault-sync] Running converter (state.json -> PouchDB)...`);

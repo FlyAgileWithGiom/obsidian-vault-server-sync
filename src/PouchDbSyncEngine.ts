@@ -25,7 +25,6 @@
  */
 
 import type { Plugin } from "obsidian";
-import { Notice } from "obsidian";
 import type PouchDB from "pouchdb-browser";
 import { ObsidianVaultWatcher } from "./ObsidianVaultWatcher";
 import { PouchDbFsBridge } from "./PouchDbFsBridge";
@@ -52,6 +51,7 @@ export class PouchDbSyncEngine {
   onCountsChange: (counts: SyncCounts) => void = () => {};
   onError: (msg: string) => void = () => {};
   onDiagnosticsChange: () => void = () => {};
+  onNotice: ((msg: string) => void) | undefined = undefined;
 
   private syncHandle: PouchEmitter | null = null;
   private started = false;
@@ -257,13 +257,7 @@ export class PouchDbSyncEngine {
     this.pullTotal = 0;
     this.onDiagnosticsChange();
 
-    // Notice is only available in Obsidian context — guard with try/catch
-    try {
-      new Notice("Vault Sync: Initial sync starting...");
-    } catch {
-      // In daemon mode, Notice is unavailable — log to console instead
-      console.log("[vault-sync] Initial sync starting...");
-    }
+    this.onNotice?.("Vault Sync: Initial sync starting...");
 
     return new Promise<void>((resolve) => {
       const remoteUrl = this.buildRemoteUrl();
@@ -284,11 +278,7 @@ export class PouchDbSyncEngine {
         this.initialPullRunning = false;
         this.syncHandle = null;
         this.cleanupLegacyRevMap();
-        try {
-          new Notice("Vault Sync: Initial sync complete");
-        } catch {
-          console.log("[vault-sync] Initial sync complete");
-        }
+        this.onNotice?.("Vault Sync: Initial sync complete");
         if (this.started) {
           this.startLiveSync();
           this.setState("ok");

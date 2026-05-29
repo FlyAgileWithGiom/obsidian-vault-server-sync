@@ -49,6 +49,9 @@ export default class VaultSyncPlugin extends Plugin {
     this.strategy.onCountsChange = (counts) => this.updateCounts(counts);
     this.strategy.onError = (msg) => this.handleSyncError(msg);
     this.strategy.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    if ("onNotice" in this.strategy) {
+      this.strategy.onNotice = (msg) => new Notice(msg);
+    }
     // Shape b: strategy registers its own vault event handlers
     this.strategy.register(this);
     this.engineVaultName = this.app.vault.getName();
@@ -144,6 +147,9 @@ export default class VaultSyncPlugin extends Plugin {
     this.strategy.onCountsChange = (counts) => this.updateCounts(counts);
     this.strategy.onError = (msg) => this.handleSyncError(msg);
     this.strategy.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    if ("onNotice" in this.strategy) {
+      this.strategy.onNotice = (msg) => new Notice(msg);
+    }
     this.strategy.register(this);
     this.engineVaultName = current;
     this.notifyDiagnosticsListeners();
