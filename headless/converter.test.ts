@@ -334,9 +334,9 @@ describe("Converter — runConverter()", () => {
       expect(fs.existsSync(statePath)).toBe(true);
     });
 
-    it("batches allDocs calls: 250 known entries -> 3 batches (100+100+50)", async () => {
+    it("batches allDocs calls: 250 known entries -> 5 batches (50 each)", async () => {
       // Build 250 known entries: first 200 are phantoms, last 50 exist in CouchDB.
-      // PHANTOM_BATCH_SIZE = 100 → batches: [0..99], [100..199], [200..249]
+      // PHANTOM_BATCH_SIZE = 50 → batches: [0..49], [50..99], [100..149], [150..199], [200..249]
       const revMap: Record<string, unknown> = {};
       const existingIds = new Set<string>();
 
@@ -350,11 +350,11 @@ describe("Converter — runConverter()", () => {
       const remoteDb = makeRemoteMock(existingIds);
       const result = await runConverter(statePath, pouchDir, db as never, false, remoteDb);
 
-      // 3 batches: 100 + 100 + 50
-      expect(remoteDb._batchCalls).toHaveLength(3);
-      expect(remoteDb._batchCalls[0]).toHaveLength(100);
-      expect(remoteDb._batchCalls[1]).toHaveLength(100);
-      expect(remoteDb._batchCalls[2]).toHaveLength(50);
+      // 5 batches of 50 each
+      expect(remoteDb._batchCalls).toHaveLength(5);
+      for (const batch of remoteDb._batchCalls) {
+        expect(batch).toHaveLength(50);
+      }
 
       expect(result.phantomSkipped).toBe(200);
       expect(result.migrated).toBe(50);
@@ -394,6 +394,102 @@ describe("Converter — runConverter()", () => {
 
       expect(result.phantomSkipped).toBe(0);
       expect(result.migrated).toBe(2);
+    });
+
+    // ---- Retry / abort tests ------------------------------------------------
+
+    /**
+     * Build a remote mock that fails the first `failCount` calls then succeeds normally.
+     * Used to simulate transient CouchDB timeouts followed by recovery.
+     */
+    function makeRetryMock(existingIds: Set<string>, failCount: number) {
+      let callCount = 0;
+      const batchCalls: string[][] = [];
+
+      const mock: RemoteDbForPhantomCheck & { _batchCalls: string[][] } = {
+        _batchCalls: batchCalls,
+
+        async allDocs(opts: { keys: string[]; include_docs: false }) {
+          batchCalls.push([...opts.keys]);
+          if (callCount < failCount) {
+            callCount++;
+            throw new Error(`simulated allDocs timeout (attempt ${callCount})`);
+          }
+          callCount++;
+          const rows = opts.keys.map(key =>
+            existingIds.has(key)
+              ? { id: key, key, value: { rev: "1-abc" } }
+              : { key, error: "not_found" },
+          );
+          return { rows };
+        },
+      };
+
+      return mock;
+    }
+
+    it("retries on transient failure and succeeds: batch timeout then success on 2nd attempt", async () => {
+      // Arrange: one real doc, one phantom; allDocs fails once then succeeds
+      const revMap = {
+        "file/real.md": { state: "known", rev: "1-aaa", mtime: 1700000001000 },
+        ".DS_Store":    { state: "known", rev: "1-bbb", mtime: 1700000002000 },
+      };
+      fs.writeFileSync(statePath, makeStateJson(revMap));
+
+      const remoteDb = makeRetryMock(new Set(["file/real.md"]), 1 /* fail once */);
+
+      // Use fake timers to fast-forward the backoff sleep (1s on retry 1)
+      vi.useFakeTimers();
+      const resultPromise = runConverter(statePath, pouchDir, db as never, false, remoteDb);
+      // Advance past the 1s backoff for the first retry
+      await vi.advanceTimersByTimeAsync(1_500);
+      const result = await resultPromise;
+      vi.useRealTimers();
+
+      // Should have succeeded on retry: phantom detected correctly, none migrated by mistake
+      expect(result.phantomSkipped).toBe(1);
+      expect(result.migrated).toBe(1);
+
+      // _batchCalls length = 2: initial attempt (failed) + 1 retry (succeeded)
+      expect(remoteDb._batchCalls).toHaveLength(2);
+
+      // State file renamed (migration completed successfully)
+      expect(fs.existsSync(statePath + ".migrated")).toBe(true);
+    });
+
+    it("aborts converter after 3 retries exhausted: no phantom migrated by mistake", async () => {
+      // Arrange: one phantom entry; allDocs always fails (simulates persistent CouchDB outage)
+      const revMap = {
+        ".DS_Store": { state: "known", rev: "1-aaa", mtime: 1700000001000 },
+      };
+      fs.writeFileSync(statePath, makeStateJson(revMap));
+
+      // Fail more times than PHANTOM_BATCH_MAX_RETRIES (3) allows
+      const remoteDb = makeRetryMock(new Set(), 10 /* always fails */);
+
+      vi.useFakeTimers();
+      const resultPromise = runConverter(statePath, pouchDir, db as never, false, remoteDb);
+
+      // Attach rejection handler BEFORE advancing timers to prevent unhandled rejection.
+      // The promise may settle during advanceTimersByTimeAsync microtask flush.
+      const rejectionAssertion = expect(resultPromise).rejects.toThrow(
+        /phantom check failed for batch.*aborting migration/,
+      );
+
+      // Advance past all backoffs: 1s + 2s + 4s = 7s total
+      await vi.advanceTimersByTimeAsync(10_000);
+      await rejectionAssertion;
+      vi.useRealTimers();
+
+      // Critical: no phantom was migrated to PouchDB
+      expect(db._insertedDocs).toHaveLength(0);
+
+      // state.json NOT renamed — safe to retry when CouchDB recovers
+      expect(fs.existsSync(statePath)).toBe(true);
+      expect(fs.existsSync(statePath + ".migrated")).toBe(false);
+
+      // Total calls: 1 initial + 3 retries = 4 attempts
+      expect(remoteDb._batchCalls).toHaveLength(4);
     });
   });
 });

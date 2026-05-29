@@ -28,12 +28,16 @@ const REVMAP_KEY = "vault-sync-revmap";
 const MIGRATION_MARKER = ".migration-complete";
 /**
  * Batch size for remote allDocs phantom check.
- * 100 ids ≈ ~7 KB body — safe for CouchDB Fly.io which drops large POST bodies.
- * The original plan called for 1000 but Fly.io's CouchDB drops requests >~8 KB.
+ * 50 ids ≈ ~3.5 KB body — reduced from 100 to lower per-request load on
+ * Fly.io CouchDB, which is prone to timeouts under concurrent batch load.
  */
-const PHANTOM_BATCH_SIZE = 100;
-/** Timeout per allDocs batch in ms. CouchDB on Fly.io can be slow under load. */
-const PHANTOM_BATCH_TIMEOUT_MS = 30_000;
+const PHANTOM_BATCH_SIZE = 50;
+/** Timeout per allDocs batch in ms. Increased from 30s to tolerate Fly.io latency spikes. */
+const PHANTOM_BATCH_TIMEOUT_MS = 60_000;
+/** Max retries per batch before aborting the entire converter. */
+const PHANTOM_BATCH_MAX_RETRIES = 3;
+/** Base backoff in ms for phantom batch retries (doubles each attempt: 1s, 2s, 4s). */
+const PHANTOM_BATCH_BACKOFF_MS = 1_000;
 /** Delay between phantom-check batches in ms — avoids rate-limiting on Fly.io CouchDB. */
 const PHANTOM_BATCH_DELAY_MS = 500;
 
@@ -155,23 +159,47 @@ export async function runConverter(
 
     for (let i = 0; i < allIds.length; i += PHANTOM_BATCH_SIZE) {
       const batchIds = allIds.slice(i, i + PHANTOM_BATCH_SIZE);
+      const batchNum = Math.floor(i / PHANTOM_BATCH_SIZE) + 1;
       let rows: Array<{ id?: string; key: string; value?: { rev: string }; error?: string }>;
-      try {
-        const batchPromise = remoteDb.allDocs({ keys: batchIds, include_docs: false });
-        const timeoutPromise = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`allDocs batch timed out after ${PHANTOM_BATCH_TIMEOUT_MS}ms`)), PHANTOM_BATCH_TIMEOUT_MS),
-        );
-        const response = await Promise.race([batchPromise, timeoutPromise]);
-        rows = response.rows as typeof rows;
-      } catch (e) {
-        console.error("[vault-sync] Converter: remote allDocs batch failed:", e);
-        // If we can't check, treat all as non-phantom to be safe (no data loss)
-        existingEntries.push(...knownEntries.slice(i, i + PHANTOM_BATCH_SIZE));
-        continue;
+
+      // Retry loop: up to PHANTOM_BATCH_MAX_RETRIES attempts with exponential backoff.
+      // On exhaustion, abort entirely rather than falling back to "treat as non-phantom"
+      // which would silently migrate unverified entries and risk CouchDB pollution.
+      let lastError: unknown;
+      let succeeded = false;
+      for (let attempt = 0; attempt <= PHANTOM_BATCH_MAX_RETRIES; attempt++) {
+        if (attempt > 0) {
+          const backoffMs = PHANTOM_BATCH_BACKOFF_MS * Math.pow(2, attempt - 1);
+          console.warn(
+            `[vault-sync] Converter: phantom batch ${batchNum} retry ${attempt}/${PHANTOM_BATCH_MAX_RETRIES} ` +
+            `after ${backoffMs}ms (error: ${lastError})`,
+          );
+          await new Promise(r => setTimeout(r, backoffMs));
+        }
+        try {
+          const batchPromise = remoteDb.allDocs({ keys: batchIds, include_docs: false });
+          const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`allDocs batch timed out after ${PHANTOM_BATCH_TIMEOUT_MS}ms`)), PHANTOM_BATCH_TIMEOUT_MS),
+          );
+          const response = await Promise.race([batchPromise, timeoutPromise]);
+          rows = response.rows as typeof rows;
+          succeeded = true;
+          break;
+        } catch (e) {
+          lastError = e;
+        }
       }
 
-      for (let j = 0; j < rows.length; j++) {
-        const row = rows[j];
+      if (!succeeded) {
+        throw new Error(
+          `[vault-sync] Converter: phantom check failed for batch ${batchNum} after ` +
+          `${PHANTOM_BATCH_MAX_RETRIES} retries — aborting migration to avoid CouchDB pollution. ` +
+          `Retry when CouchDB is responsive. Last error: ${lastError}`,
+        );
+      }
+
+      for (let j = 0; j < rows!.length; j++) {
+        const row = rows![j];
         // A row is a phantom if:
         //   - error: "not_found"  → never existed in CouchDB (local-only filtered files)
         //   - value.deleted: true → was pushed then deleted in CouchDB (remotely tombstoned)
