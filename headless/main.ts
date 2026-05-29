@@ -1,18 +1,83 @@
 import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
-import { CustomFetchSyncStrategy } from "../src/sync-engine";
+import * as http from "node:http";
+import * as https from "node:https";
 import { FilesystemVaultAdapter } from "./VaultAdapter";
-import { JsonStateStore } from "./StateStore";
-import { FetchTransport } from "./FetchTransport";
-import type { VaultSyncSettings, VaultFile, VaultEntry } from "../src/types";
+import type { VaultSyncSettings } from "../src/types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "../src/types";
+import type { RemoteDbForPhantomCheck } from "./converter";
 
 /**
- * Legacy state filename, written at vault root before #54.
- * Kept as a constant so the migration path stays unambiguous.
+ * Build a RemoteDbForPhantomCheck that uses node:http or node:https directly.
+ *
+ * pouchdb-node's HTTP adapter hangs on large _all_docs?keys=... POST requests
+ * (keep-alive issues with Fly.io / CouchDB). node:http(s) with explicit
+ * Connection:close avoids the hang. Supports both http:// (localhost, smoke
+ * tests) and https:// (production Fly.io) by selecting the module based on
+ * the URL scheme.
+ *
+ * The rawUrl must include credentials if authentication is required, e.g.:
+ *   http://user:pass@localhost:5986/vault-name
+ *   https://user:pass@couchdb.fly.dev/vault-name
  */
-const LEGACY_STATE_FILENAME = ".vault-sync-state.json";
+export function makeHttpRemoteDb(rawUrl: string): RemoteDbForPhantomCheck {
+  const parsed = new URL(rawUrl);
+  const isHttps = parsed.protocol === "https:";
+  const auth = parsed.username
+    ? `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}`
+    : undefined;
+
+  // Strip credentials from the URL used for the request path
+  const reqUrl = new URL(rawUrl);
+  reqUrl.username = "";
+  reqUrl.password = "";
+  const baseUrl = reqUrl.toString().replace(/\/$/, "");
+
+  return {
+    async allDocs(opts: { keys: string[]; include_docs: false }) {
+      const endpoint = `${baseUrl}/_all_docs?include_docs=false`;
+      const body = JSON.stringify({ keys: opts.keys });
+      const endpointParsed = new URL(endpoint);
+
+      return new Promise((resolve, reject) => {
+        const reqOptions = {
+          hostname: endpointParsed.hostname,
+          port: endpointParsed.port || (isHttps ? 443 : 80),
+          path: endpointParsed.pathname + endpointParsed.search,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+            ...(auth ? { "Authorization": auth } : {}),
+            // Disable keep-alive to avoid socket hang-up on Fly.io CouchDB
+            "Connection": "close",
+          },
+        };
+
+        const transport = isHttps ? https : http;
+        const req = transport.request(reqOptions, (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            try {
+              const json = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+              resolve(json);
+            } catch (e) {
+              reject(new Error(`Failed to parse _all_docs response: ${e}`));
+            }
+          });
+          res.on("error", reject);
+        });
+
+        req.on("error", reject);
+        req.write(body);
+        req.end();
+      });
+    },
+  };
+}
+
 const STATE_FILENAME = "state.json";
 const STATE_APP_DIR = "vault-sync-daemon";
 const CONFIG_FILENAME = VAULT_SYNC_CONFIG_FILE;
@@ -54,49 +119,29 @@ export function resolveStatePath(
 }
 
 /**
- * One-shot migration of the legacy `.vault-sync-state.json` (at vault root) to
- * the new out-of-vault location. Idempotent and safe:
- *  - If no legacy file exists: no-op.
- *  - If only legacy exists: move it to the new location.
- *  - If both exist: KEEP the new file (presumed newer), DELETE the legacy file
- *    so the cloud-sync conflict loop stops generating phantom copies.
+ * Resolve the PouchDB LevelDB directory for the daemon.
  *
- * Never throws on routine I/O errors — best-effort cleanup. The daemon falls
- * back to fresh state if the new location is empty.
+ * Mirrors resolveStatePath() but points to the pouch/ subdirectory.
+ *   macOS  : ~/Library/Application Support/vault-sync-daemon/<dbName>/pouch/
+ *   Linux  : ~/.config/vault-sync-daemon/<dbName>/pouch/
+ *   Windows: %APPDATA%/vault-sync-daemon/<dbName>/pouch/
  */
-export function migrateStateFile(vaultRoot: string, newStatePath: string): void {
-  const legacy = path.join(vaultRoot, LEGACY_STATE_FILENAME);
-  let legacyExists = false;
-  try { legacyExists = fs.statSync(legacy).isFile(); } catch { /* no legacy */ }
-  if (!legacyExists) return;
+export function resolvePouchDir(
+  dbName: string,
+  env: { platform?: NodeJS.Platform; home?: string; appData?: string } = {},
+): string {
+  const platform = env.platform ?? process.platform;
+  const home = env.home ?? os.homedir();
+  const slug = dbName || "default";
 
-  let newExists = false;
-  try { newExists = fs.statSync(newStatePath).isFile(); } catch { /* no new */ }
-
-  if (newExists) {
-    // New location wins. Unlink legacy so it stops being walked & re-conflicted.
-    // Isolated try/catch: a failed unlink here MUST NOT trigger the rename fallback,
-    // which would copy the legacy file over the current state (data loss).
-    try { fs.unlinkSync(legacy); }
-    catch (e) { console.warn(`[vault-sync] State migration: could not remove legacy ${legacy}: ${(e as Error).message}`); }
-    return;
+  if (platform === "darwin") {
+    return path.join(home, "Library", "Application Support", STATE_APP_DIR, slug, "pouch");
   }
-
-  try {
-    fs.mkdirSync(path.dirname(newStatePath), { recursive: true });
-    fs.renameSync(legacy, newStatePath);
-  } catch (e) {
-    // Cross-device rename (EXDEV) or transient I/O — fall back to copy+unlink.
-    // Safe here because the newExists branch returned above: target is absent
-    // so copyFileSync cannot clobber a current state file.
-    try {
-      fs.mkdirSync(path.dirname(newStatePath), { recursive: true });
-      fs.copyFileSync(legacy, newStatePath);
-      fs.unlinkSync(legacy);
-    } catch (inner) {
-      console.warn(`[vault-sync] State migration failed: ${(e as Error).message} / ${(inner as Error).message}`);
-    }
+  if (platform === "win32") {
+    const appData = env.appData ?? process.env.APPDATA ?? path.join(home, "AppData", "Roaming");
+    return path.join(appData, STATE_APP_DIR, slug, "pouch");
   }
+  return path.join(home, ".config", STATE_APP_DIR, slug, "pouch");
 }
 
 /**
@@ -143,72 +188,144 @@ function loadConfig(vaultRoot: string): VaultSyncSettings {
   }
 }
 
-const DEBOUNCE_MS = 100;
+/**
+ * Exported startup sequence for the PouchDB daemon.
+ *
+ * Extracted for testability: allows unit tests to assert that runConverter
+ * completes (on a cold PouchDB) BEFORE bridge.start() arms the changes-feed
+ * and FS watcher. This ordering prevents the init-race where a Dropbox/iCloud
+ * FS event during boot triggers writeTextToPouch → db.put → doc_count > 0,
+ * making the converter believe migration already happened and silently skipping
+ * the seed of 14700+ docs (issue #69).
+ *
+ * @param deps.bridge       Pre-constructed PouchDbFsBridge (not yet started)
+ * @param deps.runConverter Async fn that seeds PouchDB from state.json revMap
+ * @param deps.fsWatcher    Pre-constructed FsWatcher (not yet started)
+ * @param deps.engine       Pre-constructed PouchDbSyncEngine (not yet started)
+ * @param deps.statePath    Path to state.json passed to runConverter
+ * @param deps.pouchDir     PouchDB data dir passed to runConverter
+ * @param deps.db           PouchDB instance passed to runConverter
+ */
+export async function runDaemonV2Startup(deps: {
+  bridge: { start: (watcher: unknown) => void };
+  runConverter: (
+    statePath: string,
+    pouchDir: string,
+    db: unknown,
+    dryRun: boolean,
+    remoteDb: RemoteDbForPhantomCheck,
+  ) => Promise<{
+    noStateFile?: boolean;
+    alreadyMigrated?: boolean;
+    migrated?: number;
+    tombstonedSkipped?: number;
+    orphanSkipped?: number;
+    phantomSkipped?: number;
+  }>;
+  fsWatcher: unknown;
+  engine: { start: () => Promise<void> };
+  statePath: string;
+  pouchDir: string;
+  db: unknown;
+  remoteDb: RemoteDbForPhantomCheck;
+}): Promise<void> {
+  const { bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db, remoteDb } = deps;
 
-export function createWatcher(
-  absVaultRoot: string,
-  excludePatterns: string[],
-  engine: Pick<CustomFetchSyncStrategy, "handleLocalChange" | "handleLocalDelete">,
-): fs.FSWatcher {
-  const debounce = new Map<string, ReturnType<typeof setTimeout>>();
-  // macOS FSEvents emits a spurious event with rawFilename === basename(vaultRoot)
-  const vaultRootBasename = path.basename(absVaultRoot);
+  // CRITICAL: converter MUST run on a cold PouchDB (no other writer active).
+  // Arming the changes-feed or FS watcher before this completes risks a
+  // Dropbox/iCloud FS event triggering writeTextToPouch → db.put → doc_count > 0,
+  // making the converter skip the seed and causing silent partial sync.
+  // remoteDb is required so the phantom filter (C04-bis) actually runs — without
+  // it, phantom entries (.DS_Store, .git/*) would be migrated and pushed to CouchDB.
+  const convResult = await runConverter(statePath, pouchDir, db, false, remoteDb);
+  if (convResult.noStateFile) {
+    console.log("[vault-sync] No state.json found — PouchDB will fresh-pull from CouchDB");
+  } else if (convResult.alreadyMigrated) {
+    console.log("[vault-sync] PouchDB already has docs — skipping migration");
+  } else {
+    console.log(
+      `[vault-sync] Converter: migrated ${convResult.migrated} docs, ` +
+      `${convResult.tombstonedSkipped} tombstoned skipped, ` +
+      `${convResult.orphanSkipped} orphan skipped, ` +
+      `${convResult.phantomSkipped ?? 0} phantom skipped`,
+    );
+  }
 
-  const watcher = fs.watch(absVaultRoot, { recursive: true, persistent: true });
+  // Now arm the changes-feed and FS watcher — PouchDB is fully seeded.
+  bridge.start(fsWatcher);
 
-  watcher.on("change", (eventType: string, rawFilename: string | Buffer | null) => {
-    if (!rawFilename) return;
-    const rel = typeof rawFilename === "string" ? rawFilename : rawFilename.toString("utf-8");
-
-    // Skip spurious self-referential events for the vault root directory itself
-    if (rel === vaultRootBasename) return;
-
-    const filePath = path.join(absVaultRoot, rel);
-
-    if (excludePatterns.some((p) => rel === p || rel.startsWith(p + path.sep))) return;
-
-    const existing = debounce.get(rel);
-    if (existing) clearTimeout(existing);
-    debounce.set(rel, setTimeout(() => {
-      debounce.delete(rel);
-      handleFsEvent(filePath, rel, engine);
-    }, DEBOUNCE_MS));
-  });
-
-  watcher.on("error", (error: Error) => {
-    console.error("[vault-sync] Watcher error:", error);
-  });
-
-  return watcher;
+  // Engine.start() handles isFirstRun() check: if converter migrated docs,
+  // it skips initial pull and goes straight to live sync.
+  await engine.start();
 }
 
-function handleFsEvent(
-  filePath: string,
-  rel: string,
-  engine: Pick<CustomFetchSyncStrategy, "handleLocalChange" | "handleLocalDelete">,
-): void {
-  let stat: ReturnType<typeof fs.statSync> | null = null;
-  try {
-    stat = fs.statSync(filePath);
-  } catch {
-    // Path no longer exists → delete event
-  }
+async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Promise<void> {
+  // PouchDB (pouchdb-node + LevelDB) + PouchDbSyncEngine — the only engine since v2.0 (issue #69).
+  const PouchDB = require("pouchdb-node") as typeof import("pouchdb-node");
+  const { PouchDbFsBridge } = await import("../src/PouchDbFsBridge");
+  const { PouchDbSyncEngine } = await import("../src/PouchDbSyncEngine");
+  const { FsWatcher } = await import("./FsWatcher");
+  const { runConverter } = await import("./converter");
 
-  if (!stat) {
-    const file: VaultEntry = { kind: "file", path: rel, mtime: 0, size: 0 };
-    engine.handleLocalDelete(file);
-    return;
-  }
+  const pouchDir = resolvePouchDir(settings.couchDbName);
+  fs.mkdirSync(pouchDir, { recursive: true });
+  console.log(`[vault-sync] PouchDB dir: ${pouchDir}`);
 
-  if (stat.isDirectory()) return;
+  // Construct pouchdb-node database backed by LevelDB at pouchDir
+  const db = new PouchDB(pouchDir) as unknown as import("../src/pouchdb-browser").default;
 
-  const vaultFile: VaultFile = {
-    kind: "file",
-    path: rel,
-    mtime: stat.mtimeMs,
-    size: stat.size,
+  // Build vault adapter and bridge (bridge not yet started — converter runs first)
+  const vaultAdapter = new FilesystemVaultAdapter(absVaultRoot);
+  const bridge = new PouchDbFsBridge(vaultAdapter, db);
+
+  const excludePatterns = [STATE_FILENAME, CONFIG_FILENAME, ".git", ...settings.excludePatterns];
+  const fsWatcher = new FsWatcher(absVaultRoot, excludePatterns);
+
+  // Build engine with injected db and bridge
+  const engine = new PouchDbSyncEngine(settings, db, bridge);
+
+  engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
+  engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);
+  engine.onCountsChange = ({ pendingPush, pendingPull }) => {
+    if (pendingPush > 0 || pendingPull > 0) {
+      console.log(`[vault-sync] Pending: ↑${pendingPush} ↓${pendingPull}`);
+    }
   };
-  engine.handleLocalChange(vaultFile);
+  engine.onNotice = (msg) => console.log(`[vault-sync] ${msg}`);
+
+  const statePath = resolveStatePath(absVaultRoot, settings.couchDbName);
+  console.log(`[vault-sync] Running converter (state.json -> PouchDB)...`);
+
+  // Build the remoteDb adapter for the phantom check (C04-bis).
+  // Uses node:http(s) directly instead of pouchdb-node's HTTP adapter, which
+  // hangs on _all_docs POST requests under Fly.io CouchDB (keep-alive issue).
+  // This covers localhost:5986 (smoke/http) and production Fly.io (https).
+  const { couchDbUrl, couchDbName, couchDbUser, couchDbPassword } = settings;
+  const base = couchDbUrl.replace(/\/$/, "");
+  const proto = base.startsWith("https://") ? "https://" : "http://";
+  const host = base.slice(proto.length);
+  const authPart = (couchDbUser && couchDbPassword)
+    ? `${encodeURIComponent(couchDbUser)}:${encodeURIComponent(couchDbPassword)}@`
+    : "";
+  const remoteDbUrl = `${proto}${authPart}${host}/${couchDbName}`;
+  const remoteDb = makeHttpRemoteDb(remoteDbUrl);
+  console.log(`[vault-sync] Phantom check remote: ${proto}${host}/${couchDbName}`);
+
+  // Delegate ordering logic to runDaemonV2Startup (converter first, then bridge.start)
+  await runDaemonV2Startup({ bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db, remoteDb });
+
+  // Graceful shutdown
+  function shutdown(signal: string): void {
+    console.log(`\n[vault-sync] Received ${signal}, shutting down...`);
+    engine.stop();
+    fsWatcher.stop();
+    process.exit(0);
+  }
+
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  console.log("[vault-sync] Daemon (PouchDB) running. Press Ctrl+C to stop.");
 }
 
 async function main(): Promise<void> {
@@ -218,53 +335,10 @@ async function main(): Promise<void> {
   console.log(`[vault-sync] Starting headless daemon for vault: ${absVaultRoot}`);
 
   const settings = loadConfig(absVaultRoot);
-  const vaultAdapter = new FilesystemVaultAdapter(absVaultRoot);
 
-  // State now lives outside the vault to avoid Dropbox/iCloud conflict-copy
-  // loops (issue #54). Migrate any legacy in-vault file on first run.
-  const statePath = resolveStatePath(absVaultRoot, settings.couchDbName);
-  migrateStateFile(absVaultRoot, statePath);
-  console.log(`[vault-sync] State file: ${statePath}`);
-  const stateStore = new JsonStateStore(statePath);
-
-  const transport = new FetchTransport();
-
-  const engine = new CustomFetchSyncStrategy(settings, vaultAdapter, stateStore, transport);
-
-  engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
-  engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);
-  engine.onCountsChange = ({ pendingPush, pendingPull }) => {
-    if (pendingPush > 0 || pendingPull > 0) {
-      console.log(`[vault-sync] Pending: ↑${pendingPush} ↓${pendingPull}`);
-    }
-  };
-
-  // Start initial sync
-  await engine.start();
-
-  // Watch filesystem for local changes
-  // Exclude state file and config file from watching to prevent echo loops
-  const excludePatterns = [
-    STATE_FILENAME,
-    CONFIG_FILENAME,
-    ".git",
-    ...settings.excludePatterns,
-  ];
-
-  const watcher = createWatcher(absVaultRoot, excludePatterns, engine);
-
-  // Graceful shutdown
-  function shutdown(signal: string): void {
-    console.log(`\n[vault-sync] Received ${signal}, shutting down...`);
-    engine.stop();
-    watcher.close();
-    process.exit(0);
-  }
-
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-  console.log("[vault-sync] Daemon running. Press Ctrl+C to stop.");
+  // PouchDB is the only sync engine since v2.0 (issue #69). The former DAEMON_V2
+  // env flag is now a no-op — kept harmless for operators who still set it.
+  await runDaemon(absVaultRoot, settings);
 }
 
 // Only auto-run when executed as the entry point (dist/headless.js or headless/main.ts),

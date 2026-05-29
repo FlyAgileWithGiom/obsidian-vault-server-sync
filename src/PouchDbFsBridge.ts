@@ -1,22 +1,29 @@
 /**
- * PouchDbFsBridge — bidirectional bridge between Obsidian vault FS and local PouchDB.
+ * PouchDbFsBridge — bidirectional bridge between vault FS and local PouchDB.
  *
- * Instantiated by PouchDbSyncStrategy. Responsible for:
- * - Vault events (modify/create/delete/rename) -> local PouchDB writes
+ * Platform-neutral: no Obsidian Plugin reference. Accepts a VaultWatcher port
+ * (ObsidianVaultWatcher on plugin side, FsWatcher on daemon side).
+ *
+ * Responsible for:
+ * - Vault events (change/delete) via VaultWatcher -> local PouchDB writes
  * - PouchDB change events -> vault FS writes
- * - Echo-loop suppression (Level 1: TTL cache, Level 2: content equality)
+ * - Echo-loop suppression:
+ *     Level 1: in-memory Map<docId, appliedRev> with 5s TTL
+ *       Stored BEFORE vault write so the sentinel is always in memory
+ *       when the FS event arrives (FSEvents latency is 50-200ms).
+ *     Level 2: content equality check (text only, no read for binary)
  * - Parent directory creation before vault FS writes
  *
  * The strategy handles the actual CouchDB replication (db.sync). This bridge
  * only cares about the local PouchDB <-> vault FS boundary.
  */
 
-import type { Plugin, EventRef } from "obsidian";
-import type { VaultAdapter, VaultEntry } from "./types";
+import type { VaultAdapter } from "./types";
 import { buildTextDoc, buildBinaryDocMeta } from "./doc-builder";
 import { docIdToPath, pathToDocId, DOC_PREFIX } from "./doc-id";
-import { isBinaryPath, ATTACHMENT_NAME, CONTENT_TYPE_MAP, contentTypeForPath } from "./binary-ext";
+import { isBinaryPath, ATTACHMENT_NAME, contentTypeForPath } from "./binary-ext";
 import type PouchDB from "pouchdb-browser";
+import type { VaultWatcher, FileEvent } from "./WatcherAdapter";
 
 // Shape of a PouchDB change row from db.changes()
 interface PouchChangeRow {
@@ -27,6 +34,7 @@ interface PouchChangeRow {
     _id: string;
     _rev?: string;
     _deleted?: boolean;
+    _conflicts?: string[];
     _attachments?: Record<string, unknown>;
     content?: string;
     mtime?: number;
@@ -34,12 +42,19 @@ interface PouchChangeRow {
   };
 }
 
+/** TTL for the appliedRevs sentinel (ms). Clears after this delay. */
+const APPLIED_REV_TTL_MS = 5000;
+
 export class PouchDbFsBridge {
-  private plugin: Plugin | null = null;
-  private eventRefs: EventRef[] = [];
-  /** Level 1 echo-suppression: paths recently written by bridge -> vault, with write timestamp. */
-  private recentRemotePaths: Map<string, number> = new Map();
-  /** Handle for the PouchDB changes listener, so it can be cancelled on unregister. */
+  private watcher: VaultWatcher | null = null;
+  /**
+   * Level 1 echo-suppression: docId -> _rev for docs the bridge just wrote to the FS.
+   * Stored BEFORE vault.write() (synchronously) so the sentinel is always present
+   * when the FS watcher fires (FSEvents latency 50-200ms, Node.js single-threaded).
+   * TTL cleared after APPLIED_REV_TTL_MS to avoid stale suppression of genuine edits.
+   */
+  private appliedRevs: Map<string, string> = new Map();
+  /** Handle for the PouchDB changes listener, so it can be cancelled on stop. */
   private changesHandle: { cancel(): void } | null = null;
 
   constructor(
@@ -49,47 +64,20 @@ export class PouchDbFsBridge {
 
   /**
    * Wire vault event handlers and start listening to PouchDB changes.
-   * Called by PouchDbSyncStrategy.register(plugin).
+   * Replaces the old register(plugin) API — no Obsidian Plugin reference needed.
    */
-  register(plugin: Plugin): void {
-    this.plugin = plugin;
-    const vaultObj = plugin.app.vault;
-
-    const addEvent = (ref: EventRef) => {
-      plugin.registerEvent(ref);
-      this.eventRefs.push(ref);
-    };
-
-    addEvent(
-      vaultObj.on("modify", (file) => this.onVaultModify(file))
-    );
-    addEvent(
-      vaultObj.on("create", (file) => this.onVaultModify(file))
-    );
-    addEvent(
-      vaultObj.on("delete", (file) => this.onVaultDelete(file))
-    );
-    addEvent(
-      vaultObj.on("rename", (file, oldPath) => this.onVaultRename(file, oldPath as string))
-    );
-
-    // Start listening to PouchDB changes (live, from current seq)
+  start(watcher: VaultWatcher): void {
+    this.watcher = watcher;
+    watcher.start((event: FileEvent) => this.onVaultEvent(event));
     this.startChangesListener();
   }
 
   /** Stop all event handlers and the PouchDB changes listener. */
-  unregister(): void {
-    if (this.plugin) {
-      const vaultObj = this.plugin.app.vault as typeof this.plugin.app.vault & { offref?: (ref: EventRef) => void };
-      if (vaultObj.offref) {
-        for (const ref of this.eventRefs) {
-          vaultObj.offref(ref);
-        }
-      }
-      this.eventRefs = [];
-      this.plugin = null;
+  stop(): void {
+    if (this.watcher) {
+      this.watcher.stop();
+      this.watcher = null;
     }
-
     if (this.changesHandle) {
       this.changesHandle.cancel();
       this.changesHandle = null;
@@ -98,38 +86,64 @@ export class PouchDbFsBridge {
 
   // --- Vault -> PouchDB ---
 
-  private onVaultModify(file: { path: string }): void {
-    const entry = this.vault.getEntryByPath(file.path);
+  private onVaultEvent(event: FileEvent): void {
+    if (event.type === "delete") {
+      const docId = pathToDocId(event.path);
+      // For deletes, check the sentinel too: if bridge just applied a remote
+      // deletion (rare), avoid re-deleting. Sentinel uses empty string for deletes.
+      if (this.appliedRevs.get(docId) === "") return;
+      this.markDeletedInPouch(docId).catch(() => {/* non-critical */});
+      return;
+    }
+
+    // "change" event
+    const entry = this.vault.getEntryByPath(event.path);
     if (!entry || entry.kind !== "file") return;
 
-    // Check echo-suppression Level 1: recently written by bridge
-    const cached = this.recentRemotePaths.get(file.path);
-    if (cached !== undefined && Math.abs(Date.now() - cached) < 3000) return;
+    // Level 1 echo-suppression: compare the bridge's last-applied _rev against
+    // the current doc _rev. If they match, this FS event is an echo of a remote
+    // write the bridge just applied — skip it.
+    const docId = pathToDocId(event.path);
+    const sentinelRev = this.appliedRevs.get(docId);
+    if (sentinelRev !== undefined) {
+      // Sentinel present — check rev asynchronously to confirm it's an echo
+      this.suppressIfEcho(docId, sentinelRev, event.path, entry).catch(() => {});
+      return;
+    }
 
-    if (isBinaryPath(file.path)) {
-      // Binary path: handled in commit 8 extension
-      this.writeBinaryToPouch(entry).catch(() => {/* non-critical, will retry on next change */});
+    if (isBinaryPath(event.path)) {
+      this.writeBinaryToPouch(entry).catch(() => {/* non-critical */});
     } else {
       this.writeTextToPouch(entry).catch(() => {/* non-critical */});
     }
   }
 
-  private onVaultDelete(file: { path: string }): void {
-    const docId = pathToDocId(file.path);
-    this.markDeletedInPouch(docId).catch(() => {/* non-critical */});
-  }
-
-  private onVaultRename(file: { path: string }, oldPath: string): void {
-    // Treat rename as: delete old doc, create new doc
-    const oldDocId = pathToDocId(oldPath);
-    this.markDeletedInPouch(oldDocId).catch(() => {});
-    const entry = this.vault.getEntryByPath(file.path);
-    if (entry && entry.kind === "file") {
-      if (isBinaryPath(file.path)) {
-        this.writeBinaryToPouch(entry).catch(() => {});
-      } else {
-        this.writeTextToPouch(entry).catch(() => {});
+  /**
+   * Check if a vault change event is an echo of a bridge-applied remote write.
+   * Called only when appliedRevs has an entry for the docId (Level 1 sentinel).
+   * If the current PouchDB _rev matches the applied rev, it's an echo — skip.
+   * If _rev differs, it's a genuine concurrent edit — forward to PouchDB.
+   */
+  private async suppressIfEcho(
+    docId: string,
+    sentinelRev: string,
+    path: string,
+    entry: import("./types").VaultFile,
+  ): Promise<void> {
+    try {
+      const current = await this.db.get(docId);
+      if (current._rev === sentinelRev) {
+        return; // Echo confirmed: this is the rev the bridge just applied
       }
+      // Rev differs: genuine concurrent edit — write to PouchDB
+    } catch {
+      // Doc gone or DB error — treat as genuine edit
+    }
+
+    if (isBinaryPath(path)) {
+      this.writeBinaryToPouch(entry).catch(() => {/* non-critical */});
+    } else {
+      this.writeTextToPouch(entry).catch(() => {/* non-critical */});
     }
   }
 
@@ -225,24 +239,36 @@ export class PouchDbFsBridge {
     if (!doc._id.startsWith(DOC_PREFIX)) return;
     const path = docIdToPath(doc._id);
 
+    const docId = doc._id;
+    let docRev = doc._rev ?? "";
+    let resolvedDoc = doc;
+
     // Skip deleted docs — handle tombstone by deleting from vault
     if (doc._deleted || doc.deleted) {
       const entry = this.vault.getEntryByPath(path);
       if (entry && entry.kind === "file") {
-        this.markRemoteWrite(path);
+        // Sentinel: empty string marks "bridge applied a delete for this docId"
+        this.setAppliedRev(docId, "");
         await this.vault.deleteFile(entry);
       }
       return;
     }
 
+    // LWW-by-mtime conflict resolution: if PouchDB reports conflicts, pick
+    // the doc with the highest mtime as the winner before writing to vault.
+    if (doc._conflicts && doc._conflicts.length > 0) {
+      const winner = await this.resolveConflictsByMtime(doc);
+      resolvedDoc = winner;
+      docRev = winner._rev ?? docRev;
+    }
+
     if (isBinaryPath(path)) {
-      // Binary path: handled in commit 8 extension
-      await this.applyRemoteBinaryChange(doc, path);
+      await this.applyRemoteBinaryChange(resolvedDoc, path, docRev);
       return;
     }
 
     // Text path
-    const content = typeof doc.content === "string" ? doc.content : null;
+    const content = typeof resolvedDoc.content === "string" ? resolvedDoc.content : null;
     if (content === null) return; // Malformed doc — skip
 
     // Level 2 echo-suppression: content equality guard
@@ -255,8 +281,10 @@ export class PouchDbFsBridge {
     // Ensure parent directory exists
     await this.ensureParentDirectory(path);
 
-    // Mark as remote write BEFORE writing to suppress vault event echo
-    this.markRemoteWrite(path);
+    // Set Level 1 sentinel BEFORE vault write.
+    // FSEvents fires 50-200ms after the write; Node.js single-threaded so this
+    // is always in memory before the FS event handler runs.
+    this.setAppliedRev(docId, docRev);
 
     if (existingEntry && existingEntry.kind === "file") {
       await this.vault.modifyText(existingEntry, content);
@@ -265,21 +293,72 @@ export class PouchDbFsBridge {
     }
   }
 
+  /**
+   * LWW (Last-Write-Wins) conflict resolution by mtime.
+   *
+   * When PouchDB detects conflicts, it picks a winner arbitrarily by _rev string
+   * sort. This method overrides that by fetching all conflict revisions and
+   * picking the one with the highest mtime field. Losing revisions are deleted
+   * from PouchDB so the conflict tree stays clean.
+   *
+   * Called only when change.doc._conflicts is non-empty. Cost: one extra
+   * db.get({open_revs:"all"}) per conflicted doc — negligible in steady state.
+   */
+  private async resolveConflictsByMtime(
+    doc: NonNullable<PouchChangeRow["doc"]>,
+  ): Promise<NonNullable<PouchChangeRow["doc"]>> {
+    const allRevs = (doc._conflicts ?? []).concat(doc._rev ?? []);
+
+    // Fetch all revisions (winner + losing conflict revs)
+    let candidates: NonNullable<PouchChangeRow["doc"]>[];
+    try {
+      const rows = await (this.db as unknown as {
+        get(id: string, opts: { open_revs: string[] }): Promise<Array<{ ok: NonNullable<PouchChangeRow["doc"]> }>>;
+      }).get(doc._id, { open_revs: allRevs });
+      candidates = rows.map(r => r.ok).filter(Boolean);
+    } catch {
+      // If we can't fetch all revs, fall back to the change-feed winner
+      return doc;
+    }
+
+    if (candidates.length === 0) return doc;
+
+    // Pick the candidate with the highest mtime; break ties by _rev lexicographic order
+    const winner = candidates.reduce((best, curr) => {
+      const bestMtime = typeof best.mtime === "number" ? best.mtime : -Infinity;
+      const currMtime = typeof curr.mtime === "number" ? curr.mtime : -Infinity;
+      if (currMtime > bestMtime) return curr;
+      if (currMtime === bestMtime && (curr._rev ?? "") > (best._rev ?? "")) return curr;
+      return best;
+    });
+
+    // Delete all losing revisions so PouchDB's conflict tree stays clean
+    const losers = candidates.filter(c => c._rev !== winner._rev);
+    await Promise.all(
+      losers.map(loser =>
+        this.db.put({ ...loser, _deleted: true } as Parameters<typeof this.db.put>[0]).catch(() => {
+          // If delete fails (e.g., race condition), it's non-fatal — next sync will retry
+        }),
+      ),
+    );
+
+    return winner;
+  }
+
   private async applyRemoteBinaryChange(
     doc: NonNullable<PouchChangeRow["doc"]>,
     path: string,
+    docRev: string,
   ): Promise<void> {
     // Check if this doc has an attachment
     if (!doc._attachments || !doc._attachments[ATTACHMENT_NAME]) return;
 
     const existingEntry = this.vault.getEntryByPath(path);
 
-    // Level 1 echo-suppression only (no content equality for binary — too expensive)
-    const cached = this.recentRemotePaths.get(path);
-    if (cached !== undefined && Math.abs(Date.now() - cached) < 3000) return;
-
     await this.ensureParentDirectory(path);
-    this.markRemoteWrite(path);
+
+    // Set Level 1 sentinel BEFORE vault write (binary has no content equality check).
+    this.setAppliedRev(doc._id, docRev);
 
     const blob = await this.db.getAttachment(doc._id, ATTACHMENT_NAME);
     const buffer = blob instanceof Blob
@@ -293,9 +372,18 @@ export class PouchDbFsBridge {
     }
   }
 
-  private markRemoteWrite(path: string): void {
-    this.recentRemotePaths.set(path, Date.now());
-    setTimeout(() => this.recentRemotePaths.delete(path), 3000);
+  /**
+   * Record that the bridge applied _rev for docId to the vault FS.
+   * The sentinel is cleared after APPLIED_REV_TTL_MS to avoid stale suppression.
+   */
+  private setAppliedRev(docId: string, rev: string): void {
+    this.appliedRevs.set(docId, rev);
+    setTimeout(() => {
+      // Only clear if the rev hasn't been updated by a newer remote write
+      if (this.appliedRevs.get(docId) === rev) {
+        this.appliedRevs.delete(docId);
+      }
+    }, APPLIED_REV_TTL_MS);
   }
 
   private async ensureParentDirectory(filePath: string): Promise<void> {

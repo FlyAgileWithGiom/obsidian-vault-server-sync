@@ -1,15 +1,39 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { Plugin, Vault, TFile } from "./__mocks__/obsidian";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
-import { CustomFetchSyncStrategy as SyncEngine } from "./sync-engine";
+// Since v2.0 (issue #69) the plugin constructs PouchDbSyncEngine on every platform.
+// The `SyncEngine` alias keeps the engine-agnostic test bodies below unchanged.
+import { PouchDbSyncEngine as SyncEngine } from "./PouchDbSyncEngine";
 
 // Import the plugin class — obsidian is aliased to the mock via vitest.config.ts
 import VaultSyncPlugin from "./main";
 
-// The plugin uses syncEngine?.updateSettings — mock it so saveSettings doesn't throw
-// when syncEngine is not initialised.
-vi.mock("./sync-engine", () => ({
-  CustomFetchSyncStrategy: vi.fn().mockImplementation(() => ({
+vi.mock("./settings-tab", () => ({
+  VaultSyncSettingTab: vi.fn().mockImplementation(() => ({})),
+}));
+
+// Mock pouchdb-browser to avoid loading the real bundle in the node test env
+vi.mock("pouchdb-browser", () => ({
+  default: vi.fn().mockImplementation(() => ({
+    sync: vi.fn().mockReturnValue({ on: vi.fn().mockReturnThis(), cancel: vi.fn() }),
+    replicate: { from: vi.fn().mockReturnValue({ on: vi.fn().mockReturnThis(), cancel: vi.fn() }) },
+    info: vi.fn().mockResolvedValue({ doc_count: 0, update_seq: 0, db_name: "test" }),
+    destroy: vi.fn().mockResolvedValue(undefined),
+  })),
+}));
+
+vi.mock("./PouchDbFsBridge", () => ({
+  PouchDbFsBridge: vi.fn().mockImplementation(() => ({
+    start: vi.fn(),
+    stop: vi.fn(),
+  })),
+}));
+
+// The plugin calls engine.updateSettings/forceFullSync/etc. — mock the engine so
+// onload() runs without touching real PouchDB and so the test bodies can assert
+// against the constructed instance via vi.mocked(SyncEngine).mock.results.
+vi.mock("./PouchDbSyncEngine", () => ({
+  PouchDbSyncEngine: vi.fn().mockImplementation(() => ({
     isRunning: vi.fn().mockReturnValue(false),
     start: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn(),
@@ -25,20 +49,11 @@ vi.mock("./sync-engine", () => ({
     onCountsChange: null,
     onError: null,
     onDiagnosticsChange: null,
+    onNotice: null,
     getDiagnostics: vi.fn().mockReturnValue({}),
     replaceLocalFromServer: vi.fn().mockResolvedValue(undefined),
     planFullSync: vi.fn().mockResolvedValue({}),
   })),
-}));
-
-vi.mock("./couch-client", () => ({
-  CouchClient: vi.fn().mockImplementation(() => ({
-    ping: vi.fn().mockResolvedValue(true),
-  })),
-}));
-
-vi.mock("./settings-tab", () => ({
-  VaultSyncSettingTab: vi.fn().mockImplementation(() => ({})),
 }));
 
 /**

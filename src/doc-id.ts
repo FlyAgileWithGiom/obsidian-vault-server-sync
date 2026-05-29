@@ -1,7 +1,8 @@
 /**
- * CouchDB doc ID helpers shared between CustomFetchSyncStrategy and
- * PouchDbFsBridge. Extracted to ensure identical path encoding on both
- * sides, preventing duplicate docs for the same file.
+ * CouchDB doc ID helpers used by PouchDbFsBridge — the single bridge that
+ * backs both the Obsidian plugin (pouchdb-browser) and the headless daemon
+ * (pouchdb-node). Centralising the encoding here guarantees plugin and daemon
+ * produce identical doc IDs, preventing duplicate docs for the same file.
  *
  * Convention: "file/<NFC-normalized-path>"
  * NFC normalization is critical: macOS HFS+/APFS stores filenames in NFD,

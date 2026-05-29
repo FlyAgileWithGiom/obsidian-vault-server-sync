@@ -217,27 +217,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 
     this.previewEl = containerEl.createEl("div", { cls: "vault-sync-preview" });
 
-    // --- Advanced section (hidden by default, for testing / rollback) ---
-    const advancedDetails = containerEl.createEl("details", { cls: "vault-sync-advanced" });
-    advancedDetails.createEl("summary", { text: "Advanced" });
-
-    new Setting(advancedDetails)
-      .setName("Sync strategy")
-      .setDesc(
-        "Change only if instructed. 'Auto' uses PouchDB on iOS, custom engine on desktop."
-      )
-      .addDropdown((dropdown) =>
-        dropdown
-          .addOption("auto", "Auto (recommended)")
-          .addOption("custom", "Custom fetch (legacy/rollback)")
-          .addOption("pouchdb", "PouchDB")
-          .setValue(this.plugin.settings.syncStrategy ?? "auto")
-          .onChange(async (value) => {
-            this.plugin.settings.syncStrategy = value as 'auto' | 'custom' | 'pouchdb';
-            await this.plugin.saveSettings();
-          })
-      );
-
     // --- Diagnostics section (provides observability on mobile) ---
     containerEl.createEl("h3", { text: "Diagnostics" });
     this.diagnosticsEl = containerEl.createEl("div", { cls: "vault-sync-diagnostics" });

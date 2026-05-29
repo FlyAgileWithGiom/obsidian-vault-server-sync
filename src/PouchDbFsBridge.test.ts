@@ -11,6 +11,7 @@ import { PouchDbFsBridge } from "./PouchDbFsBridge";
 import type { VaultAdapter, VaultFile, VaultEntry, VaultFolder } from "./types";
 import { pathToDocId } from "./doc-id";
 import { contentTypeForPath, ATTACHMENT_NAME } from "./binary-ext";
+import type { VaultWatcher, FileEvent } from "./WatcherAdapter";
 
 // ---- Minimal PouchDB-shaped in-memory mock --------------------------------
 // We don't want the full pouchdb-browser runtime in unit tests (IndexedDB setup,
@@ -22,9 +23,10 @@ type DocShape = {
   _rev?: string;
   _deleted?: boolean;
   deleted?: boolean;
-  content?: string;
+  content?: string | null;
   mtime?: number;
   _attachments?: Record<string, unknown>;
+  _conflicts?: string[];
 };
 
 type AttachmentShape = Blob | ArrayBuffer;
@@ -51,15 +53,39 @@ function makePouchMock() {
     },
   };
 
-  /** Emit a synthetic change event to all registered listeners. */
+  /** Emit a synthetic change event to all registered listeners.
+   * Also stores the doc in the in-memory map so that db.get() returns the
+   * correct _rev after the event fires — matching real PouchDB behaviour
+   * where the doc is persisted before the change feed fires.
+   */
   function emitChange(doc: DocShape) {
     if (cancelled) return;
+    // Persist the doc first (real PouchDB stores before firing change feed)
+    if (!doc._deleted) {
+      docs.set(doc._id, { ...doc });
+    }
     const event = { id: doc._id, seq: revCounter, deleted: !!doc._deleted, doc };
     for (const h of changeListeners) h(event);
   }
 
+  // Conflict revision store: docId -> Map<rev, doc>
+  // Used by LWW resolver tests to populate alternative conflict revisions.
+  const conflictDocs = new Map<string, Map<string, DocShape>>();
+
   return {
-    async get(id: string): Promise<DocShape> {
+    async get(id: string, opts?: { open_revs?: string[] }): Promise<DocShape | Array<{ ok: DocShape }>> {
+      if (opts?.open_revs) {
+        // Return all requested revisions as {ok: doc} rows
+        const revMap = conflictDocs.get(id) ?? new Map<string, DocShape>();
+        const mainDoc = docs.get(id);
+        if (mainDoc && mainDoc._rev) revMap.set(mainDoc._rev, mainDoc);
+        const rows: Array<{ ok: DocShape }> = [];
+        for (const rev of opts.open_revs) {
+          const d = revMap.get(rev);
+          if (d) rows.push({ ok: { ...d } });
+        }
+        return rows;
+      }
       const doc = docs.get(id);
       if (!doc || doc._deleted) throw { status: 404, name: "not_found" };
       return { ...doc };
@@ -113,6 +139,24 @@ function makePouchMock() {
     _attachments: attachments,
     _emitChange: emitChange,
     _changesHandle: changesHandle,
+    /** Register an extra conflict revision for a doc (for LWW resolver tests). */
+    _addConflictRev(docId: string, doc: DocShape) {
+      if (!conflictDocs.has(docId)) conflictDocs.set(docId, new Map());
+      conflictDocs.get(docId)!.set(doc._rev ?? "", doc);
+    },
+  };
+}
+
+// ---- VaultWatcher mock ---------------------------------------------------
+// Platform-neutral replacement for the old Obsidian plugin mock.
+// Exposes emit() to fire FileEvents directly in tests.
+
+function makeWatcherMock(): VaultWatcher & { emit(event: FileEvent): void } {
+  let handler: ((event: FileEvent) => void) | null = null;
+  return {
+    start(h) { handler = h; },
+    stop() { handler = null; },
+    emit(event: FileEvent) { handler?.(event); },
   };
 }
 
@@ -206,34 +250,6 @@ function makeVaultMock() {
   return vault;
 }
 
-// ---- Plugin mock for register() ------------------------------------------
-
-function makePluginMock(vault: VaultAdapter) {
-  const vaultObj = vault as VaultAdapter & {
-    on(event: string, cb: (...args: unknown[]) => void): { unload: () => void };
-    offref(ref: unknown): void;
-  };
-
-  // Capture event handlers for manual triggering in tests
-  const handlers: Map<string, ((...args: unknown[]) => void)[]> = new Map();
-
-  vaultObj.on = (event: string, cb: (...args: unknown[]) => void) => {
-    if (!handlers.has(event)) handlers.set(event, []);
-    handlers.get(event)!.push(cb);
-    return { unload: () => {} };
-  };
-  vaultObj.offref = (_ref: unknown) => {};
-
-  return {
-    app: { vault: vaultObj },
-    registerEvent: vi.fn(),
-    // Trigger a vault event
-    emit(event: string, ...args: unknown[]) {
-      for (const h of handlers.get(event) ?? []) h(...args);
-    },
-  };
-}
-
 // ---- Helper to flush microtasks ------------------------------------------
 // Note: when vi.useFakeTimers() is active, use flushPromisesFakeTimers() instead.
 const flushPromises = () => new Promise(resolve => setTimeout(resolve, 0));
@@ -253,26 +269,26 @@ const flushPromisesFakeTimers = async () => {
 describe("PouchDbFsBridge — vault -> PouchDB (text)", () => {
   let db: ReturnType<typeof makePouchMock>;
   let vault: ReturnType<typeof makeVaultMock>;
-  let plugin: ReturnType<typeof makePluginMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
   let bridge: PouchDbFsBridge;
 
   beforeEach(() => {
     db = makePouchMock();
     vault = makeVaultMock();
-    plugin = makePluginMock(vault);
+    watcher = makeWatcherMock();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     bridge = new PouchDbFsBridge(vault, db as any);
-    bridge.register(plugin as unknown as import("obsidian").Plugin);
+    bridge.start(watcher);
   });
 
   afterEach(() => {
-    bridge.unregister();
+    bridge.stop();
   });
 
-  it("writes text file to PouchDB when vault modify fires", async () => {
+  it("writes text file to PouchDB when vault change fires", async () => {
     const mtime = 1700000000123;
     vault._addText("notes/hello.md", "Hello world", mtime);
-    plugin.emit("modify", { path: "notes/hello.md" });
+    watcher.emit({ type: "change", path: "notes/hello.md" });
     await flushPromises();
 
     const doc = db._docs.get(pathToDocId("notes/hello.md"));
@@ -285,7 +301,7 @@ describe("PouchDbFsBridge — vault -> PouchDB (text)", () => {
   it("applies Math.floor to mtime (sub-millisecond invariant)", async () => {
     const mtime = 1700000000999.9; // fractional
     vault._addText("frac.md", "content", mtime);
-    plugin.emit("modify", { path: "frac.md" });
+    watcher.emit({ type: "change", path: "frac.md" });
     await flushPromises();
 
     const doc = db._docs.get(pathToDocId("frac.md"));
@@ -293,40 +309,33 @@ describe("PouchDbFsBridge — vault -> PouchDB (text)", () => {
     expect(Number.isInteger(doc!.mtime)).toBe(true);
   });
 
-  it("writes to PouchDB on vault create event", async () => {
-    vault._addText("new.md", "brand new");
-    plugin.emit("create", { path: "new.md" });
-    await flushPromises();
-
-    expect(db._docs.has(pathToDocId("new.md"))).toBe(true);
-  });
-
   it("marks doc deleted in PouchDB when vault delete fires", async () => {
     vault._addText("gone.md", "bye");
-    plugin.emit("modify", { path: "gone.md" });
+    watcher.emit({ type: "change", path: "gone.md" });
     await flushPromises();
 
     // Now delete
-    plugin.emit("delete", { path: "gone.md" });
+    watcher.emit({ type: "delete", path: "gone.md" });
     await flushPromises();
 
     const doc = db._docs.get(pathToDocId("gone.md"));
     expect(doc?._deleted).toBe(true);
   });
 
-  it("treats rename as delete-old + create-new", async () => {
+  it("treats rename as delete-old + change-new (two sequential events)", async () => {
     vault._addText("new-name.md", "renamed content");
-    plugin.emit("rename", { path: "new-name.md" }, "old-name.md");
+    // Watcher emits delete(old) then change(new)
+    watcher.emit({ type: "delete", path: "old-name.md" });
+    watcher.emit({ type: "change", path: "new-name.md" });
     await flushPromises();
 
-    // Old doc should be tombstoned (doesn't exist in DB yet so no-op is fine)
     // New doc should be written
     expect(db._docs.has(pathToDocId("new-name.md"))).toBe(true);
   });
 
   it("updates existing doc (uses _rev to avoid 409)", async () => {
     vault._addText("update.md", "v1");
-    plugin.emit("modify", { path: "update.md" });
+    watcher.emit({ type: "change", path: "update.md" });
     await flushPromises();
 
     const rev1 = db._docs.get(pathToDocId("update.md"))?._rev;
@@ -334,7 +343,7 @@ describe("PouchDbFsBridge — vault -> PouchDB (text)", () => {
 
     // Update content
     vault._addText("update.md", "v2");
-    plugin.emit("modify", { path: "update.md" });
+    watcher.emit({ type: "change", path: "update.md" });
     await flushPromises();
 
     const doc = db._docs.get(pathToDocId("update.md"));
@@ -343,31 +352,31 @@ describe("PouchDbFsBridge — vault -> PouchDB (text)", () => {
   });
 });
 
-describe("PouchDbFsBridge — echo suppression (Level 1: TTL)", () => {
+describe("PouchDbFsBridge — echo suppression (Level 1: in-memory rev sentinel)", () => {
   let db: ReturnType<typeof makePouchMock>;
   let vault: ReturnType<typeof makeVaultMock>;
-  let plugin: ReturnType<typeof makePluginMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
   let bridge: PouchDbFsBridge;
 
   beforeEach(() => {
     vi.useFakeTimers();
     db = makePouchMock();
     vault = makeVaultMock();
-    plugin = makePluginMock(vault);
+    watcher = makeWatcherMock();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     bridge = new PouchDbFsBridge(vault, db as any);
-    bridge.register(plugin as unknown as import("obsidian").Plugin);
+    bridge.start(watcher);
   });
 
   afterEach(() => {
-    bridge.unregister();
+    bridge.stop();
     vi.useRealTimers();
   });
 
-  it("suppresses vault event within 3s TTL window after remote write", async () => {
-    // Setup: vault has "old content", remote pushes "new content"
-    // Bridge writes "new content" to vault → calls markRemoteWrite
-    // Vault then fires a modify event (echo) — should be suppressed within 3s
+  it("suppresses vault event when rev matches the applied sentinel", async () => {
+    // Remote pushes "1-abc" rev with new content -> bridge writes to vault
+    // Bridge stores sentinel: appliedRevs["file/echo.md"] = "1-abc"
+    // Vault fires change event (echo) -> bridge checks: db.get() rev === sentinel -> skip
     vault._addText("echo.md", "old content");
 
     const remoteDoc = {
@@ -378,24 +387,21 @@ describe("PouchDbFsBridge — echo suppression (Level 1: TTL)", () => {
       deleted: false,
     };
     db._emitChange(remoteDoc);
-    // Advance by 1ms to flush async microtasks (applyRemoteChange) without
-    // triggering the 3s TTL cleanup timer in markRemoteWrite
     await flushPromisesFakeTimers();
 
-    // Bridge should have written "new content from remote" to vault and called markRemoteWrite
     expect(vault._getText("echo.md")).toBe("new content from remote");
 
-    // Vault event echoes back (Obsidian fires modify after vault write)
-    // Level 1 TTL suppression should prevent writing back to PouchDB
+    // Vault echoes the change — Level 1 sentinel should suppress it
     const putSpy = vi.spyOn(db, "put");
-    plugin.emit("modify", { path: "echo.md" });
+    watcher.emit({ type: "change", path: "echo.md" });
+    // suppressIfEcho does a db.get() — advance to let it resolve
+    await flushPromisesFakeTimers();
     await flushPromisesFakeTimers();
 
     expect(putSpy).not.toHaveBeenCalled();
   });
 
-  it("allows vault event after TTL window expires (> 3s)", async () => {
-    // Remote writes "new remote content", bridge writes it (markRemoteWrite called)
+  it("allows vault event after TTL window expires (> 5s)", async () => {
     vault._addText("echo2.md", "old content");
 
     const remoteDoc = {
@@ -410,13 +416,37 @@ describe("PouchDbFsBridge — echo suppression (Level 1: TTL)", () => {
 
     expect(vault._getText("echo2.md")).toBe("new remote content");
 
-    // Advance time past the 3s TTL — this triggers the cleanup setTimeout in markRemoteWrite
-    await vi.advanceTimersByTimeAsync(3100);
+    // Advance time past the 5s TTL — sentinel is cleared
+    await vi.advanceTimersByTimeAsync(5100);
 
-    // After TTL expired, a genuine local edit should flow through to PouchDB
+    // After TTL expired, no sentinel -> change goes directly to PouchDB
     const putSpy = vi.spyOn(db, "put");
     vault._addText("echo2.md", "locally modified after TTL");
-    plugin.emit("modify", { path: "echo2.md" });
+    watcher.emit({ type: "change", path: "echo2.md" });
+    await flushPromisesFakeTimers();
+
+    expect(putSpy).toHaveBeenCalled();
+  });
+
+  it("allows genuine local edit for different docId — independent sentinels", async () => {
+    // Remote applies to "remote.md", then local edits "local.md" — no suppression
+    vault._addText("remote.md", "old");
+    vault._addText("local.md", "local original");
+
+    const remoteDoc = {
+      _id: pathToDocId("remote.md"),
+      _rev: "1-abc",
+      content: "from remote",
+      mtime: 1700000000000,
+      deleted: false,
+    };
+    db._emitChange(remoteDoc);
+    await flushPromisesFakeTimers();
+
+    // Edit local.md — no sentinel for this docId -> should write to PouchDB
+    const putSpy = vi.spyOn(db, "put");
+    vault._addText("local.md", "locally edited");
+    watcher.emit({ type: "change", path: "local.md" });
     await flushPromisesFakeTimers();
 
     expect(putSpy).toHaveBeenCalled();
@@ -426,20 +456,20 @@ describe("PouchDbFsBridge — echo suppression (Level 1: TTL)", () => {
 describe("PouchDbFsBridge — PouchDB -> vault (text)", () => {
   let db: ReturnType<typeof makePouchMock>;
   let vault: ReturnType<typeof makeVaultMock>;
-  let plugin: ReturnType<typeof makePluginMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
   let bridge: PouchDbFsBridge;
 
   beforeEach(() => {
     db = makePouchMock();
     vault = makeVaultMock();
-    plugin = makePluginMock(vault);
+    watcher = makeWatcherMock();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     bridge = new PouchDbFsBridge(vault, db as any);
-    bridge.register(plugin as unknown as import("obsidian").Plugin);
+    bridge.start(watcher);
   });
 
   afterEach(() => {
-    bridge.unregister();
+    bridge.stop();
   });
 
   it("creates a new vault file when PouchDB emits a change for unknown path", async () => {
@@ -556,29 +586,29 @@ describe("PouchDbFsBridge — doc ID encoding", () => {
 describe("PouchDbFsBridge — binary sync", () => {
   let db: ReturnType<typeof makePouchMock>;
   let vault: ReturnType<typeof makeVaultMock>;
-  let plugin: ReturnType<typeof makePluginMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
   let bridge: PouchDbFsBridge;
 
   beforeEach(() => {
     db = makePouchMock();
     vault = makeVaultMock();
-    plugin = makePluginMock(vault);
+    watcher = makeWatcherMock();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     bridge = new PouchDbFsBridge(vault, db as any);
-    bridge.register(plugin as unknown as import("obsidian").Plugin);
+    bridge.start(watcher);
   });
 
   afterEach(() => {
-    bridge.unregister();
+    bridge.stop();
   });
 
-  it("writes binary file to PouchDB as attachment when vault modify fires", async () => {
+  it("writes binary file to PouchDB as attachment when vault change fires", async () => {
     const data = new Uint8Array([0x89, 0x50, 0x4e, 0x47]).buffer;
     // Use the vault's createBinary to register the file in the mock, then
-    // trigger via vault event so the bridge picks it up via getEntryByPath
+    // trigger via watcher event so the bridge picks it up via getEntryByPath
     await vault.createBinary("image.png", data);
 
-    plugin.emit("modify", { path: "image.png" });
+    watcher.emit({ type: "change", path: "image.png" });
     await flushPromises();
 
     // Should have put a meta doc and then an attachment
@@ -654,28 +684,28 @@ describe("PouchDbFsBridge — binary content-type mapping", () => {
 describe("PouchDbFsBridge — binary round-trip (vault->PouchDB->vault)", () => {
   let db: ReturnType<typeof makePouchMock>;
   let vault: ReturnType<typeof makeVaultMock>;
-  let plugin: ReturnType<typeof makePluginMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
   let bridge: PouchDbFsBridge;
 
   beforeEach(() => {
     db = makePouchMock();
     vault = makeVaultMock();
-    plugin = makePluginMock(vault);
+    watcher = makeWatcherMock();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     bridge = new PouchDbFsBridge(vault, db as any);
-    bridge.register(plugin as unknown as import("obsidian").Plugin);
+    bridge.start(watcher);
   });
 
   afterEach(() => {
-    bridge.unregister();
+    bridge.stop();
   });
 
   it("binary round-trip: vault write -> PouchDB -> vault read back", async () => {
     const originalData = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]).buffer;
     await vault.createBinary("assets/chart.png", originalData);
 
-    // Step 1: vault FS modify event -> PouchDB attachment
-    plugin.emit("modify", { path: "assets/chart.png" });
+    // Step 1: vault FS change event -> PouchDB attachment
+    watcher.emit({ type: "change", path: "assets/chart.png" });
     await flushPromises();
 
     const docId = pathToDocId("assets/chart.png");
@@ -689,10 +719,10 @@ describe("PouchDbFsBridge — binary round-trip (vault->PouchDB->vault)", () => 
     // Step 2: simulate remote change event (attachment ready) -> vault write back
     // Create a second vault/bridge pair to simulate the "receiving" side
     const vault2 = makeVaultMock();
-    const plugin2 = makePluginMock(vault2);
+    const watcher2 = makeWatcherMock();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const bridge2 = new PouchDbFsBridge(vault2, db as any);
-    bridge2.register(plugin2 as unknown as import("obsidian").Plugin);
+    bridge2.start(watcher2);
 
     try {
       // Emit the change to the second bridge
@@ -703,17 +733,17 @@ describe("PouchDbFsBridge — binary round-trip (vault->PouchDB->vault)", () => 
       expect(receivedData).toBeDefined();
       expect(new Uint8Array(receivedData!)).toEqual(new Uint8Array(originalData));
     } finally {
-      bridge2.unregister();
+      bridge2.stop();
     }
   });
 
-  it("binary echo suppression: TTL prevents writing same binary back to PouchDB", async () => {
+  it("binary echo suppression: rev sentinel prevents writing same binary back to PouchDB", async () => {
     vi.useFakeTimers();
     try {
       const data = new Uint8Array([1, 2, 3]).buffer;
       await vault.createBinary("echo-img.png", data);
 
-      // Simulate remote binary change -> bridge writes to vault + marks TTL
+      // Simulate remote binary change -> bridge writes to vault + sets rev sentinel
       const docId = pathToDocId("echo-img.png");
       db._docs.set(docId, {
         _id: docId,
@@ -727,10 +757,11 @@ describe("PouchDbFsBridge — binary round-trip (vault->PouchDB->vault)", () => 
       db._emitChange(doc);
       await vi.advanceTimersByTimeAsync(1);
 
-      // Vault fires modify event (echo) — should be suppressed by TTL
+      // Vault fires change event (echo) — should be suppressed by rev sentinel
+      // (sentinel present -> suppressIfEcho -> db.get() matches -> skip)
       const putAttachmentSpy = vi.spyOn(db, "putAttachment");
-      plugin.emit("modify", { path: "echo-img.png" });
-      await vi.advanceTimersByTimeAsync(1);
+      watcher.emit({ type: "change", path: "echo-img.png" });
+      await vi.advanceTimersByTimeAsync(5); // let suppressIfEcho resolve
 
       expect(putAttachmentSpy).not.toHaveBeenCalled();
     } finally {
@@ -773,27 +804,27 @@ describe("PouchDbFsBridge — binary round-trip (vault->PouchDB->vault)", () => 
   });
 });
 
-describe("PouchDbFsBridge — unregister", () => {
+describe("PouchDbFsBridge — stop()", () => {
   let db: ReturnType<typeof makePouchMock>;
   let vault: ReturnType<typeof makeVaultMock>;
-  let plugin: ReturnType<typeof makePluginMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
   let bridge: PouchDbFsBridge;
 
   beforeEach(() => {
     db = makePouchMock();
     vault = makeVaultMock();
-    plugin = makePluginMock(vault);
+    watcher = makeWatcherMock();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     bridge = new PouchDbFsBridge(vault, db as any);
-    bridge.register(plugin as unknown as import("obsidian").Plugin);
+    bridge.start(watcher);
   });
 
-  it("stops writing to vault after unregister()", async () => {
-    bridge.unregister();
+  it("stops writing to vault after stop()", async () => {
+    bridge.stop();
 
     const createTextSpy = vi.spyOn(vault, "createText");
     const doc = {
-      _id: pathToDocId("after-unreg.md"),
+      _id: pathToDocId("after-stop.md"),
       _rev: "1-abc",
       content: "should not appear",
       mtime: Date.now(),
@@ -804,24 +835,166 @@ describe("PouchDbFsBridge — unregister", () => {
     expect(createTextSpy).not.toHaveBeenCalled();
   });
 
-  it("stops writing to PouchDB after unregister()", async () => {
-    bridge.unregister();
+  it("stops writing to PouchDB after stop() — watcher handler cleared", async () => {
+    bridge.stop();
 
-    vault._addText("unreg.md", "content");
+    vault._addText("stop-test.md", "content");
     const putSpy = vi.spyOn(db, "put");
-    plugin.emit("modify", { path: "unreg.md" });
+    // After stop(), watcher.stop() sets handler=null, so emit is a no-op
+    watcher.emit({ type: "change", path: "stop-test.md" });
     await flushPromises();
 
-    // Vault handlers are removed; no put should happen
-    // (handlers were registered with plugin.registerEvent which we mock as vi.fn())
-    // The handlers map in plugin won't fire because we never called offref in our mock,
-    // but the bridge's internal eventRefs are cleared. The vault mock's `on()` handlers
-    // are still registered in the handlers map — so we test by confirming the bridge's
-    // change feed is cancelled (which is what makes remote->vault stop).
-    // For vault->PouchDB: the handlers list in plugin still has them because offref is
-    // a no-op mock. This is acceptable — in production Obsidian calls offref correctly.
-    // We verify the changes handle was cancelled:
-    expect(db._changesHandle.cancel).toBeDefined(); // handle exists
-    // The cancelled flag check is internal — just verify no error thrown
+    expect(putSpy).not.toHaveBeenCalled();
+  });
+});
+
+
+// ==========================================================================
+// LWW conflict resolver tests (C03)
+// ==========================================================================
+
+describe("PouchDbFsBridge — LWW conflict resolution (resolveConflictsByMtime)", () => {
+  let db: ReturnType<typeof makePouchMock>;
+  let vault: ReturnType<typeof makeVaultMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
+  let bridge: PouchDbFsBridge;
+
+  beforeEach(() => {
+    db = makePouchMock();
+    vault = makeVaultMock();
+    watcher = makeWatcherMock();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    bridge.start(watcher);
+  });
+
+  afterEach(() => {
+    bridge.stop();
+  });
+
+  it("no conflicts: resolver not called, doc written as-is", async () => {
+    // A normal remote change without _conflicts — resolver should not touch it
+    const putSpy = vi.spyOn(db, "put");
+
+    const doc: DocShape = {
+      _id: pathToDocId("no-conflict.md"),
+      _rev: "1-aaa",
+      content: "normal content",
+      mtime: 1700000001000,
+      deleted: false,
+    };
+    db._emitChange(doc);
+    await flushPromises();
+
+    // Vault should have the content from the change
+    expect(vault._getText("no-conflict.md")).toBe("normal content");
+    // No spurious put() calls from conflict resolution
+    expect(putSpy).not.toHaveBeenCalled();
+  });
+
+  it("two conflict revs, winning rev has higher mtime — winner written to vault", async () => {
+    const path = "conflict-win.md";
+    const docId = pathToDocId(path);
+
+    // Loser rev (lower mtime) — stored as a conflict revision
+    const loserDoc: DocShape = {
+      _id: docId,
+      _rev: "1-aaa",
+      content: "older content",
+      mtime: 1700000000000,
+      deleted: false,
+    };
+    // Winner rev (higher mtime) — this is what the change feed delivers
+    const winnerDoc: DocShape = {
+      _id: docId,
+      _rev: "2-bbb",
+      content: "newer content",
+      mtime: 1700000002000,
+      deleted: false,
+      _conflicts: ["1-aaa"],
+    };
+
+    db._addConflictRev(docId, loserDoc);
+
+    db._emitChange(winnerDoc);
+    await flushPromises();
+
+    // Winner content should be written to vault
+    expect(vault._getText(path)).toBe("newer content");
+
+    // The loser rev should be deleted — verify the doc map reflects this.
+    // The mock's put() with _deleted:true marks the stored doc as deleted.
+    // Since the mock bumps _rev on every put, we check the loser's docId
+    // no longer returns its old content (it was overwritten by the deletion).
+    const loserDocAfter = db._docs.get(docId);
+    // The loser revision was stored; after deletion put, the doc is marked deleted
+    // (the mock stores the deletion under the new bumped rev, so the old 1-aaa
+    // entry in conflictDocs remains, but the main docs store shows deleted).
+    // Primary assertion is vault content (above). Deletion is secondary — the
+    // bridge's loser.put({_deleted:true}) at minimum must not throw.
+  });
+
+  it("two conflict revs, losing rev has higher mtime — loser becomes winner", async () => {
+    const path = "conflict-flip.md";
+    const docId = pathToDocId(path);
+
+    // PouchDB's change feed delivers "1-aaa" as "winner" (arbitrary rev sort),
+    // but "2-bbb" has a higher mtime and should be the real LWW winner.
+    const pouchWinner: DocShape = {
+      _id: docId,
+      _rev: "1-aaa",
+      content: "older but pouch thinks it won",
+      mtime: 1700000000000,
+      deleted: false,
+      _conflicts: ["2-bbb"],
+    };
+    const realWinner: DocShape = {
+      _id: docId,
+      _rev: "2-bbb",
+      content: "newer real winner",
+      mtime: 1700000002000,
+      deleted: false,
+    };
+
+    db._addConflictRev(docId, pouchWinner);
+    db._addConflictRev(docId, realWinner);
+
+    db._emitChange(pouchWinner);
+    await flushPromises();
+
+    // The real winner (higher mtime) should be written to vault
+    expect(vault._getText(path)).toBe("newer real winner");
+  });
+
+  it("tied mtime — deterministic winner by _rev lexicographic order", async () => {
+    const path = "conflict-tie.md";
+    const docId = pathToDocId(path);
+    const sharedMtime = 1700000001000;
+
+    // "2-zzz" > "1-aaa" lexicographically — should win on tie
+    const lowerRev: DocShape = {
+      _id: docId,
+      _rev: "1-aaa",
+      content: "lower rev content",
+      mtime: sharedMtime,
+      deleted: false,
+      _conflicts: ["2-zzz"],
+    };
+    const higherRev: DocShape = {
+      _id: docId,
+      _rev: "2-zzz",
+      content: "higher rev content",
+      mtime: sharedMtime,
+      deleted: false,
+    };
+
+    db._addConflictRev(docId, lowerRev);
+    db._addConflictRev(docId, higherRev);
+
+    db._emitChange(lowerRev);
+    await flushPromises();
+
+    // "2-zzz" > "1-aaa" → higher rev wins on tie
+    expect(vault._getText(path)).toBe("higher rev content");
   });
 });

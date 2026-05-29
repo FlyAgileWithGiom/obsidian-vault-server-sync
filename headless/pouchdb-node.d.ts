@@ -1,12 +1,17 @@
 /**
- * Minimal ambient declaration for pouchdb-browser v9.
- * We do NOT use @types/pouchdb-browser — the official types target v6 and
- * conflict with the v9 runtime API surface.
- * Only the subset of APIs used by PouchDbFsBridge and PouchDbSyncStrategy
- * is declared here.
+ * Minimal ambient declaration for pouchdb-node v9.
+ *
+ * Mirrors src/pouchdb-browser.d.ts — same API surface, different adapter.
+ * pouchdb-node uses LevelDB (via leveldown) as the local storage backend,
+ * constructed with a filesystem path instead of a string name.
+ *
+ * We do NOT use @types/pouchdb — the official types target v6 and conflict
+ * with the v9 runtime API surface.
+ * Only the subset of APIs used by PouchDbFsBridge, PouchDbSyncEngine, and
+ * the headless converter is declared here.
  */
 
-declare module "pouchdb-browser" {
+declare module "pouchdb-node" {
   interface PouchDbDoc {
     _id: string;
     _rev?: string;
@@ -51,7 +56,12 @@ declare module "pouchdb-browser" {
   }
 
   class PouchDB {
-    constructor(name: string, options?: Record<string, unknown>);
+    /**
+     * @param path  Absolute filesystem path to the LevelDB directory.
+     *              pouchdb-node creates the directory if absent.
+     * @param options  Optional adapter options (e.g. { adapter: 'leveldb' }).
+     */
+    constructor(path: string, options?: Record<string, unknown>);
 
     sync(remote: string, opts?: { live?: boolean; retry?: boolean }): PouchDbSyncHandle;
 
@@ -74,14 +84,14 @@ declare module "pouchdb-browser" {
       docId: string,
       attachmentId: string,
       rev: string,
-      attachment: Blob | ArrayBuffer,
+      attachment: Buffer | ArrayBuffer,
       type: string,
     ): Promise<PouchDbPutResult>;
 
     getAttachment(
       docId: string,
       attachmentId: string,
-    ): Promise<Blob | Buffer>;
+    ): Promise<Buffer>;
 
     bulkDocs(
       docs: PouchDbDoc[],
@@ -93,6 +103,8 @@ declare module "pouchdb-browser" {
       live: boolean;
       include_docs?: boolean;
     }): PouchDbSyncHandle;
+
+    destroy(): Promise<void>;
   }
 
   export = PouchDB;

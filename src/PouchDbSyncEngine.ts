@@ -1,29 +1,33 @@
 /**
- * PouchDbSyncStrategy — SyncStrategy implementation using pouchdb-browser.
+ * PouchDbSyncEngine — concrete sync implementation using PouchDB.
  *
- * Designed for iOS (Capacitor) where custom fetch and CouchDB HTTPS aren't
- * available. Uses PouchDB's built-in replication protocol over IndexedDB.
+ * Replaces PouchDbSyncStrategy (renamed in C05). Platform-neutral: accepts an
+ * injected PouchDB instance and PouchDbFsBridge, so the same class works for
+ * both the Obsidian plugin (pouchdb-browser) and the headless daemon (pouchdb-node).
+ *
+ * Construction:
+ *   Plugin: src/main.ts creates pouchdb-browser db + ObsidianVaultAdapter + bridge,
+ *           then calls register(plugin) to wire vault events + DOM visibilitychange.
+ *   Daemon: headless/main.ts creates pouchdb-node db + FilesystemVaultAdapter + bridge,
+ *           calls bridge.start(fsWatcher), then engine.start().
+ *           register() is a no-op when not called (Obsidian APIs unavailable).
  *
  * Lifecycle:
- *   1. constructor(settings, app): instantiates PouchDB + PouchDbFsBridge
- *   2. register(plugin): wires vault events via bridge + visibilitychange DOM handler
+ *   1. constructor(settings, db, bridge): stores injected deps
+ *   2. register(plugin) [plugin path only]: wires vault events + visibilitychange
  *   3. start():
  *      - isFirstRun() === true  → migration flow: replicate.from (initial pull)
  *        then cleanupLegacyRevMap() then startLiveSync()
  *      - isFirstRun() === false → startLiveSync() (resumes from PouchDB checkpoint)
- *   4. stop(): cancels sync handle (bridge events cleaned up by registerEvent at unload)
+ *   4. stop(): cancels sync handle + stops bridge
  *
- * Migration flow (isFirstRun + initial pull) is implemented here (commit 10).
+ * replaceLocalFromServer(): destroy local DB → re-create → runInitialPull().
  */
 
-import type { App } from "obsidian";
-import PouchDB from "pouchdb-browser";
 import type { Plugin } from "obsidian";
-import { Notice } from "obsidian";
-import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
+import type PouchDB from "pouchdb-browser";
 import { ObsidianVaultWatcher } from "./ObsidianVaultWatcher";
 import { PouchDbFsBridge } from "./PouchDbFsBridge";
-import type { SyncStrategy } from "./sync-strategy";
 import type {
   VaultSyncSettings,
   SyncState,
@@ -41,15 +45,14 @@ interface PouchEmitter {
   cancel(): void;
 }
 
-export class PouchDbSyncStrategy implements SyncStrategy {
+export class PouchDbSyncEngine {
   // --- Callbacks (set by main.ts before register()) ---
   onStateChange: (state: SyncState) => void = () => {};
   onCountsChange: (counts: SyncCounts) => void = () => {};
   onError: (msg: string) => void = () => {};
   onDiagnosticsChange: () => void = () => {};
+  onNotice: ((msg: string) => void) | undefined = undefined;
 
-  private readonly db: PouchDB;
-  private readonly bridge: PouchDbFsBridge;
   private syncHandle: PouchEmitter | null = null;
   private started = false;
 
@@ -62,18 +65,20 @@ export class PouchDbSyncStrategy implements SyncStrategy {
 
   constructor(
     private settings: VaultSyncSettings,
-    private readonly app: App,
-  ) {
-    const vaultAdapter = new ObsidianVaultAdapter(app.vault);
-    const localDbName = `vault-sync-${settings.couchDbName}`;
-    this.db = new PouchDB(localDbName);
-    this.bridge = new PouchDbFsBridge(vaultAdapter, this.db);
-  }
+    private readonly db: PouchDB,
+    private readonly bridge: PouchDbFsBridge,
+  ) {}
 
   // --- Lifecycle ---
 
+  /**
+   * Register vault event handlers and visibilitychange DOM handler (plugin path).
+   * Creates ObsidianVaultWatcher and calls bridge.start(watcher).
+   *
+   * In daemon mode, the caller manages the watcher externally:
+   *   bridge.start(fsWatcher) is called before engine.start().
+   */
   register(plugin: Plugin): void {
-    // Wire vault events (modify/create/delete/rename) via platform-neutral watcher
     const watcher = new ObsidianVaultWatcher(plugin);
     this.bridge.start(watcher);
 
@@ -127,6 +132,24 @@ export class PouchDbSyncStrategy implements SyncStrategy {
     }
     this.cancelSync();
     this.setState("syncing");
+    await this.runInitialPull();
+  }
+
+  /**
+   * DESTRUCTIVE: destroy local PouchDB, then re-pull all docs from the remote.
+   * Matches the "Replace local from server" Obsidian command intent.
+   * Decision D5 in v2-unify-pouchdb-plan.md.
+   */
+  async replaceLocalFromServer(): Promise<void> {
+    this.cancelSync();
+    this.setState("syncing");
+    try {
+      await (this.db as unknown as { destroy(): Promise<void> }).destroy();
+    } catch (e) {
+      // Non-fatal: log and continue — runInitialPull will start fresh anyway
+      console.warn("[vault-sync] replaceLocalFromServer: db.destroy() failed:", e);
+    }
+    this.started = true;
     await this.runInitialPull();
   }
 
@@ -210,7 +233,7 @@ export class PouchDbSyncStrategy implements SyncStrategy {
   // --- Migration helpers ---
 
   /**
-   * Returns true when local IndexedDB is empty — first run or after strategy switch.
+   * Returns true when local DB is empty — first run or after strategy switch.
    * Both cases require an initial full pull from the remote CouchDB.
    */
   private async isFirstRun(): Promise<boolean> {
@@ -234,7 +257,7 @@ export class PouchDbSyncStrategy implements SyncStrategy {
     this.pullTotal = 0;
     this.onDiagnosticsChange();
 
-    new Notice("Vault Sync: Initial sync starting...");
+    this.onNotice?.("Vault Sync: Initial sync starting...");
 
     return new Promise<void>((resolve) => {
       const remoteUrl = this.buildRemoteUrl();
@@ -255,7 +278,7 @@ export class PouchDbSyncStrategy implements SyncStrategy {
         this.initialPullRunning = false;
         this.syncHandle = null;
         this.cleanupLegacyRevMap();
-        new Notice("Vault Sync: Initial sync complete");
+        this.onNotice?.("Vault Sync: Initial sync complete");
         if (this.started) {
           this.startLiveSync();
           this.setState("ok");
@@ -282,7 +305,7 @@ export class PouchDbSyncStrategy implements SyncStrategy {
       localStorage.removeItem("vault-sync-revmap");
       localStorage.removeItem("vault-sync-last-seq");
     } catch {
-      // Non-critical: localStorage may not be available or may already be empty
+      // Non-critical: localStorage may not be available (daemon mode) or empty
     }
   }
 
@@ -339,7 +362,7 @@ export class PouchDbSyncStrategy implements SyncStrategy {
   }
 
   private handleVisibilityVisible(): void {
-    // Guard: only act if strategy is started and not in initial pull
+    // Guard: only act if engine is started and not in initial pull
     if (!this.started) return;
     if (this.initialPullRunning) return;
     this.cancelSync();

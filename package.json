@@ -1,6 +1,6 @@
 {
   "name": "obsidian-vault-server-sync",
-  "version": "1.14.0",
+  "version": "2.0.0",
   "description": "Lightweight CouchDB sync for Obsidian vaults",
   "main": "main.js",
   "bin": {
@@ -25,7 +25,8 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
-    "pouchdb-browser": "^9.0.0"
+    "pouchdb-browser": "^9.0.0",
+    "pouchdb-node": "^9.0.0"
   },
   "overrides": {
     "uuid": "^11.0.0"
