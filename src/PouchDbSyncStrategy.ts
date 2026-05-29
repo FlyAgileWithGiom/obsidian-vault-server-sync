@@ -21,6 +21,7 @@ import PouchDB from "pouchdb-browser";
 import type { Plugin } from "obsidian";
 import { Notice } from "obsidian";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
+import { ObsidianVaultWatcher } from "./ObsidianVaultWatcher";
 import { PouchDbFsBridge } from "./PouchDbFsBridge";
 import type { SyncStrategy } from "./sync-strategy";
 import type {
@@ -72,8 +73,9 @@ export class PouchDbSyncStrategy implements SyncStrategy {
   // --- Lifecycle ---
 
   register(plugin: Plugin): void {
-    // Wire vault events (modify/create/delete/rename) and PouchDB changes listener
-    this.bridge.register(plugin);
+    // Wire vault events (modify/create/delete/rename) via platform-neutral watcher
+    const watcher = new ObsidianVaultWatcher(plugin);
+    this.bridge.start(watcher);
 
     // Restart sync on tab/app becoming visible again (iOS app resume)
     plugin.registerDomEvent(document, "visibilitychange", () => {
@@ -99,11 +101,10 @@ export class PouchDbSyncStrategy implements SyncStrategy {
   stop(): void {
     this.started = false;
     this.cancelSync();
-    // Unregister bridge explicitly to cancel the PouchDB changes listener.
-    // Vault EventRef handles are cleaned by plugin.registerEvent lifecycle at
-    // plugin unload, but the PouchDB changes feed handle is not an Obsidian
-    // EventRef — it must be cancelled explicitly.
-    this.bridge.unregister();
+    // Stop bridge: cancels the PouchDB changes listener.
+    // Vault events (registered via plugin.registerEvent) are cleaned up
+    // by Obsidian's plugin unload lifecycle automatically.
+    this.bridge.stop();
     this.setState("idle");
   }
 

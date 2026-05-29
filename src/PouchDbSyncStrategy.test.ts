@@ -23,13 +23,21 @@ vi.mock("./ObsidianVaultAdapter", () => ({
   ObsidianVaultAdapter: vi.fn().mockImplementation(() => ({})),
 }));
 
+// ---- Mock ObsidianVaultWatcher ------------------------------------------
+vi.mock("./ObsidianVaultWatcher", () => ({
+  ObsidianVaultWatcher: vi.fn().mockImplementation(() => ({
+    start: vi.fn(),
+    stop: vi.fn(),
+  })),
+}));
+
 // ---- Mock PouchDbFsBridge ------------------------------------------------
-const mockBridgeRegister = vi.fn();
-const mockBridgeUnregister = vi.fn();
+const mockBridgeStart = vi.fn();
+const mockBridgeStop = vi.fn();
 vi.mock("./PouchDbFsBridge", () => ({
   PouchDbFsBridge: vi.fn().mockImplementation(() => ({
-    register: mockBridgeRegister,
-    unregister: mockBridgeUnregister,
+    start: mockBridgeStart,
+    stop: mockBridgeStop,
   })),
 }));
 
@@ -183,11 +191,11 @@ describe("PouchDbSyncStrategy — register()", () => {
     pouchConstructorCalls = [];
   });
 
-  it("delegates vault event wiring to bridge.register()", () => {
+  it("delegates vault event wiring to bridge.start() via ObsidianVaultWatcher", () => {
     const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
     const plugin = makePlugin();
     strategy.register(plugin);
-    expect(mockBridgeRegister).toHaveBeenCalledWith(plugin);
+    expect(mockBridgeStart).toHaveBeenCalledWith(expect.objectContaining({ start: expect.any(Function) }));
   });
 
   it("subscribes to visibilitychange DOM event", () => {
@@ -256,14 +264,14 @@ describe("PouchDbSyncStrategy — start() / stop()", () => {
     expect(() => strategy.stop()).not.toThrow();
   });
 
-  it("stop() calls bridge.unregister() to cancel the PouchDB changes listener", async () => {
+  it("stop() calls bridge.stop() to cancel the PouchDB changes listener", async () => {
     const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
     strategy.register(makePlugin());
     await strategy.start();
 
     strategy.stop();
 
-    expect(mockBridgeUnregister).toHaveBeenCalled();
+    expect(mockBridgeStop).toHaveBeenCalled();
   });
 
   it("sync handle uses live=true and retry=true options", async () => {

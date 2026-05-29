@@ -1,8 +1,11 @@
 /**
- * PouchDbFsBridge — bidirectional bridge between Obsidian vault FS and local PouchDB.
+ * PouchDbFsBridge — bidirectional bridge between vault FS and local PouchDB.
  *
- * Instantiated by PouchDbSyncStrategy. Responsible for:
- * - Vault events (modify/create/delete/rename) -> local PouchDB writes
+ * Platform-neutral: no Obsidian Plugin reference. Accepts a VaultWatcher port
+ * (ObsidianVaultWatcher on plugin side, FsWatcher on daemon side).
+ *
+ * Responsible for:
+ * - Vault events (change/delete) via VaultWatcher -> local PouchDB writes
  * - PouchDB change events -> vault FS writes
  * - Echo-loop suppression (Level 1: TTL cache, Level 2: content equality)
  * - Parent directory creation before vault FS writes
@@ -11,12 +14,12 @@
  * only cares about the local PouchDB <-> vault FS boundary.
  */
 
-import type { Plugin, EventRef } from "obsidian";
-import type { VaultAdapter, VaultEntry } from "./types";
+import type { VaultAdapter } from "./types";
 import { buildTextDoc, buildBinaryDocMeta } from "./doc-builder";
 import { docIdToPath, pathToDocId, DOC_PREFIX } from "./doc-id";
-import { isBinaryPath, ATTACHMENT_NAME, CONTENT_TYPE_MAP, contentTypeForPath } from "./binary-ext";
+import { isBinaryPath, ATTACHMENT_NAME, contentTypeForPath } from "./binary-ext";
 import type PouchDB from "pouchdb-browser";
+import type { VaultWatcher, FileEvent } from "./WatcherAdapter";
 
 // Shape of a PouchDB change row from db.changes()
 interface PouchChangeRow {
@@ -35,11 +38,10 @@ interface PouchChangeRow {
 }
 
 export class PouchDbFsBridge {
-  private plugin: Plugin | null = null;
-  private eventRefs: EventRef[] = [];
+  private watcher: VaultWatcher | null = null;
   /** Level 1 echo-suppression: paths recently written by bridge -> vault, with write timestamp. */
   private recentRemotePaths: Map<string, number> = new Map();
-  /** Handle for the PouchDB changes listener, so it can be cancelled on unregister. */
+  /** Handle for the PouchDB changes listener, so it can be cancelled on stop. */
   private changesHandle: { cancel(): void } | null = null;
 
   constructor(
@@ -49,47 +51,20 @@ export class PouchDbFsBridge {
 
   /**
    * Wire vault event handlers and start listening to PouchDB changes.
-   * Called by PouchDbSyncStrategy.register(plugin).
+   * Replaces the old register(plugin) API — no Obsidian Plugin reference needed.
    */
-  register(plugin: Plugin): void {
-    this.plugin = plugin;
-    const vaultObj = plugin.app.vault;
-
-    const addEvent = (ref: EventRef) => {
-      plugin.registerEvent(ref);
-      this.eventRefs.push(ref);
-    };
-
-    addEvent(
-      vaultObj.on("modify", (file) => this.onVaultModify(file))
-    );
-    addEvent(
-      vaultObj.on("create", (file) => this.onVaultModify(file))
-    );
-    addEvent(
-      vaultObj.on("delete", (file) => this.onVaultDelete(file))
-    );
-    addEvent(
-      vaultObj.on("rename", (file, oldPath) => this.onVaultRename(file, oldPath as string))
-    );
-
-    // Start listening to PouchDB changes (live, from current seq)
+  start(watcher: VaultWatcher): void {
+    this.watcher = watcher;
+    watcher.start((event: FileEvent) => this.onVaultEvent(event));
     this.startChangesListener();
   }
 
   /** Stop all event handlers and the PouchDB changes listener. */
-  unregister(): void {
-    if (this.plugin) {
-      const vaultObj = this.plugin.app.vault as typeof this.plugin.app.vault & { offref?: (ref: EventRef) => void };
-      if (vaultObj.offref) {
-        for (const ref of this.eventRefs) {
-          vaultObj.offref(ref);
-        }
-      }
-      this.eventRefs = [];
-      this.plugin = null;
+  stop(): void {
+    if (this.watcher) {
+      this.watcher.stop();
+      this.watcher = null;
     }
-
     if (this.changesHandle) {
       this.changesHandle.cancel();
       this.changesHandle = null;
@@ -98,38 +73,25 @@ export class PouchDbFsBridge {
 
   // --- Vault -> PouchDB ---
 
-  private onVaultModify(file: { path: string }): void {
-    const entry = this.vault.getEntryByPath(file.path);
+  private onVaultEvent(event: FileEvent): void {
+    if (event.type === "delete") {
+      const docId = pathToDocId(event.path);
+      this.markDeletedInPouch(docId).catch(() => {/* non-critical */});
+      return;
+    }
+
+    // "change" event
+    const entry = this.vault.getEntryByPath(event.path);
     if (!entry || entry.kind !== "file") return;
 
     // Check echo-suppression Level 1: recently written by bridge
-    const cached = this.recentRemotePaths.get(file.path);
+    const cached = this.recentRemotePaths.get(event.path);
     if (cached !== undefined && Math.abs(Date.now() - cached) < 3000) return;
 
-    if (isBinaryPath(file.path)) {
-      // Binary path: handled in commit 8 extension
-      this.writeBinaryToPouch(entry).catch(() => {/* non-critical, will retry on next change */});
+    if (isBinaryPath(event.path)) {
+      this.writeBinaryToPouch(entry).catch(() => {/* non-critical */});
     } else {
       this.writeTextToPouch(entry).catch(() => {/* non-critical */});
-    }
-  }
-
-  private onVaultDelete(file: { path: string }): void {
-    const docId = pathToDocId(file.path);
-    this.markDeletedInPouch(docId).catch(() => {/* non-critical */});
-  }
-
-  private onVaultRename(file: { path: string }, oldPath: string): void {
-    // Treat rename as: delete old doc, create new doc
-    const oldDocId = pathToDocId(oldPath);
-    this.markDeletedInPouch(oldDocId).catch(() => {});
-    const entry = this.vault.getEntryByPath(file.path);
-    if (entry && entry.kind === "file") {
-      if (isBinaryPath(file.path)) {
-        this.writeBinaryToPouch(entry).catch(() => {});
-      } else {
-        this.writeTextToPouch(entry).catch(() => {});
-      }
     }
   }
 
@@ -236,7 +198,6 @@ export class PouchDbFsBridge {
     }
 
     if (isBinaryPath(path)) {
-      // Binary path: handled in commit 8 extension
       await this.applyRemoteBinaryChange(doc, path);
       return;
     }
