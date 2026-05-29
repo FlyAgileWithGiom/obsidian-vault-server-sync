@@ -10,7 +10,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { runConverter, type ConverterResult } from "./converter";
+import { runConverter, type ConverterResult, type RemoteDbForPhantomCheck } from "./converter";
 
 // ---- Minimal PouchDB mock -----------------------------------------------
 
@@ -43,6 +43,47 @@ function makePouchMock(initialDocCount = 0) {
     _insertedDocs: insertedDocs,
     _forceBulkFail() { shouldBulkFail = true; },
   };
+}
+
+// ---- Remote mock for phantom check ---------------------------------------
+
+type AllDocsRow =
+  | { id: string; key: string; value: { rev: string; deleted?: boolean } }
+  | { key: string; error: string };
+
+/**
+ * Build a remote mock that answers allDocs with configurable existing/not-found/deleted ids.
+ * existingIds: set of ids that "exist" actively in CouchDB (return a value row)
+ * deletedIds: set of ids that are tombstoned in CouchDB (return value.deleted: true)
+ * All other ids in the keys array get a { key, error: "not_found" } row.
+ *
+ * Real-world: many "phantom" entries (e.g. .git/* files) appear as deleted docs
+ * in CouchDB (they were pushed once, then deleted via daemon tombstone), rather
+ * than pure not_found.
+ */
+function makeRemoteMock(existingIds: Set<string>, deletedIds: Set<string> = new Set()) {
+  const batchCalls: string[][] = [];
+
+  const mock: RemoteDbForPhantomCheck & { _batchCalls: string[][] } = {
+    _batchCalls: batchCalls,
+
+    async allDocs(opts: { keys: string[]; include_docs: false }) {
+      batchCalls.push([...opts.keys]);
+      const rows: AllDocsRow[] = opts.keys.map(key => {
+        if (existingIds.has(key)) {
+          return { id: key, key, value: { rev: "1-abc" } };
+        }
+        if (deletedIds.has(key)) {
+          // Mimics CouchDB response for a deleted doc: value contains rev + deleted:true
+          return { id: key, key, value: { rev: "2-deleted", deleted: true } };
+        }
+        return { key, error: "not_found" };
+      });
+      return { rows };
+    },
+  };
+
+  return mock;
 }
 
 // ---- State file helpers ---------------------------------------------------
@@ -234,6 +275,7 @@ describe("Converter — runConverter()", () => {
     expect(result.migrated).toBe(2);
     expect(result.tombstonedSkipped).toBe(1);
     expect(result.orphanSkipped).toBe(1);
+    expect(result.phantomSkipped).toBe(0);
 
     // No writes to PouchDB
     expect(db._insertedDocs).toHaveLength(0);
@@ -244,5 +286,114 @@ describe("Converter — runConverter()", () => {
     // No marker written
     const markerPath = path.join(pouchDir, ".migration-complete");
     expect(fs.existsSync(markerPath)).toBe(false);
+  });
+
+  // ---- Phantom filter tests -----------------------------------------------
+
+  describe("Phantom filter (remoteDb provided)", () => {
+    it("skips known entry absent from CouchDB (phantom), migrates one present", async () => {
+      const revMap = {
+        "file/real.md": { state: "known", rev: "1-aaa", mtime: 1700000001000 },
+        ".DS_Store":    { state: "known", rev: "1-bbb", mtime: 1700000002000 },
+      };
+      fs.writeFileSync(statePath, makeStateJson(revMap));
+
+      // CouchDB only knows file/real.md
+      const remoteDb = makeRemoteMock(new Set(["file/real.md"]));
+      const result = await runConverter(statePath, pouchDir, db as never, false, remoteDb);
+
+      expect(result.migrated).toBe(1);
+      expect(result.phantomSkipped).toBe(1);
+      expect(result.tombstonedSkipped).toBe(0);
+      expect(result.orphanSkipped).toBe(0);
+
+      // Only real.md should be inserted
+      expect(db._insertedDocs).toHaveLength(1);
+      expect(db._insertedDocs[0]._id).toBe("file/real.md");
+    });
+
+    it("dry-run with remoteDb reports phantomSkipped without writing", async () => {
+      const revMap = {
+        "file/real.md": { state: "known", rev: "1-aaa", mtime: 1700000001000 },
+        ".git/HEAD":    { state: "known", rev: "1-bbb", mtime: 1700000002000 },
+        ".git/config":  { state: "known", rev: "1-ccc", mtime: 1700000003000 },
+        "file/dead.md": { state: "tombstoned", rev: "2-ddd", tombstonedAt: 1700000000000 },
+      };
+      fs.writeFileSync(statePath, makeStateJson(revMap));
+
+      const remoteDb = makeRemoteMock(new Set(["file/real.md"]));
+      const result = await runConverter(statePath, pouchDir, db as never, true, remoteDb);
+
+      expect(result.migrated).toBe(1);
+      expect(result.phantomSkipped).toBe(2);
+      expect(result.tombstonedSkipped).toBe(1);
+      expect(result.orphanSkipped).toBe(0);
+
+      // No writes in dry-run
+      expect(db._insertedDocs).toHaveLength(0);
+      expect(fs.existsSync(statePath)).toBe(true);
+    });
+
+    it("batches allDocs calls: 250 known entries -> 3 batches (100+100+50)", async () => {
+      // Build 250 known entries: first 200 are phantoms, last 50 exist in CouchDB.
+      // PHANTOM_BATCH_SIZE = 100 → batches: [0..99], [100..199], [200..249]
+      const revMap: Record<string, unknown> = {};
+      const existingIds = new Set<string>();
+
+      for (let i = 0; i < 250; i++) {
+        const id = `file/doc-${i}.md`;
+        revMap[id] = { state: "known", rev: `1-${i.toString(16).padStart(3, "0")}`, mtime: 1700000000000 + i };
+        if (i >= 200) existingIds.add(id);
+      }
+      fs.writeFileSync(statePath, makeStateJson(revMap));
+
+      const remoteDb = makeRemoteMock(existingIds);
+      const result = await runConverter(statePath, pouchDir, db as never, false, remoteDb);
+
+      // 3 batches: 100 + 100 + 50
+      expect(remoteDb._batchCalls).toHaveLength(3);
+      expect(remoteDb._batchCalls[0]).toHaveLength(100);
+      expect(remoteDb._batchCalls[1]).toHaveLength(100);
+      expect(remoteDb._batchCalls[2]).toHaveLength(50);
+
+      expect(result.phantomSkipped).toBe(200);
+      expect(result.migrated).toBe(50);
+    });
+
+    it("skips entries that are deleted in CouchDB (value.deleted=true)", async () => {
+      // Real-world scenario: .git/* files were pushed to CouchDB then deleted
+      // remotely. The daemon's state.json still has them as "known".
+      // allDocs returns them with value.deleted:true — they must be skipped.
+      const revMap = {
+        "file/real.md":  { state: "known", rev: "1-aaa", mtime: 1700000001000 },
+        "file/.git/HEAD": { state: "known", rev: "4-bbb", mtime: 1700000002000 },
+      };
+      fs.writeFileSync(statePath, makeStateJson(revMap));
+
+      const existingIds = new Set(["file/real.md"]);
+      const deletedIds = new Set(["file/.git/HEAD"]);
+      const remoteDb = makeRemoteMock(existingIds, deletedIds);
+      const result = await runConverter(statePath, pouchDir, db as never, false, remoteDb);
+
+      expect(result.phantomSkipped).toBe(1);
+      expect(result.migrated).toBe(1);
+
+      expect(db._insertedDocs).toHaveLength(1);
+      expect(db._insertedDocs[0]._id).toBe("file/real.md");
+    });
+
+    it("without remoteDb, no phantom check is performed (phantomSkipped=0)", async () => {
+      const revMap = {
+        ".DS_Store": { state: "known", rev: "1-aaa", mtime: 1700000001000 },
+        ".git/HEAD": { state: "known", rev: "1-bbb", mtime: 1700000002000 },
+      };
+      fs.writeFileSync(statePath, makeStateJson(revMap));
+
+      // No remoteDb — both entries migrated regardless
+      const result = await runConverter(statePath, pouchDir, db as never, false, undefined);
+
+      expect(result.phantomSkipped).toBe(0);
+      expect(result.migrated).toBe(2);
+    });
   });
 });
