@@ -55,6 +55,24 @@ declare module "pouchdb-node" {
     pending?: number;
   }
 
+  /**
+   * Replication / sync options. Mirrors src/pouchdb-browser.d.ts.
+   *
+   * `selector` is a Mango selector forwarded to CouchDB as a server-side
+   * `_changes?filter=_selector` filter (validated by spikes/mobile-text-first):
+   * it gates which docs cross the wire, enabling the two-phase text-first pull.
+   *
+   * `checkpoint: 'target'` stores the replication checkpoint on the local target
+   * (keeps a read-only source clean and makes a phase resumable); `false` forces a
+   * full changes-feed walk with no checkpoint reuse.
+   */
+  interface PouchDbReplicationOpts {
+    live?: boolean;
+    retry?: boolean;
+    selector?: Record<string, unknown>;
+    checkpoint?: "source" | "target" | false;
+  }
+
   class PouchDB {
     /**
      * @param path  Absolute filesystem path to the LevelDB directory.
@@ -63,10 +81,10 @@ declare module "pouchdb-node" {
      */
     constructor(path: string, options?: Record<string, unknown>);
 
-    sync(remote: string, opts?: { live?: boolean; retry?: boolean }): PouchDbSyncHandle;
+    sync(remote: string, opts?: PouchDbReplicationOpts): PouchDbSyncHandle;
 
     replicate: {
-      from(remote: string, opts?: { live?: boolean; retry?: boolean }): PouchDbSyncHandle;
+      from(remote: string, opts?: PouchDbReplicationOpts): PouchDbSyncHandle;
     };
 
     info(): Promise<PouchDbInfo>;
