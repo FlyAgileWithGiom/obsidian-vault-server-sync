@@ -37,9 +37,27 @@ import type {
   FullSyncPlan,
 } from "./types";
 
-/** Emitter shape for PouchDB replication/sync handles. */
+/**
+ * Emitter shape for PouchDB replication/sync handles.
+ *
+ * The `change` payload is a SUPERSET covering two distinct PouchDB shapes that share this
+ * one handler signature (verified against the real artifact, spikes/mobile-text-first/
+ * probe-livesync-events.mjs):
+ * - `replicate.from` (phase-1 pull) emits the FLAT shape: `{ docs_written, pending }`.
+ * - `db.sync` (live, the binary backfill) emits the NESTED shape: `{ direction, change: {
+ *   docs_written, pending } }` — the flat top-level `pending` is ALWAYS undefined there.
+ * A reader that wants progress must consult `info.change?.pending ?? info.pending`, never
+ * the flat field alone, or it silently reads 0 on every live-sync change.
+ */
+interface PouchChangeInfo {
+  docs_written?: number;
+  pending?: number;
+  direction?: "pull" | "push";
+  change?: { docs_written?: number; pending?: number };
+}
+
 interface PouchEmitter {
-  on(event: "change", handler: (info: { docs_written?: number; pending?: number }) => void): this;
+  on(event: "change", handler: (info: PouchChangeInfo) => void): this;
   on(event: "complete", handler: (info?: unknown) => void): this;
   on(event: "error", handler: (err: unknown) => void): this;
   on(event: "active" | "paused", handler: () => void): this;
@@ -88,13 +106,23 @@ export class PouchDbSyncEngine {
   // Two-phase sync tracking (Refs #72)
   private syncPhase: SyncPhase = "idle";
   /**
-   * Last `pending` count seen on a live-sync `change` event. The combined `db.sync`
-   * handle emits a no-arg `paused` BOTH when caught up AND on error-backoff (push is
-   * idle during the backfill, so any pull hiccup coalesces to a no-arg pause). The
-   * server-reported `pending` is the only reliable discriminator: a genuine caught-up
-   * pause follows the feed draining to 0; an error-backoff pause leaves pending > 0.
+   * Last `pending` count seen on a live-sync `change` event, read from the db.sync NESTED
+   * shape (`info.change.pending`) — the flat `info.pending` is always undefined on db.sync
+   * changes (real-artifact verified: spikes/mobile-text-first/probe-livesync-events.mjs).
+   *
+   * The combined `db.sync` handle emits a no-arg `paused` BOTH when caught up AND on
+   * error-backoff (push is idle during the backfill, so any pull hiccup coalesces to a
+   * no-arg pause). The server-reported `pending` is the only reliable discriminator: a
+   * genuine caught-up pause follows the feed draining to 0; an error-backoff pause leaves
+   * pending > 0.
+   *
+   * Seeded to a sentinel (-1, "no change observed yet") rather than 0 so a `paused` that
+   * fires BEFORE the first `change` — the exact error-backoff case this guard exists for —
+   * is not misread as caught-up. Only an actual change reporting pending === 0 may latch
+   * complete/ok.
    */
-  private liveSyncPending = 0;
+  private static readonly PENDING_UNKNOWN = -1;
+  private liveSyncPending = PouchDbSyncEngine.PENDING_UNKNOWN;
 
   constructor(
     private settings: VaultSyncSettings,
@@ -424,7 +452,8 @@ export class PouchDbSyncEngine {
     const handle = this.db.sync(remoteUrl, { live: true, retry: true });
     const emitter = handle as unknown as PouchEmitter;
     this.syncHandle = emitter;
-    this.liveSyncPending = 0;
+    // Sentinel: no change observed yet. A paused before the first change must NOT latch ok.
+    this.liveSyncPending = PouchDbSyncEngine.PENDING_UNKNOWN;
     // Entering live sync means there may be backlog (binaries, or steady-state catch-up).
     // Do not rely on `active` to enter this phase: the combined db.sync `active` only fires
     // once one direction is already paused, so it may not fire at startup.
@@ -434,7 +463,10 @@ export class PouchDbSyncEngine {
     this.setState("syncing");
 
     emitter.on("change", (info) => {
-      this.liveSyncPending = info.pending ?? 0;
+      // db.sync nests progress under info.change.pending (with a .direction field); the flat
+      // info.pending is always undefined on db.sync changes. Read nested first, fall back to
+      // flat for parity with the replicate.from shape; ?? 0 only once a change is observed.
+      this.liveSyncPending = info.change?.pending ?? info.pending ?? 0;
       this.setState("syncing");
     });
 
@@ -446,8 +478,10 @@ export class PouchDbSyncEngine {
     });
 
     emitter.on("paused", () => {
-      // Caught up only when the changes feed drained (pending === 0). A no-arg pause with
-      // pending still > 0 is an error-backoff pause — stay syncing.
+      // Caught up only when an actual change reported the feed drained (pending === 0). The
+      // sentinel (PENDING_UNKNOWN = -1) means no change has been observed yet, so a paused
+      // firing first — the error-backoff case — stays syncing. A no-arg pause with pending
+      // still > 0 is likewise an error-backoff pause, not caught-up.
       if (this.liveSyncPending === 0) {
         this.setPhase("complete");
         this.setState("ok");

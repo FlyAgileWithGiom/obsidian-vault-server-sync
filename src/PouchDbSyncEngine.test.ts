@@ -462,13 +462,55 @@ describe("PouchDbSyncEngine — isFirstRun() branching", () => {
     await engine.start();
     // The live db.sync handle drives completion. A change with pending>0 then a pause is
     // an error-backoff pause — must NOT complete.
-    lastSyncHandle!._emit("change", { docs_written: 10, pending: 42 });
+    // REAL db.sync change shape: progress is NESTED under info.change.pending with a
+    // .direction field. The flat top-level info.pending is undefined on db.sync changes
+    // (verified: spikes/mobile-text-first/probe-livesync-events.mjs). Emitting the nested
+    // shape here is what makes this test exercise the real-artifact behaviour.
+    lastSyncHandle!._emit("change", { direction: "pull", change: { docs_written: 10, pending: 42 } });
     lastSyncHandle!._emit("paused");
     expect(onStateChange).not.toHaveBeenCalledWith("ok");
     // Feed drains (pending 0) then pauses → genuinely caught up → 'ok'.
-    lastSyncHandle!._emit("change", { docs_written: 6750, pending: 0 });
+    lastSyncHandle!._emit("change", { direction: "pull", change: { docs_written: 6750, pending: 0 } });
     lastSyncHandle!._emit("paused");
     expect(onStateChange).toHaveBeenCalledWith("ok");
+    engine.stop();
+  });
+
+  it("stays 'syncing'/'binary-backfill' on a paused after a change reported pending>0 (nested db.sync shape)", async () => {
+    // Regression for the startLiveSync pending-field blocker (Refs #72): the real db.sync
+    // change event nests progress under info.change.pending; the engine previously read the
+    // flat info.pending (always undefined on db.sync), latching liveSyncPending=0 so the
+    // FIRST paused — including the error-backoff pause this guard exists for — falsely
+    // reported "Synced" mid binary-backfill. State AND phase must both stay non-complete.
+    const onStateChange = vi.fn();
+    const { engine } = makeEngine({ docCount: 0 });
+    engine.onStateChange = onStateChange;
+    engine.register(makePlugin());
+    await engine.start();
+    onStateChange.mockClear();
+    // Backfill in flight: a change reporting pending>0, then a (backoff) pause.
+    lastSyncHandle!._emit("change", { direction: "pull", change: { docs_written: 100, pending: 6650 } });
+    lastSyncHandle!._emit("paused");
+    expect(onStateChange).not.toHaveBeenCalledWith("ok");
+    expect(engine.getDiagnostics().state).toBe("syncing");
+    expect(engine.getDiagnostics().syncPhase).toBe("binary-backfill");
+    engine.stop();
+  });
+
+  it("a paused firing BEFORE any change does not latch 'complete'/'ok' (sentinel guard)", async () => {
+    // The combined db.sync handle can emit a no-arg paused at startup before the first
+    // change reports pending. Seeding liveSyncPending to 0 would misread that as caught-up.
+    // A sentinel (no change observed yet) must keep state 'syncing'/phase 'binary-backfill'.
+    const onStateChange = vi.fn();
+    const { engine } = makeEngine({ docCount: 0 });
+    engine.onStateChange = onStateChange;
+    engine.register(makePlugin());
+    await engine.start();
+    onStateChange.mockClear();
+    lastSyncHandle!._emit("paused");
+    expect(onStateChange).not.toHaveBeenCalledWith("ok");
+    expect(engine.getDiagnostics().state).toBe("syncing");
+    expect(engine.getDiagnostics().syncPhase).toBe("binary-backfill");
     engine.stop();
   });
 

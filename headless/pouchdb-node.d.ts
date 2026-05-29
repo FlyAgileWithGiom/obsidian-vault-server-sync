@@ -50,9 +50,20 @@ declare module "pouchdb-node" {
     on(event: "error", handler: (err: unknown) => void): this;
   }
 
+  /**
+   * Superset of the two change-event shapes (verified: spikes/mobile-text-first/
+   * probe-livesync-events.mjs):
+   * - replicate.from emits the FLAT shape: { docs_written, pending }.
+   * - db.sync emits the NESTED shape: { direction, change: { docs_written, pending } } —
+   *   the flat top-level `pending` is ALWAYS undefined there.
+   * A reader after live-sync progress must use `info.change?.pending ?? info.pending`,
+   * never the flat field alone, or it reads 0 on every db.sync change.
+   */
   interface PouchDbChangeInfo {
     docs_written?: number;
     pending?: number;
+    direction?: "pull" | "push";
+    change?: { docs_written?: number; pending?: number };
   }
 
   /**
