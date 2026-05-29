@@ -431,6 +431,8 @@ describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visi
       fetchSampleCount: 0,
       avgApplyMs: null,
       applySampleCount: 0,
+      syncPhase: "text-ready",
+      binaryProgress: null,
     };
 
     const output = formatDiagnostics(d);
@@ -462,6 +464,8 @@ describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visi
       fetchSampleCount: 0,
       avgApplyMs: null,
       applySampleCount: 0,
+      syncPhase: "text-ready",
+      binaryProgress: null,
     };
 
     const output = formatDiagnostics(d);
