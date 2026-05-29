@@ -54,6 +54,32 @@ export function resolveStatePath(
 }
 
 /**
+ * Resolve the PouchDB LevelDB directory for DAEMON_V2 mode.
+ *
+ * Mirrors resolveStatePath() but points to the pouch/ subdirectory.
+ *   macOS  : ~/Library/Application Support/vault-sync-daemon/<dbName>/pouch/
+ *   Linux  : ~/.config/vault-sync-daemon/<dbName>/pouch/
+ *   Windows: %APPDATA%/vault-sync-daemon/<dbName>/pouch/
+ */
+export function resolvePouchDir(
+  dbName: string,
+  env: { platform?: NodeJS.Platform; home?: string; appData?: string } = {},
+): string {
+  const platform = env.platform ?? process.platform;
+  const home = env.home ?? os.homedir();
+  const slug = dbName || "default";
+
+  if (platform === "darwin") {
+    return path.join(home, "Library", "Application Support", STATE_APP_DIR, slug, "pouch");
+  }
+  if (platform === "win32") {
+    const appData = env.appData ?? process.env.APPDATA ?? path.join(home, "AppData", "Roaming");
+    return path.join(appData, STATE_APP_DIR, slug, "pouch");
+  }
+  return path.join(home, ".config", STATE_APP_DIR, slug, "pouch");
+}
+
+/**
  * One-shot migration of the legacy `.vault-sync-state.json` (at vault root) to
  * the new out-of-vault location. Idempotent and safe:
  *  - If no legacy file exists: no-op.
@@ -211,6 +237,73 @@ function handleFsEvent(
   engine.handleLocalChange(vaultFile);
 }
 
+async function mainV2(absVaultRoot: string, settings: VaultSyncSettings): Promise<void> {
+  // DAEMON_V2 path: PouchDB (pouchdb-node + LevelDB) + PouchDbSyncEngine
+  const PouchDB = require("pouchdb-node") as typeof import("pouchdb-node");
+  const { PouchDbFsBridge } = await import("../src/PouchDbFsBridge");
+  const { PouchDbSyncEngine } = await import("../src/PouchDbSyncEngine");
+  const { FsWatcher } = await import("./FsWatcher");
+  const { runConverter } = await import("./converter");
+
+  const pouchDir = resolvePouchDir(settings.couchDbName);
+  fs.mkdirSync(pouchDir, { recursive: true });
+  console.log(`[vault-sync] PouchDB dir: ${pouchDir}`);
+
+  // Construct pouchdb-node database backed by LevelDB at pouchDir
+  const db = new PouchDB(pouchDir) as unknown as import("../src/pouchdb-browser").default;
+
+  // Build vault adapter and bridge
+  const vaultAdapter = new FilesystemVaultAdapter(absVaultRoot);
+  const bridge = new PouchDbFsBridge(vaultAdapter, db);
+
+  // Wire FsWatcher -> bridge before engine.start()
+  const excludePatterns = [STATE_FILENAME, CONFIG_FILENAME, ".git", ...settings.excludePatterns];
+  const fsWatcher = new FsWatcher(absVaultRoot, excludePatterns);
+  bridge.start(fsWatcher);
+
+  // Run converter: migrate state.json revMap -> PouchDB local docs (idempotent)
+  const statePath = resolveStatePath(absVaultRoot, settings.couchDbName);
+  console.log(`[vault-sync] Running converter (state.json -> PouchDB)...`);
+  const convResult = await runConverter(statePath, pouchDir, db);
+  if (convResult.noStateFile) {
+    console.log("[vault-sync] No state.json found — PouchDB will fresh-pull from CouchDB");
+  } else if (convResult.alreadyMigrated) {
+    console.log("[vault-sync] PouchDB already has docs — skipping migration");
+  } else {
+    console.log(
+      `[vault-sync] Converter: migrated ${convResult.migrated} docs, ` +
+      `${convResult.tombstonedSkipped} tombstoned skipped, ${convResult.orphanSkipped} orphan skipped`,
+    );
+  }
+
+  // Build engine with injected db and pre-started bridge
+  const engine = new PouchDbSyncEngine(settings, db, bridge);
+
+  engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
+  engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);
+  engine.onCountsChange = ({ pendingPush, pendingPull }) => {
+    if (pendingPush > 0 || pendingPull > 0) {
+      console.log(`[vault-sync] Pending: ↑${pendingPush} ↓${pendingPull}`);
+    }
+  };
+
+  // start() handles isFirstRun() check — if converter migrated docs, skips initial pull
+  await engine.start();
+
+  // Graceful shutdown
+  function shutdown(signal: string): void {
+    console.log(`\n[vault-sync] Received ${signal}, shutting down...`);
+    engine.stop();
+    fsWatcher.stop();
+    process.exit(0);
+  }
+
+  process.on("SIGINT", () => shutdown("SIGINT"));
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+  console.log("[vault-sync] Daemon v2 (PouchDB) running. Press Ctrl+C to stop.");
+}
+
 async function main(): Promise<void> {
   const vaultRoot = process.argv[2] ?? process.cwd();
   const absVaultRoot = path.resolve(vaultRoot);
@@ -218,6 +311,14 @@ async function main(): Promise<void> {
   console.log(`[vault-sync] Starting headless daemon for vault: ${absVaultRoot}`);
 
   const settings = loadConfig(absVaultRoot);
+
+  if (process.env.DAEMON_V2 === "1") {
+    console.log("[vault-sync] DAEMON_V2=1 — using PouchDB engine (pouchdb-node + LevelDB)");
+    await mainV2(absVaultRoot, settings);
+    return;
+  }
+
+  // Legacy path: CustomFetchSyncStrategy (state.json + CouchDB custom fetch)
   const vaultAdapter = new FilesystemVaultAdapter(absVaultRoot);
 
   // State now lives outside the vault to avoid Dropbox/iCloud conflict-copy

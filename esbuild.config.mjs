@@ -45,7 +45,12 @@ const pluginContext = await esbuild.context({
 });
 
 // --- Headless daemon build ---
-// Headless daemon remains CJS Node — never imports PouchDbSyncStrategy.
+// DAEMON_V2=1 path imports pouchdb-node which uses leveldown (native .node binary).
+// leveldown and fsevents cannot be bundled — they must be required from node_modules
+// at runtime. Mark them external so esbuild emits require("leveldown") instead of
+// trying to inline the native bindings.
+// fsevents is an optional transitive dep (macOS FSEvents via libuv) — externalize
+// defensively to avoid bundle failures on non-macOS targets.
 const headlessContext = await esbuild.context({
   entryPoints: ["headless/main.ts"],
   bundle: true,
@@ -53,6 +58,9 @@ const headlessContext = await esbuild.context({
   target: "node18",
   format: "cjs",
   outfile: "dist/headless.js",
+  // leveldown/fsevents: native bindings, cannot be bundled — resolved from node_modules at runtime
+  // obsidian: Obsidian plugin API, unavailable in Node.js — imported type-only or guarded in PouchDbSyncEngine
+  external: ["leveldown", "fsevents", "obsidian"],
   sourcemap: prod ? false : "inline",
   treeShaking: true,
   minify: prod,

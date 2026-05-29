@@ -25,7 +25,8 @@
     "vitest": "^3.0.0"
   },
   "dependencies": {
-    "pouchdb-browser": "^9.0.0"
+    "pouchdb-browser": "^9.0.0",
+    "pouchdb-node": "^9.0.0"
   },
   "overrides": {
     "uuid": "^11.0.0"
