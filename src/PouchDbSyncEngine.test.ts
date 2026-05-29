@@ -384,12 +384,48 @@ describe("PouchDbSyncEngine — isFirstRun() branching", () => {
     engine.stop();
   });
 
-  it("start() sets state to 'ok' after successful migration", async () => {
+  it("phase-1 pull uses the text selector and checkpoint:'target'", async () => {
+    const { engine, db } = makeEngine({ docCount: 0 });
+    engine.register(makePlugin());
+    await engine.start();
+    expect(db.replicate.from).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        live: false,
+        selector: { _attachments: { $exists: false } },
+        checkpoint: "target",
+      }),
+    );
+    engine.stop();
+  });
+
+  it("after phase-1 completes, state stays 'syncing' (not 'ok') — binaries still pending", async () => {
     const onStateChange = vi.fn();
     const { engine } = makeEngine({ docCount: 0 });
     engine.onStateChange = onStateChange;
     engine.register(makePlugin());
     await engine.start();
+    // Phase-1 (mock replicate.from auto-completes) starts live sync but must NOT set 'ok':
+    // doing so would render "Synced" while the binary backfill has not happened.
+    expect(onStateChange).not.toHaveBeenCalledWith("ok");
+    expect(onStateChange).toHaveBeenCalledWith("syncing");
+    engine.stop();
+  });
+
+  it("live sync reaches 'ok' only on a caught-up pause (pending === 0)", async () => {
+    const onStateChange = vi.fn();
+    const { engine } = makeEngine({ docCount: 0 });
+    engine.onStateChange = onStateChange;
+    engine.register(makePlugin());
+    await engine.start();
+    // The live db.sync handle drives completion. A change with pending>0 then a pause is
+    // an error-backoff pause — must NOT complete.
+    lastSyncHandle!._emit("change", { docs_written: 10, pending: 42 });
+    lastSyncHandle!._emit("paused");
+    expect(onStateChange).not.toHaveBeenCalledWith("ok");
+    // Feed drains (pending 0) then pauses → genuinely caught up → 'ok'.
+    lastSyncHandle!._emit("change", { docs_written: 6750, pending: 0 });
+    lastSyncHandle!._emit("paused");
     expect(onStateChange).toHaveBeenCalledWith("ok");
     engine.stop();
   });

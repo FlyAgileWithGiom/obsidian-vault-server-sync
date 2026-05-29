@@ -45,6 +45,26 @@ interface PouchEmitter {
   cancel(): void;
 }
 
+/**
+ * Two-phase initial pull (Refs #72). Server-side Mango selectors on `_attachments`,
+ * validated against prod by spikes/mobile-text-first (phase-1 = 64 MB on the wire, not
+ * 8 GB; zero `_attachments` docs locally after phase-1).
+ *
+ * Phase 1 pulls text docs only so the vault becomes usable in tens of MB. Phase 2 — the
+ * binary backfill — is handled by the ordinary live `db.sync` (Pattern B): push stays
+ * live from the first moment, and revs_diff skips the already-present text revs (measured:
+ * 0 `_bulk_get` calls on a re-pull against a text-seeded DB), so binaries trickle in
+ * without re-downloading text.
+ */
+const TEXT_SELECTOR = { _attachments: { $exists: false } } as const;
+
+/**
+ * Initial-pull phase, distinct from SyncState. SyncState must NOT read "ok" while binaries
+ * are still backfilling (that renders "Synced" — a lie). The phase carries the honest
+ * "notes ready, attachments syncing" signal; state stays "syncing" until caught up.
+ */
+export type SyncPhase = "idle" | "text-pull" | "text-ready" | "binary-backfill" | "complete";
+
 export class PouchDbSyncEngine {
   // --- Callbacks (set by main.ts before register()) ---
   onStateChange: (state: SyncState) => void = () => {};
@@ -62,6 +82,17 @@ export class PouchDbSyncEngine {
   private pullTotal = 0;
   private lastError: string | null = null;
   private currentState: SyncState = "idle";
+
+  // Two-phase sync tracking (Refs #72)
+  private syncPhase: SyncPhase = "idle";
+  /**
+   * Last `pending` count seen on a live-sync `change` event. The combined `db.sync`
+   * handle emits a no-arg `paused` BOTH when caught up AND on error-backoff (push is
+   * idle during the backfill, so any pull hiccup coalesces to a no-arg pause). The
+   * server-reported `pending` is the only reliable discriminator: a genuine caught-up
+   * pause follows the feed draining to 0; an error-backoff pause leaves pending > 0.
+   */
+  private liveSyncPending = 0;
 
   constructor(
     private settings: VaultSyncSettings,
@@ -265,22 +296,39 @@ export class PouchDbSyncEngine {
   }
 
   /**
-   * Initial pull: replicate all docs from remote to local PouchDB.
-   * Fires progress events via onCountsChange and onDiagnosticsChange.
-   * On completion, cleans up legacy revMap data and starts live sync.
+   * Initial pull, two-phase (Refs #72, Pattern B).
+   *
+   * Phase 1 (blocking, fast): pull TEXT docs only via a server-side `selector` filter, so
+   * the vault is usable in tens of MB rather than waiting on the full ~8 GB. On completion
+   * the phase becomes "text-ready" and live sync starts — state deliberately stays
+   * "syncing", never "ok", because the binaries are not here yet.
+   *
+   * Phase 2 (background, non-blocking, resumable): the binary backfill is just the natural
+   * pull backlog of the live `db.sync` started here. Push is live from this moment, and
+   * revs_diff skips the already-present text revs, so no text is re-downloaded.
+   *
+   * Routes through all three callers (start / forceFullSync / replaceLocalFromServer):
+   * one split, three beneficiaries.
    */
   private async runInitialPull(): Promise<void> {
     if (this.initialPullRunning) return;
     this.initialPullRunning = true;
     this.pullFetched = 0;
     this.pullTotal = 0;
-    this.onDiagnosticsChange();
+    this.setPhase("text-pull");
 
-    this.onNotice?.("Vault Sync: Initial sync starting...");
+    this.onNotice?.("Vault Sync: Downloading notes...");
 
     return new Promise<void>((resolve) => {
       const remoteUrl = this.buildRemoteUrl();
-      const replication = this.db.replicate.from(remoteUrl, { live: false, retry: false });
+      // checkpoint:'target' keeps the replication checkpoint on the local DB (resumable
+      // phase, simplest correct choice). selector is the server-side text filter.
+      const replication = this.db.replicate.from(remoteUrl, {
+        live: false,
+        retry: false,
+        selector: TEXT_SELECTOR,
+        checkpoint: "target",
+      });
       const emitter = replication as unknown as PouchEmitter;
 
       // Track this handle so stop() / cancelSync() can cancel it
@@ -297,10 +345,13 @@ export class PouchDbSyncEngine {
         this.initialPullRunning = false;
         this.syncHandle = null;
         this.cleanupLegacyRevMap();
-        this.onNotice?.("Vault Sync: Initial sync complete");
+        // Phase-1 done: notes are usable. State stays "syncing" (binaries pending) — the
+        // phase, not the state, carries the "ready" signal so the UI never lies "Synced".
+        this.setPhase("text-ready");
+        this.onNotice?.("Vault Sync: Notes ready, attachments downloading in background");
         if (this.started) {
+          // Live db.sync backfills the binaries (Pattern B) while push is live throughout.
           this.startLiveSync();
-          this.setState("ok");
         }
         resolve();
       });
@@ -341,14 +392,53 @@ export class PouchDbSyncEngine {
     return `${couchDbUrl.replace(/\/$/, "")}/${couchDbName}`;
   }
 
+  /**
+   * Live bidirectional sync — the steady state, and (Pattern B) the binary backfill.
+   *
+   * State is driven by the live handle's events, with a deliberate discriminator:
+   * - `change`  : work flowing → "syncing"; remember `pending` for the paused gate.
+   * - `paused`  : the combined db.sync handle emits a no-arg pause on caught-up AND on
+   *               error-backoff. Only treat it as caught-up ("ok"/"complete") when the
+   *               last `pending` was 0; otherwise it is a backoff pause → stay "syncing".
+   * - `active`  : work resuming → "syncing" / "binary-backfill".
+   * - `complete`: only fires when a live handle is cancelled; kept for parity.
+   *
+   * Why not just set "ok" eagerly: doing so renders "Synced" while binaries are still
+   * pending, which is the lie this feature removes.
+   */
   private startLiveSync(): void {
     const remoteUrl = this.buildRemoteUrl();
     const handle = this.db.sync(remoteUrl, { live: true, retry: true });
     const emitter = handle as unknown as PouchEmitter;
     this.syncHandle = emitter;
+    this.liveSyncPending = 0;
+    // Entering live sync means there may be backlog (binaries, or steady-state catch-up).
+    // Do not rely on `active` to enter this phase: the combined db.sync `active` only fires
+    // once one direction is already paused, so it may not fire at startup.
+    if (this.syncPhase !== "complete") {
+      this.setPhase("binary-backfill");
+    }
+    this.setState("syncing");
 
-    emitter.on("change", () => {
+    emitter.on("change", (info) => {
+      this.liveSyncPending = info.pending ?? 0;
       this.setState("syncing");
+    });
+
+    emitter.on("active", () => {
+      if (this.syncPhase !== "complete") {
+        this.setPhase("binary-backfill");
+      }
+      this.setState("syncing");
+    });
+
+    emitter.on("paused", () => {
+      // Caught up only when the changes feed drained (pending === 0). A no-arg pause with
+      // pending still > 0 is an error-backoff pause — stay syncing.
+      if (this.liveSyncPending === 0) {
+        this.setPhase("complete");
+        this.setState("ok");
+      }
     });
 
     emitter.on("complete", () => {
@@ -371,6 +461,11 @@ export class PouchDbSyncEngine {
   private setState(state: SyncState): void {
     this.currentState = state;
     this.onStateChange(state);
+    this.onDiagnosticsChange();
+  }
+
+  private setPhase(phase: SyncPhase): void {
+    this.syncPhase = phase;
     this.onDiagnosticsChange();
   }
 
