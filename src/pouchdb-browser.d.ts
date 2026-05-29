@@ -83,6 +83,11 @@ declare module "pouchdb-browser" {
       attachmentId: string,
     ): Promise<Blob | Buffer>;
 
+    bulkDocs(
+      docs: PouchDbDoc[],
+      opts?: { new_edits?: boolean },
+    ): Promise<Array<{ ok?: boolean; id?: string; rev?: string; error?: boolean; message?: string }>>;
+
     changes(opts: {
       since: string | number;
       live: boolean;
