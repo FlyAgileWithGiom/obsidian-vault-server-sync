@@ -283,6 +283,48 @@ describe("PouchDbSyncEngine — getDiagnostics()", () => {
     expect(diag.state).toBe("idle");
     expect(diag.lastError).toBeNull();
   });
+
+  it("populates the four formerly-missing timing fields as null/0 (no NaN)", () => {
+    // These belonged to the retired PouchDbSyncStrategy; getDiagnostics() omitted them,
+    // violating SyncDiagnostics. They must be present and never NaN.
+    const diag = makeEngine().engine.getDiagnostics();
+    expect(diag.avgFetchMs).toBeNull();
+    expect(diag.fetchSampleCount).toBe(0);
+    expect(diag.avgApplyMs).toBeNull();
+    expect(diag.applySampleCount).toBe(0);
+  });
+
+  it("reports syncPhase 'idle' and binaryProgress null before any pull", () => {
+    const diag = makeEngine().engine.getDiagnostics();
+    expect(diag.syncPhase).toBe("idle");
+    expect(diag.binaryProgress).toBeNull();
+  });
+
+  it("reports syncPhase 'binary-backfill' after phase-1 completes (state still 'syncing')", async () => {
+    const { engine } = makeEngine({ docCount: 0 });
+    engine.register(makePlugin());
+    await engine.start();
+    // Phase-1 (mock replicate.from auto-completes) goes text-ready, then startLiveSync()
+    // moves the phase to binary-backfill (the live db.sync backlog). State stays "syncing"
+    // until a caught-up pause — never "ok" while binaries are still pending.
+    const diag = engine.getDiagnostics();
+    expect(diag.syncPhase).toBe("binary-backfill");
+    expect(diag.state).toBe("syncing");
+    engine.stop();
+  });
+
+  it("reports syncPhase 'complete' and binaryProgress null after a caught-up pause", async () => {
+    const { engine } = makeEngine({ docCount: 0 });
+    engine.register(makePlugin());
+    await engine.start();
+    lastSyncHandle!._emit("change", { docs_written: 6750, pending: 0 });
+    lastSyncHandle!._emit("paused");
+    const diag = engine.getDiagnostics();
+    expect(diag.syncPhase).toBe("complete");
+    expect(diag.state).toBe("ok");
+    expect(diag.binaryProgress).toBeNull();
+    engine.stop();
+  });
 });
 
 describe("PouchDbSyncEngine — forceFullSync() / planFullSync()", () => {
@@ -427,6 +469,18 @@ describe("PouchDbSyncEngine — isFirstRun() branching", () => {
     lastSyncHandle!._emit("change", { docs_written: 6750, pending: 0 });
     lastSyncHandle!._emit("paused");
     expect(onStateChange).toHaveBeenCalledWith("ok");
+    engine.stop();
+  });
+
+  it("fires a one-shot 'Notes ready' notice at the text-ready transition", async () => {
+    const notices: string[] = [];
+    const { engine } = makeEngine({ docCount: 0 });
+    engine.onNotice = (msg: string) => notices.push(msg);
+    engine.register(makePlugin());
+    await engine.start();
+    // Phase-1 completion is the "notes usable" moment — the user-visible win.
+    const readyNotices = notices.filter((m) => /notes ready/i.test(m));
+    expect(readyNotices).toHaveLength(1);
     engine.stop();
   });
 });

@@ -28,6 +28,15 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
 
 export type SyncState = "idle" | "syncing" | "ok" | "error" | "offline" | "not-configured";
 
+/**
+ * Two-phase initial-pull phase (Refs #72), distinct from SyncState.
+ *
+ * SyncState must NOT read "ok" while binaries are still backfilling — that would render
+ * "Synced" as a lie. The phase carries the honest "notes ready, attachments syncing"
+ * signal independently of state. Mirrors PouchDbSyncEngine's internal SyncPhase.
+ */
+export type SyncPhase = "idle" | "text-pull" | "text-ready" | "binary-backfill" | "complete";
+
 export interface SyncCounts {
   pendingPush: number;
   pendingPull: number;
@@ -67,6 +76,19 @@ export interface SyncDiagnostics {
   avgApplyMs: number | null;
   /** Number of samples in the avgApplyMs rolling buffer */
   applySampleCount: number;
+  /**
+   * Two-phase initial-pull phase (Refs #72). Distinct from `state`: when this is
+   * "text-ready" or "binary-backfill", `state` is still "syncing" (binaries pending) —
+   * the UI reads this to show "Notes ready, attachments syncing" without claiming "Synced".
+   */
+  syncPhase: SyncPhase;
+  /**
+   * Binary backfill progress during phase-2, or null when unavailable.
+   * Pattern B has no binary-specific counter (the live db.sync `pending` is a combined
+   * text+binary figure), so this is null under Pattern B and reserved for a future
+   * Pattern A exact "attachments N/total". Do not fabricate an N/6750 from combined pending.
+   */
+  binaryProgress: { fetched: number; total: number } | null;
 }
 
 /**

@@ -31,6 +31,7 @@ import { PouchDbFsBridge } from "./PouchDbFsBridge";
 import type {
   VaultSyncSettings,
   SyncState,
+  SyncPhase,
   SyncCounts,
   SyncDiagnostics,
   FullSyncPlan,
@@ -58,12 +59,8 @@ interface PouchEmitter {
  */
 const TEXT_SELECTOR = { _attachments: { $exists: false } } as const;
 
-/**
- * Initial-pull phase, distinct from SyncState. SyncState must NOT read "ok" while binaries
- * are still backfilling (that renders "Synced" — a lie). The phase carries the honest
- * "notes ready, attachments syncing" signal; state stays "syncing" until caught up.
- */
-export type SyncPhase = "idle" | "text-pull" | "text-ready" | "binary-backfill" | "complete";
+// SyncPhase (distinct from SyncState) is declared in ./types so the diagnostics consumer
+// and the engine share one definition. State must NOT read "ok" while binaries backfill.
 
 export class PouchDbSyncEngine {
   // --- Callbacks (set by main.ts before register()) ---
@@ -232,6 +229,17 @@ export class PouchDbSyncEngine {
       lastError: this.lastError,
       unsyncableCount: 0,
       unsyncableSample: [],
+      // avg*/...SampleCount belonged to the retired per-doc-timing PouchDbSyncStrategy; the
+      // engine has no such instrumentation. Report null/0 (not NaN) so the UI renders cleanly.
+      avgFetchMs: null,
+      fetchSampleCount: 0,
+      avgApplyMs: null,
+      applySampleCount: 0,
+      // Two-phase initial-pull observability (Refs #72).
+      syncPhase: this.syncPhase,
+      // Pattern B has no binary-specific counter (live db.sync `pending` is combined
+      // text+binary), so no honest N/total is available — null, not a fabricated count.
+      binaryProgress: null,
     };
   }
 
