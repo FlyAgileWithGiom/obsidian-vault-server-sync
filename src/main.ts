@@ -1,8 +1,6 @@
 import { Notice, Plugin } from "obsidian";
-import { CouchClient } from "./couch-client";
 import type { PouchDbSyncEngine } from "./PouchDbSyncEngine";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
-import { ObsidianTransport } from "./ObsidianTransport";
 import { VaultSyncSettingTab } from "./settings-tab";
 import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics, FullSyncPlan } from "./types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
@@ -316,8 +314,7 @@ export default class VaultSyncPlugin extends Plugin {
 
   /** Public: called from settings tab */
   async testConnection(): Promise<boolean> {
-    const client = new CouchClient(this.settings, new ObsidianTransport());
-    return client.ping();
+    return this.strategy.testConnection();
   }
 
   // --- UI state ---

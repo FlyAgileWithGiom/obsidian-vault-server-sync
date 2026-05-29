@@ -3,11 +3,8 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
-import { CustomFetchSyncStrategy } from "../src/sync-engine";
 import { FilesystemVaultAdapter } from "./VaultAdapter";
-import { JsonStateStore } from "./StateStore";
-import { FetchTransport } from "./FetchTransport";
-import type { VaultSyncSettings, VaultFile, VaultEntry } from "../src/types";
+import type { VaultSyncSettings } from "../src/types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "../src/types";
 import type { RemoteDbForPhantomCheck } from "./converter";
 
@@ -81,11 +78,6 @@ export function makeHttpRemoteDb(rawUrl: string): RemoteDbForPhantomCheck {
   };
 }
 
-/**
- * Legacy state filename, written at vault root before #54.
- * Kept as a constant so the migration path stays unambiguous.
- */
-const LEGACY_STATE_FILENAME = ".vault-sync-state.json";
 const STATE_FILENAME = "state.json";
 const STATE_APP_DIR = "vault-sync-daemon";
 const CONFIG_FILENAME = VAULT_SYNC_CONFIG_FILE;
@@ -153,52 +145,6 @@ export function resolvePouchDir(
 }
 
 /**
- * One-shot migration of the legacy `.vault-sync-state.json` (at vault root) to
- * the new out-of-vault location. Idempotent and safe:
- *  - If no legacy file exists: no-op.
- *  - If only legacy exists: move it to the new location.
- *  - If both exist: KEEP the new file (presumed newer), DELETE the legacy file
- *    so the cloud-sync conflict loop stops generating phantom copies.
- *
- * Never throws on routine I/O errors — best-effort cleanup. The daemon falls
- * back to fresh state if the new location is empty.
- */
-export function migrateStateFile(vaultRoot: string, newStatePath: string): void {
-  const legacy = path.join(vaultRoot, LEGACY_STATE_FILENAME);
-  let legacyExists = false;
-  try { legacyExists = fs.statSync(legacy).isFile(); } catch { /* no legacy */ }
-  if (!legacyExists) return;
-
-  let newExists = false;
-  try { newExists = fs.statSync(newStatePath).isFile(); } catch { /* no new */ }
-
-  if (newExists) {
-    // New location wins. Unlink legacy so it stops being walked & re-conflicted.
-    // Isolated try/catch: a failed unlink here MUST NOT trigger the rename fallback,
-    // which would copy the legacy file over the current state (data loss).
-    try { fs.unlinkSync(legacy); }
-    catch (e) { console.warn(`[vault-sync] State migration: could not remove legacy ${legacy}: ${(e as Error).message}`); }
-    return;
-  }
-
-  try {
-    fs.mkdirSync(path.dirname(newStatePath), { recursive: true });
-    fs.renameSync(legacy, newStatePath);
-  } catch (e) {
-    // Cross-device rename (EXDEV) or transient I/O — fall back to copy+unlink.
-    // Safe here because the newExists branch returned above: target is absent
-    // so copyFileSync cannot clobber a current state file.
-    try {
-      fs.mkdirSync(path.dirname(newStatePath), { recursive: true });
-      fs.copyFileSync(legacy, newStatePath);
-      fs.unlinkSync(legacy);
-    } catch (inner) {
-      console.warn(`[vault-sync] State migration failed: ${(e as Error).message} / ${(inner as Error).message}`);
-    }
-  }
-}
-
-/**
  * Patterns that must ALWAYS be excluded from sync regardless of user config.
  * Critical: `.git/` and `.DS_Store` were leaking into CouchDB before because
  * they weren't in the user's `excludePatterns`. The watcher excludes them
@@ -242,76 +188,8 @@ function loadConfig(vaultRoot: string): VaultSyncSettings {
   }
 }
 
-const DEBOUNCE_MS = 100;
-
-export function createWatcher(
-  absVaultRoot: string,
-  excludePatterns: string[],
-  engine: Pick<CustomFetchSyncStrategy, "handleLocalChange" | "handleLocalDelete">,
-): fs.FSWatcher {
-  const debounce = new Map<string, ReturnType<typeof setTimeout>>();
-  // macOS FSEvents emits a spurious event with rawFilename === basename(vaultRoot)
-  const vaultRootBasename = path.basename(absVaultRoot);
-
-  const watcher = fs.watch(absVaultRoot, { recursive: true, persistent: true });
-
-  watcher.on("change", (eventType: string, rawFilename: string | Buffer | null) => {
-    if (!rawFilename) return;
-    const rel = typeof rawFilename === "string" ? rawFilename : rawFilename.toString("utf-8");
-
-    // Skip spurious self-referential events for the vault root directory itself
-    if (rel === vaultRootBasename) return;
-
-    const filePath = path.join(absVaultRoot, rel);
-
-    if (excludePatterns.some((p) => rel === p || rel.startsWith(p + path.sep))) return;
-
-    const existing = debounce.get(rel);
-    if (existing) clearTimeout(existing);
-    debounce.set(rel, setTimeout(() => {
-      debounce.delete(rel);
-      handleFsEvent(filePath, rel, engine);
-    }, DEBOUNCE_MS));
-  });
-
-  watcher.on("error", (error: Error) => {
-    console.error("[vault-sync] Watcher error:", error);
-  });
-
-  return watcher;
-}
-
-function handleFsEvent(
-  filePath: string,
-  rel: string,
-  engine: Pick<CustomFetchSyncStrategy, "handleLocalChange" | "handleLocalDelete">,
-): void {
-  let stat: ReturnType<typeof fs.statSync> | null = null;
-  try {
-    stat = fs.statSync(filePath);
-  } catch {
-    // Path no longer exists → delete event
-  }
-
-  if (!stat) {
-    const file: VaultEntry = { kind: "file", path: rel, mtime: 0, size: 0 };
-    engine.handleLocalDelete(file);
-    return;
-  }
-
-  if (stat.isDirectory()) return;
-
-  const vaultFile: VaultFile = {
-    kind: "file",
-    path: rel,
-    mtime: stat.mtimeMs,
-    size: stat.size,
-  };
-  engine.handleLocalChange(vaultFile);
-}
-
 /**
- * Exported startup sequence for DAEMON_V2.
+ * Exported startup sequence for the PouchDB daemon.
  *
  * Extracted for testability: allows unit tests to assert that runConverter
  * completes (on a cold PouchDB) BEFORE bridge.start() arms the changes-feed
@@ -381,8 +259,8 @@ export async function runDaemonV2Startup(deps: {
   await engine.start();
 }
 
-async function mainV2(absVaultRoot: string, settings: VaultSyncSettings): Promise<void> {
-  // DAEMON_V2 path: PouchDB (pouchdb-node + LevelDB) + PouchDbSyncEngine
+async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Promise<void> {
+  // PouchDB (pouchdb-node + LevelDB) + PouchDbSyncEngine — the only engine since v2.0 (issue #69).
   const PouchDB = require("pouchdb-node") as typeof import("pouchdb-node");
   const { PouchDbFsBridge } = await import("../src/PouchDbFsBridge");
   const { PouchDbSyncEngine } = await import("../src/PouchDbSyncEngine");
@@ -447,7 +325,7 @@ async function mainV2(absVaultRoot: string, settings: VaultSyncSettings): Promis
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-  console.log("[vault-sync] Daemon v2 (PouchDB) running. Press Ctrl+C to stop.");
+  console.log("[vault-sync] Daemon (PouchDB) running. Press Ctrl+C to stop.");
 }
 
 async function main(): Promise<void> {
@@ -458,60 +336,9 @@ async function main(): Promise<void> {
 
   const settings = loadConfig(absVaultRoot);
 
-  if (process.env.DAEMON_V2 === "1") {
-    console.log("[vault-sync] DAEMON_V2=1 — using PouchDB engine (pouchdb-node + LevelDB)");
-    await mainV2(absVaultRoot, settings);
-    return;
-  }
-
-  // Legacy path: CustomFetchSyncStrategy (state.json + CouchDB custom fetch)
-  const vaultAdapter = new FilesystemVaultAdapter(absVaultRoot);
-
-  // State now lives outside the vault to avoid Dropbox/iCloud conflict-copy
-  // loops (issue #54). Migrate any legacy in-vault file on first run.
-  const statePath = resolveStatePath(absVaultRoot, settings.couchDbName);
-  migrateStateFile(absVaultRoot, statePath);
-  console.log(`[vault-sync] State file: ${statePath}`);
-  const stateStore = new JsonStateStore(statePath);
-
-  const transport = new FetchTransport();
-
-  const engine = new CustomFetchSyncStrategy(settings, vaultAdapter, stateStore, transport);
-
-  engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
-  engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);
-  engine.onCountsChange = ({ pendingPush, pendingPull }) => {
-    if (pendingPush > 0 || pendingPull > 0) {
-      console.log(`[vault-sync] Pending: ↑${pendingPush} ↓${pendingPull}`);
-    }
-  };
-
-  // Start initial sync
-  await engine.start();
-
-  // Watch filesystem for local changes
-  // Exclude state file and config file from watching to prevent echo loops
-  const excludePatterns = [
-    STATE_FILENAME,
-    CONFIG_FILENAME,
-    ".git",
-    ...settings.excludePatterns,
-  ];
-
-  const watcher = createWatcher(absVaultRoot, excludePatterns, engine);
-
-  // Graceful shutdown
-  function shutdown(signal: string): void {
-    console.log(`\n[vault-sync] Received ${signal}, shutting down...`);
-    engine.stop();
-    watcher.close();
-    process.exit(0);
-  }
-
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-
-  console.log("[vault-sync] Daemon running. Press Ctrl+C to stop.");
+  // PouchDB is the only sync engine since v2.0 (issue #69). The former DAEMON_V2
+  // env flag is now a no-op — kept harmless for operators who still set it.
+  await runDaemon(absVaultRoot, settings);
 }
 
 // Only auto-run when executed as the entry point (dist/headless.js or headless/main.ts),

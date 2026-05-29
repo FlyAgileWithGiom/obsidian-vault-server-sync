@@ -43,54 +43,6 @@ export interface RevMap {
   [docId: string]: RevMapEntry;
 }
 
-export interface CouchDoc {
-  _id: string;
-  _rev?: string;
-  content: string | null;
-  mtime: number;
-  deleted?: boolean;
-  _deleted?: boolean;
-  _attachments?: Record<string, CouchAttachmentStub>;
-}
-
-export interface CouchAttachmentStub {
-  content_type: string;
-  length: number;
-  stub: true;
-}
-
-export interface CouchBulkResult {
-  ok?: boolean;
-  id: string;
-  rev?: string;
-  error?: string;
-  reason?: string;
-}
-
-export interface CouchChangesResult {
-  last_seq: string | number;
-  results: CouchChangeRow[];
-}
-
-export interface CouchChangeRow {
-  seq: string | number;
-  id: string;
-  changes: { rev: string }[];
-  deleted?: boolean;
-  doc?: CouchDoc;
-}
-
-export interface CouchAllDocsResult {
-  total_rows: number;
-  rows: {
-    id: string;
-    key: string;
-    value: { rev: string };
-    doc?: CouchDoc;
-    error?: string; // Present when doc not found (POST _all_docs with keys)
-  }[];
-}
-
 /** Diagnostic snapshot for settings UI -- provides observability on mobile */
 export interface SyncDiagnostics {
   running: boolean;
@@ -183,24 +135,3 @@ export interface VaultAdapter {
   normalizePath(path: string): string;
 }
 
-export interface HttpResponse {
-  status: number;
-  text(): Promise<string>;
-  json<T>(): Promise<T>;
-  arrayBuffer(): Promise<ArrayBuffer>;
-}
-
-export interface HttpTransport {
-  request(options: {
-    url: string;
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string | ArrayBuffer;
-    timeoutMs?: number;
-  }): Promise<HttpResponse>;
-}
-
-export interface StateStore {
-  get(key: string): string | null;
-  set(key: string, value: string): void;
-}

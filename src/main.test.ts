@@ -8,12 +8,6 @@ import { PouchDbSyncEngine as SyncEngine } from "./PouchDbSyncEngine";
 // Import the plugin class — obsidian is aliased to the mock via vitest.config.ts
 import VaultSyncPlugin from "./main";
 
-vi.mock("./couch-client", () => ({
-  CouchClient: vi.fn().mockImplementation(() => ({
-    ping: vi.fn().mockResolvedValue(true),
-  })),
-}));
-
 vi.mock("./settings-tab", () => ({
   VaultSyncSettingTab: vi.fn().mockImplementation(() => ({})),
 }));
