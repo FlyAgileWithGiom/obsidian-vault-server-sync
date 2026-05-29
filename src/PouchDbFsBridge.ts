@@ -59,8 +59,33 @@ export class PouchDbFsBridge {
 
   constructor(
     private readonly vault: VaultAdapter,
-    private readonly db: PouchDB,
+    private db: PouchDB,
   ) {}
+
+  /**
+   * Replace the PouchDB instance held by the bridge.
+   *
+   * Called by PouchDbSyncEngine.replaceLocalFromServer() after destroying the old
+   * database and creating a fresh one. Re-arms the changes listener on the new db
+   * if the bridge was already started (watcher present), so live change feed keeps
+   * working after a local-replace.
+   *
+   * The vault-event watcher is NOT restarted — it routes through onVaultEvent()
+   * which reads this.db fresh on every call.
+   */
+  setDb(db: PouchDB): void {
+    this.db = db;
+    // Cancel the changes listener on the destroyed db before arming a new one.
+    if (this.changesHandle) {
+      this.changesHandle.cancel();
+      this.changesHandle = null;
+    }
+    // Re-arm only if bridge was started; if not started yet, startChangesListener()
+    // will be called by start() later.
+    if (this.watcher !== null) {
+      this.startChangesListener();
+    }
+  }
 
   /**
    * Wire vault event handlers and start listening to PouchDB changes.

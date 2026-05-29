@@ -65,8 +65,9 @@ export class PouchDbSyncEngine {
 
   constructor(
     private settings: VaultSyncSettings,
-    private readonly db: PouchDB,
+    private db: PouchDB,
     private readonly bridge: PouchDbFsBridge,
+    private readonly dbFactory?: () => PouchDB,
   ) {}
 
   // --- Lifecycle ---
@@ -136,21 +137,39 @@ export class PouchDbSyncEngine {
   }
 
   /**
-   * DESTRUCTIVE: destroy local PouchDB, then re-pull all docs from the remote.
-   * Matches the "Replace local from server" Obsidian command intent.
+   * DESTRUCTIVE: destroy local PouchDB, create a fresh instance, then re-pull all
+   * docs from the remote. Matches the "Replace local from server" Obsidian command.
    * Decision D5 in v2-unify-pouchdb-plan.md.
+   *
+   * Requires dbFactory to be provided at construction time. Without it the engine
+   * cannot create a fresh PouchDB instance and will throw rather than silently
+   * operating on the destroyed database.
    */
   async replaceLocalFromServer(): Promise<void> {
+    // Guard before touching the db — if factory is absent, fail loudly early.
+    if (!this.dbFactory) {
+      throw new Error(
+        "[vault-sync] replaceLocalFromServer: dbFactory is required but was not provided. " +
+        "Pass a dbFactory (() => PouchDB) to the PouchDbSyncEngine constructor.",
+      );
+    }
     this.cancelSync();
+    // Reset in-flight pull flag so runInitialPull is not a no-op on a fresh db.
+    this.initialPullRunning = false;
     this.setState("syncing");
     try {
       await (this.db as unknown as { destroy(): Promise<void> }).destroy();
     } catch (e) {
-      // Non-fatal: log and continue — runInitialPull will start fresh anyway
+      // Non-fatal: log and continue — we are creating a fresh instance regardless.
       console.warn("[vault-sync] replaceLocalFromServer: db.destroy() failed:", e);
     }
+    // Recreate the db and propagate the new instance to the bridge so its
+    // changes listener and all subsequent db.put/db.get calls use the fresh db.
+    this.db = this.dbFactory();
+    this.bridge.setDb(this.db);
     this.started = true;
     await this.runInitialPull();
+    // runInitialPull's complete handler calls startLiveSync() + setState("ok").
   }
 
   isRunning(): boolean {

@@ -89,7 +89,7 @@ function makeMockDb(docCount = 0) {
 }
 
 function makeMockBridge() {
-  return { start: vi.fn(), stop: vi.fn() };
+  return { start: vi.fn(), stop: vi.fn(), setDb: vi.fn() };
 }
 
 function makeSettings(): VaultSyncSettings {
@@ -106,8 +106,10 @@ function makeSettings(): VaultSyncSettings {
 function makeEngine(opts: { docCount?: number } = {}) {
   const db = makeMockDb(opts.docCount ?? 0);
   const bridge = makeMockBridge();
+  // dbFactory returns the same mock db so destroy+recreate keeps assertions on same object.
+  const dbFactory = () => db as unknown as Parameters<typeof PouchDbSyncEngine>[1];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any);
+  const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any, dbFactory as any);
   return { engine, db, bridge };
 }
 
@@ -448,10 +450,33 @@ describe("PouchDbSyncEngine — replaceLocalFromServer()", () => {
     const db = makeMockDb(5);
     (db.destroy as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("destroy failed"));
     const bridge = makeMockBridge();
+    const dbFactory = () => db as unknown as Parameters<typeof PouchDbSyncEngine>[1];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any);
+    const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any, dbFactory as any);
     engine.register(makePlugin());
     await expect(engine.replaceLocalFromServer()).resolves.toBeUndefined();
     expect(db.replicate.from).toHaveBeenCalled();
+  });
+
+  it("throws clearly when dbFactory is absent", async () => {
+    const db = makeMockDb(5);
+    const bridge = makeMockBridge();
+    // No factory passed — replaceLocalFromServer must throw before touching the db.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any);
+    await expect(engine.replaceLocalFromServer()).rejects.toThrow("dbFactory");
+    expect(db.destroy).not.toHaveBeenCalled();
+  });
+
+  it("calls bridge.setDb() with the new db after recreating", async () => {
+    const { engine, db, bridge } = makeEngine({ docCount: 5 });
+    engine.register(makePlugin());
+    await engine.replaceLocalFromServer();
+    expect(bridge.setDb).toHaveBeenCalledWith(db);
+    expect(bridge.setDb).toHaveBeenCalledBefore
+      ? expect(bridge.setDb.mock.invocationCallOrder[0]).toBeLessThan(
+          (db.replicate.from as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0],
+        )
+      : undefined; // Invocation order check
   });
 });
