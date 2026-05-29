@@ -1,9 +1,9 @@
 /**
- * Binary file extension helpers shared between CustomFetchSyncStrategy and
- * PouchDbFsBridge. Extracted here to avoid duplication and silent drift.
- *
- * Both strategies must agree on which files are binary so that the same
- * file is always stored via _attachments (never as a text doc).
+ * Binary file extension helpers used by PouchDbFsBridge — the single bridge
+ * shared by the Obsidian plugin (pouchdb-browser) and the headless daemon
+ * (pouchdb-node). Centralising detection here keeps plugin and daemon in
+ * agreement on which files are binary, so the same file is always stored via
+ * _attachments (never as a text doc).
  */
 
 /** Constant name for the PouchDB attachment that holds binary file data. */

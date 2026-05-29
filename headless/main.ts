@@ -119,7 +119,7 @@ export function resolveStatePath(
 }
 
 /**
- * Resolve the PouchDB LevelDB directory for DAEMON_V2 mode.
+ * Resolve the PouchDB LevelDB directory for the daemon.
  *
  * Mirrors resolveStatePath() but points to the pouch/ subdirectory.
  *   macOS  : ~/Library/Application Support/vault-sync-daemon/<dbName>/pouch/

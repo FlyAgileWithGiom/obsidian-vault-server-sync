@@ -45,7 +45,7 @@ const pluginContext = await esbuild.context({
 });
 
 // --- Headless daemon build ---
-// DAEMON_V2=1 path imports pouchdb-node which uses leveldown (native .node binary).
+// The daemon imports pouchdb-node which uses leveldown (native .node binary).
 // leveldown and fsevents cannot be bundled — they must be required from node_modules
 // at runtime. Mark them external so esbuild emits require("leveldown") instead of
 // trying to inline the native bindings.

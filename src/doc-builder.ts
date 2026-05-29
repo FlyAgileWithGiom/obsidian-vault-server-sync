@@ -1,8 +1,9 @@
 /**
- * Helpers for constructing CouchDB/PouchDB document shapes.
- * Shared between CustomFetchSyncStrategy and PouchDbFsBridge so that
- * both strategies produce identical document formats — critical for LWW
- * conflict resolution (mtime must be integer-truncated identically on both sides).
+ * Helpers for constructing PouchDB document shapes.
+ * Used by PouchDbFsBridge so the Obsidian plugin (pouchdb-browser) and the
+ * headless daemon (pouchdb-node) produce identical document formats — critical
+ * for LWW conflict resolution (mtime must be integer-truncated identically on
+ * both sides).
  */
 
 import { pathToDocId } from "./doc-id";
