@@ -169,6 +169,29 @@ describe("Converter — runConverter()", () => {
     expect(revs["file/notes/c.md"]).toBe("3-ccc");
   });
 
+  it("counts migrated correctly when bulkDocs returns [] (new_edits:false real pouchdb-node behaviour)", async () => {
+    // BUG FIX REGRESSION GUARD (Bug 2): With new_edits:false, pouchdb-node returns
+    // [] on full success — not [{ok:true},...]. The old code counted r.ok rows
+    // and got 0. The fix counts docs.length - error rows.
+    const revMap = {
+      "file/a.md": { state: "known", rev: "1-aaa", mtime: 1700000001000 },
+      "file/b.md": { state: "known", rev: "2-bbb", mtime: 1700000002000 },
+    };
+    fs.writeFileSync(statePath, makeStateJson(revMap));
+
+    // Override bulkDocs to simulate pouchdb-node real behaviour: return [] on success
+    const emptyResultDb = {
+      async info() { return { db_name: "test", doc_count: 0, update_seq: 0 }; },
+      async bulkDocs(docs: BulkDoc[], _opts: { new_edits: boolean }) {
+        return []; // pouchdb-node returns [] when new_edits:false and all succeed
+      },
+    };
+
+    const result = await runConverter(statePath, pouchDir, emptyResultDb as never);
+    // Must report 2 migrated, not 0
+    expect(result.migrated).toBe(2);
+  });
+
   it("skips tombstoned entries (Decision D3)", async () => {
     const revMap = {
       "file/alive.md": { state: "known", rev: "1-aaa", mtime: 1700000001000 },

@@ -358,6 +358,8 @@ declare module "vitest" {
 // causing the converter to believe migration already happened and silently
 // skipping the full seed (partial sync with missing files).
 
+const FAKE_REMOTE_DB = { async allDocs() { return { rows: [] }; } };
+
 describe("runDaemonV2Startup — converter runs before bridge.start (init-order guard)", () => {
   it("calls runConverter to completion before bridge.start is called", async () => {
     const callOrder: string[] = [];
@@ -368,7 +370,7 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
 
     const mockConverter = vi.fn(async () => {
       callOrder.push("runConverter");
-      return { alreadyMigrated: false, migrated: 3, tombstonedSkipped: 0, orphanSkipped: 0 };
+      return { alreadyMigrated: false, migrated: 3, tombstonedSkipped: 0, orphanSkipped: 0, phantomSkipped: 0 };
     });
 
     const mockFsWatcher = {};
@@ -385,6 +387,7 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
       statePath: "/fake/state.json",
       pouchDir: "/fake/pouch",
       db: {},
+      remoteDb: FAKE_REMOTE_DB,
     });
 
     // All three must have been called
@@ -410,8 +413,40 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
       statePath: "/fake/state.json",
       pouchDir: "/fake/pouch",
       db: {},
+      remoteDb: FAKE_REMOTE_DB,
     });
 
     expect(mockBridge.start).toHaveBeenCalledWith(mockFsWatcher);
+  });
+
+  it("passes remoteDb as the 5th argument to runConverter (phantom filter wiring)", async () => {
+    // BUG FIX REGRESSION GUARD: Before this fix, runConverter was called with
+    // only 3 args (statePath, pouchDir, db) — remoteDb was never passed.
+    // The phantom filter (C04-bis) is a no-op when remoteDb is undefined, so
+    // phantom entries (.DS_Store, .git/*) were migrated and pushed to CouchDB.
+    // This test pins that runConverter always receives a defined remoteDb as arg 5.
+    const capturedArgs: unknown[] = [];
+
+    const mockConverter = vi.fn(async (...args: unknown[]) => {
+      capturedArgs.push(...args);
+      return { migrated: 0, tombstonedSkipped: 0, orphanSkipped: 0, phantomSkipped: 0 };
+    });
+
+    const fakeRemoteDb = { async allDocs() { return { rows: [] }; } };
+
+    await runDaemonV2Startup({
+      bridge: { start: vi.fn() },
+      runConverter: mockConverter as never,
+      fsWatcher: {},
+      engine: { start: vi.fn(async () => {}) },
+      statePath: "/fake/state.json",
+      pouchDir: "/fake/pouch",
+      db: {},
+      remoteDb: fakeRemoteDb,
+    });
+
+    // arg[0]=statePath, [1]=pouchDir, [2]=db, [3]=dryRun=false, [4]=remoteDb
+    expect(capturedArgs[4]).toBe(fakeRemoteDb);
+    expect(capturedArgs[3]).toBe(false); // dryRun must be false in daemon mode
   });
 });

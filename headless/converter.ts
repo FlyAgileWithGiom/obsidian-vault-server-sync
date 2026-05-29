@@ -273,13 +273,14 @@ export async function runConverter(
       ): Promise<Array<{ ok?: boolean; error?: boolean; message?: string }>>;
     }).bulkDocs(docs, { new_edits: false });
 
-    // Count successes (ok: true) and soft failures
-    let successCount = 0;
+    // With new_edits:false, pouchdb-node returns [] on full success (no ok rows).
+    // It only returns rows for errors. Count = docs.length - error rows.
+    // Counting r.ok would give 0 on success (the prior bug: "migrated 0 docs").
     let errorCount = 0;
     for (const r of results) {
-      if (r.ok) successCount++;
-      else if (r.error) errorCount++;
+      if (r.error) errorCount++;
     }
+    const successCount = docs.length - errorCount;
     result.migrated = successCount;
 
     if (errorCount > 0) {

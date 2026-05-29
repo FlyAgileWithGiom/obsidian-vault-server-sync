@@ -1,12 +1,85 @@
 import * as path from "node:path";
 import * as os from "node:os";
 import * as fs from "node:fs";
+import * as http from "node:http";
+import * as https from "node:https";
 import { CustomFetchSyncStrategy } from "../src/sync-engine";
 import { FilesystemVaultAdapter } from "./VaultAdapter";
 import { JsonStateStore } from "./StateStore";
 import { FetchTransport } from "./FetchTransport";
 import type { VaultSyncSettings, VaultFile, VaultEntry } from "../src/types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "../src/types";
+import type { RemoteDbForPhantomCheck } from "./converter";
+
+/**
+ * Build a RemoteDbForPhantomCheck that uses node:http or node:https directly.
+ *
+ * pouchdb-node's HTTP adapter hangs on large _all_docs?keys=... POST requests
+ * (keep-alive issues with Fly.io / CouchDB). node:http(s) with explicit
+ * Connection:close avoids the hang. Supports both http:// (localhost, smoke
+ * tests) and https:// (production Fly.io) by selecting the module based on
+ * the URL scheme.
+ *
+ * The rawUrl must include credentials if authentication is required, e.g.:
+ *   http://user:pass@localhost:5986/vault-name
+ *   https://user:pass@couchdb.fly.dev/vault-name
+ */
+export function makeHttpRemoteDb(rawUrl: string): RemoteDbForPhantomCheck {
+  const parsed = new URL(rawUrl);
+  const isHttps = parsed.protocol === "https:";
+  const auth = parsed.username
+    ? `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}`
+    : undefined;
+
+  // Strip credentials from the URL used for the request path
+  const reqUrl = new URL(rawUrl);
+  reqUrl.username = "";
+  reqUrl.password = "";
+  const baseUrl = reqUrl.toString().replace(/\/$/, "");
+
+  return {
+    async allDocs(opts: { keys: string[]; include_docs: false }) {
+      const endpoint = `${baseUrl}/_all_docs?include_docs=false`;
+      const body = JSON.stringify({ keys: opts.keys });
+      const endpointParsed = new URL(endpoint);
+
+      return new Promise((resolve, reject) => {
+        const reqOptions = {
+          hostname: endpointParsed.hostname,
+          port: endpointParsed.port || (isHttps ? 443 : 80),
+          path: endpointParsed.pathname + endpointParsed.search,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(body),
+            ...(auth ? { "Authorization": auth } : {}),
+            // Disable keep-alive to avoid socket hang-up on Fly.io CouchDB
+            "Connection": "close",
+          },
+        };
+
+        const transport = isHttps ? https : http;
+        const req = transport.request(reqOptions, (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (c: Buffer) => chunks.push(c));
+          res.on("end", () => {
+            try {
+              const json = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+              resolve(json);
+            } catch (e) {
+              reject(new Error(`Failed to parse _all_docs response: ${e}`));
+            }
+          });
+          res.on("error", reject);
+        });
+
+        req.on("error", reject);
+        req.write(body);
+        req.end();
+      });
+    },
+  };
+}
 
 /**
  * Legacy state filename, written at vault root before #54.
@@ -257,26 +330,36 @@ function handleFsEvent(
  */
 export async function runDaemonV2Startup(deps: {
   bridge: { start: (watcher: unknown) => void };
-  runConverter: (statePath: string, pouchDir: string, db: unknown) => Promise<{
+  runConverter: (
+    statePath: string,
+    pouchDir: string,
+    db: unknown,
+    dryRun: boolean,
+    remoteDb: RemoteDbForPhantomCheck,
+  ) => Promise<{
     noStateFile?: boolean;
     alreadyMigrated?: boolean;
     migrated?: number;
     tombstonedSkipped?: number;
     orphanSkipped?: number;
+    phantomSkipped?: number;
   }>;
   fsWatcher: unknown;
   engine: { start: () => Promise<void> };
   statePath: string;
   pouchDir: string;
   db: unknown;
+  remoteDb: RemoteDbForPhantomCheck;
 }): Promise<void> {
-  const { bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db } = deps;
+  const { bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db, remoteDb } = deps;
 
   // CRITICAL: converter MUST run on a cold PouchDB (no other writer active).
   // Arming the changes-feed or FS watcher before this completes risks a
   // Dropbox/iCloud FS event triggering writeTextToPouch → db.put → doc_count > 0,
   // making the converter skip the seed and causing silent partial sync.
-  const convResult = await runConverter(statePath, pouchDir, db);
+  // remoteDb is required so the phantom filter (C04-bis) actually runs — without
+  // it, phantom entries (.DS_Store, .git/*) would be migrated and pushed to CouchDB.
+  const convResult = await runConverter(statePath, pouchDir, db, false, remoteDb);
   if (convResult.noStateFile) {
     console.log("[vault-sync] No state.json found — PouchDB will fresh-pull from CouchDB");
   } else if (convResult.alreadyMigrated) {
@@ -284,7 +367,9 @@ export async function runDaemonV2Startup(deps: {
   } else {
     console.log(
       `[vault-sync] Converter: migrated ${convResult.migrated} docs, ` +
-      `${convResult.tombstonedSkipped} tombstoned skipped, ${convResult.orphanSkipped} orphan skipped`,
+      `${convResult.tombstonedSkipped} tombstoned skipped, ` +
+      `${convResult.orphanSkipped} orphan skipped, ` +
+      `${convResult.phantomSkipped ?? 0} phantom skipped`,
     );
   }
 
@@ -333,8 +418,23 @@ async function mainV2(absVaultRoot: string, settings: VaultSyncSettings): Promis
   const statePath = resolveStatePath(absVaultRoot, settings.couchDbName);
   console.log(`[vault-sync] Running converter (state.json -> PouchDB)...`);
 
+  // Build the remoteDb adapter for the phantom check (C04-bis).
+  // Uses node:http(s) directly instead of pouchdb-node's HTTP adapter, which
+  // hangs on _all_docs POST requests under Fly.io CouchDB (keep-alive issue).
+  // This covers localhost:5986 (smoke/http) and production Fly.io (https).
+  const { couchDbUrl, couchDbName, couchDbUser, couchDbPassword } = settings;
+  const base = couchDbUrl.replace(/\/$/, "");
+  const proto = base.startsWith("https://") ? "https://" : "http://";
+  const host = base.slice(proto.length);
+  const authPart = (couchDbUser && couchDbPassword)
+    ? `${encodeURIComponent(couchDbUser)}:${encodeURIComponent(couchDbPassword)}@`
+    : "";
+  const remoteDbUrl = `${proto}${authPart}${host}/${couchDbName}`;
+  const remoteDb = makeHttpRemoteDb(remoteDbUrl);
+  console.log(`[vault-sync] Phantom check remote: ${proto}${host}/${couchDbName}`);
+
   // Delegate ordering logic to runDaemonV2Startup (converter first, then bridge.start)
-  await runDaemonV2Startup({ bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db });
+  await runDaemonV2Startup({ bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db, remoteDb });
 
   // Graceful shutdown
   function shutdown(signal: string): void {
