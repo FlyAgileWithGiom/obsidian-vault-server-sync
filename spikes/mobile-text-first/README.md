@@ -119,3 +119,55 @@ export SCRATCH_URL="http://smoke:smokepass@localhost:5986"
 node measure.mjs text            # phase-1 wire-byte measurement
 node measure.mjs binary-resume   # phase-2 separability + resumability
 ```
+
+## c5 verification harness (Refs #72, plan section 7)
+
+`measure.mjs` reports numbers; `verify-c5.mjs` ASSERTS them and exits non-zero on failure,
+so it is the decisive real-artifact PROOF a vitest cannot give (a mocked PouchDB returns
+whatever the mock returns — it cannot measure the wire). It drives the same
+`replicate.from(remote, {selector, checkpoint:'target'})` call shape the production
+`PouchDbSyncEngine.runInitialPull()` issues, against prod READ-ONLY into a scratch DB.
+
+```
+node verify-c5.mjs            # all checks
+node verify-c5.mjs phase1     # phase-1 wire bytes + zero-attachments only
+node verify-c5.mjs revsdiff   # Pattern B revs_diff economy gate only
+```
+
+Checks (each fails loudly if the saving regresses):
+
+1. phase-1 wire bytes < 512 MB (and far below the 8.59 GB DB file).
+2. scratch holds ZERO docs with `_attachments` after phase-1 (server-side filter is real).
+3. Pattern B gate: a re-pull against a text-seeded DB carries < 5 MB of `_bulk_get` doc
+   bodies — present text revs are skipped via `revs_diff`, not re-downloaded. A FAIL here is
+   the signal to switch c2 to Pattern A.
+
+### c5 measured results (rerun against prod 2026-05-30, READ-ONLY)
+
+The c5 rerun reproduced the original spike against the live artifact via the engine's exact
+replication call shape (not a bespoke probe):
+
+```
+phase-1 (measure.mjs text):
+  wireBytesTotal .... 64038705  (64.0 MB)   <-- 134x below the 8.59 GB DB file
+    of which _bulk_get  56.8 MB
+  scratch doc_count .. 8305
+  docs_written ....... 31813  (cumulative leaf revs; ~3.8/doc — conflict-heavy LiveSync tree)
+  httpRequests ....... 1261  (419 _bulk_get)
+  elapsed ............ 629 s  (~10 min, round-trip dominated, not payload)
+```
+
+The 64 MB / ~10 min profile is impossible if 8 GB were on the wire — the wire-byte
+measurement, not the resulting DB size, is what discriminates server-side from client-side
+filtering. Verdict unchanged from the spike: server-side selector filtering is real;
+text-first stays a ~134x bandwidth win for the blocking initial pull. Design and message
+against ~50-65 MB, not the stale 20 MB premise.
+
+### Cross-library transfer caveat
+
+This harness runs on **pouchdb-node** (the daemon's lib). The primary beneficiary is
+**pouchdb-browser** (mobile). The replication core is shared — `selector` ->
+`_changes?filter=_selector` server-side, and `revs_diff` -> `_bulk_get` for the doc-body
+economy — so the wire behavior should transfer; that is the working assumption (plan
+section 7). The server-side filter is a CouchDB-side concern independent of the client lib,
+which is the strongest part of the assumption.

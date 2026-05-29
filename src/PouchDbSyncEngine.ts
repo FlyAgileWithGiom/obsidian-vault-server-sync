@@ -57,7 +57,12 @@ interface PouchEmitter {
  * 0 `_bulk_get` calls on a re-pull against a text-seeded DB), so binaries trickle in
  * without re-downloading text.
  */
-const TEXT_SELECTOR = { _attachments: { $exists: false } } as const;
+// Exported so the unit test pins the exact server-side selector shape by reference identity:
+// a typo (e.g. `$exist`) would silently fall back to a client-side filter, erasing the
+// bandwidth win with no test signal unless this constant is the one thing both sides share.
+// Pattern B pulls only text; the binary inverse ({_attachments:{$exists:true}}) is the
+// unfiltered live db.sync's natural backlog, so the engine needs no BINARY_SELECTOR const.
+export const TEXT_SELECTOR = { _attachments: { $exists: false } } as const;
 
 // SyncPhase (distinct from SyncState) is declared in ./types so the diagnostics consumer
 // and the engine share one definition. State must NOT read "ok" while binaries backfill.

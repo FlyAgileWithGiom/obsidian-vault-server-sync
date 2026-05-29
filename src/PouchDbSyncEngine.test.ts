@@ -11,7 +11,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Plugin } from "obsidian";
-import { PouchDbSyncEngine } from "./PouchDbSyncEngine";
+import { PouchDbSyncEngine, TEXT_SELECTOR } from "./PouchDbSyncEngine";
 import type { VaultSyncSettings } from "./types";
 
 // ---- Minimal Plugin mock -------------------------------------------------
@@ -568,5 +568,130 @@ describe("PouchDbSyncEngine — replaceLocalFromServer()", () => {
           (db.replicate.from as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0],
         )
       : undefined; // Invocation order check
+  });
+});
+
+// ---- c5: selector constants -------------------------------------------------
+
+describe("PouchDbSyncEngine — selector constants (Refs #72)", () => {
+  // The selector shape is the contract validated against prod by the spike: the inverse
+  // server-side `_changes?filter=_selector` count was exactly 6750 (the binary-doc count).
+  // A typo here (e.g. `$exist`) would silently pull everything client-side, erasing the
+  // bandwidth win, with no unit-test signal unless the shape is pinned.
+
+  it("TEXT_SELECTOR matches docs WITHOUT _attachments ($exists:false)", () => {
+    expect(TEXT_SELECTOR).toEqual({ _attachments: { $exists: false } });
+  });
+
+  it("TEXT_SELECTOR is the inverse, on the same field, of the binary backlog selector", () => {
+    // Phase-1 text ({$exists:false}) and the unfiltered backfill's binary docs
+    // ({$exists:true}) partition the DB on the SAME field with opposite $exists — no overlap,
+    // full coverage. The binary inverse is not a production const (the unfiltered live
+    // db.sync owns the backfill); it is asserted inline here purely to document the partition.
+    const binaryInverse = { _attachments: { $exists: true } };
+    expect(TEXT_SELECTOR._attachments.$exists).toBe(false);
+    expect(binaryInverse._attachments.$exists).toBe(true);
+  });
+
+  it("phase-1 pull passes the exact TEXT_SELECTOR constant (not an inline literal)", async () => {
+    const { engine, db } = makeEngine({ docCount: 0 });
+    engine.register(makePlugin());
+    await engine.start();
+    const opts = (db.replicate.from as ReturnType<typeof vi.fn>).mock.calls[0][1] as {
+      selector: unknown;
+    };
+    // toBe (reference identity), not toEqual: proves the engine wires the shared constant
+    // through, so changing the constant changes the wire behavior — no drift.
+    expect(opts.selector).toBe(TEXT_SELECTOR);
+  });
+});
+
+// ---- c5: resume guard (no full re-pull on visibilitychange) -----------------
+
+/**
+ * Resume guard (plan section 5). Two invariants:
+ *  - A visibilitychange WHILE phase-1 is still pulling must NOT interrupt it
+ *    (handleVisibilityVisible guards on initialPullRunning) — otherwise a backgrounding
+ *    during the initial text pull would restart sync mid-pull.
+ *  - A visibilitychange DURING the binary backfill must RESUME (restart the live db.sync
+ *    handle, which continues from its checkpoint) and must NOT trigger a fresh
+ *    replicate.from — that would be a full re-pull, the exact thing this design avoids.
+ */
+describe("PouchDbSyncEngine — resume guard on visibilitychange (Refs #72)", () => {
+  beforeEach(() => { lastSyncHandle = null; lastReplicateHandle = null; });
+  afterEach(() => {
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+  });
+
+  function makeEngineWithPendingPhase1() {
+    // replicate.from that does NOT auto-complete, so phase-1 stays in-flight and
+    // initialPullRunning remains true for the duration of the test.
+    const db = makeMockDb(0);
+    (db.replicate.from as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      const handle = makeMockSyncHandle();
+      lastReplicateHandle = handle;
+      return handle; // never emits "complete"
+    });
+    const bridge = makeMockBridge();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dbFactory = () => db as any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any, dbFactory as any);
+    return { engine, db, bridge };
+  }
+
+  it("does NOT interrupt phase-1: visibilitychange while pulling leaves the pull handle alone", async () => {
+    const { engine, db } = makeEngineWithPendingPhase1();
+    const plugin = makePlugin();
+    engine.register(plugin);
+    // start() awaits runInitialPull's promise which never resolves here, so kick it off
+    // without awaiting; phase-1 is now in-flight (initialPullRunning === true). Flush the
+    // microtask queue (start() awaits isFirstRun()->db.info() before reaching the pull) until
+    // replicate.from has actually been issued.
+    void engine.start();
+    await new Promise((r) => setTimeout(r, 0));
+    const pullHandle = lastReplicateHandle!;
+    expect(db.replicate.from).toHaveBeenCalledTimes(1);
+
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    plugin._triggerDom("visibilitychange");
+
+    // The in-flight phase-1 handle must NOT be cancelled, and no live sync started.
+    expect(pullHandle.cancel).not.toHaveBeenCalled();
+    expect(db.sync).not.toHaveBeenCalled();
+    expect(db.replicate.from).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes during backfill: visibilitychange restarts the live sync handle, no re-pull", async () => {
+    const { engine, db } = makeEngine({ docCount: 0 });
+    const plugin = makePlugin();
+    engine.register(plugin);
+    await engine.start();
+    // Phase-1 auto-completed (default mock) -> live db.sync running for the backfill.
+    const firstLive = lastSyncHandle!;
+    const replicateCallsAfterStart = (db.replicate.from as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
+    plugin._triggerDom("visibilitychange");
+
+    // Old live handle cancelled, a NEW one created (resume from checkpoint via retry).
+    expect(firstLive.cancel).toHaveBeenCalled();
+    expect(lastSyncHandle).not.toBe(firstLive);
+    // Crucially: resume must NOT issue a fresh initial pull — that would be a full re-pull.
+    expect((db.replicate.from as ReturnType<typeof vi.fn>).mock.calls.length).toBe(replicateCallsAfterStart);
+    engine.stop();
+  });
+
+  it("a cold start with doc_count>0 (post phase-1 app kill) resumes via live sync, no re-pull", async () => {
+    // Mobile app-kill mid-backfill: next cold start sees doc_count>0 -> isFirstRun()===false
+    // -> startLiveSync() directly. The backfill continues from checkpoint; binaries are NOT
+    // re-pulled via a phase-1 replicate.from. (Plan section 5: "resumes correctly with no
+    // special handling".)
+    const { engine, db } = makeEngine({ docCount: 8305 });
+    engine.register(makePlugin());
+    await engine.start();
+    expect(db.replicate.from).not.toHaveBeenCalled();
+    expect(db.sync).toHaveBeenCalledWith(expect.any(String), { live: true, retry: true });
+    engine.stop();
   });
 });
