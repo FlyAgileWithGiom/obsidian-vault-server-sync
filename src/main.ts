@@ -175,9 +175,10 @@ export default class VaultSyncPlugin extends Plugin {
     const { PouchDbSyncEngine } = await import("./PouchDbSyncEngine");
     const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
     const localDbName = `vault-sync-${this.settings.couchDbName}`;
-    const db = new PouchDB(localDbName);
+    const dbFactory = () => new PouchDB(localDbName);
+    const db = dbFactory();
     const bridge = new PouchDbFsBridge(vaultAdapter, db);
-    return new PouchDbSyncEngine(this.settings, db, bridge);
+    return new PouchDbSyncEngine(this.settings, db, bridge, dbFactory);
   }
 
   // --- Settings persistence ---

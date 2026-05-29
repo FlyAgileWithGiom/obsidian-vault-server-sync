@@ -271,8 +271,11 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   fs.mkdirSync(pouchDir, { recursive: true });
   console.log(`[vault-sync] PouchDB dir: ${pouchDir}`);
 
-  // Construct pouchdb-node database backed by LevelDB at pouchDir
-  const db = new PouchDB(pouchDir) as unknown as import("../src/pouchdb-browser").default;
+  // Construct pouchdb-node database backed by LevelDB at pouchDir.
+  // dbFactory is passed to the engine so replaceLocalFromServer() can recreate
+  // the db after destroy() without knowing the platform-specific PouchDB variant.
+  const dbFactory = () => new PouchDB(pouchDir) as unknown as import("../src/pouchdb-browser").default;
+  const db = dbFactory();
 
   // Build vault adapter and bridge (bridge not yet started — converter runs first)
   const vaultAdapter = new FilesystemVaultAdapter(absVaultRoot);
@@ -282,7 +285,7 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   const fsWatcher = new FsWatcher(absVaultRoot, excludePatterns);
 
   // Build engine with injected db and bridge
-  const engine = new PouchDbSyncEngine(settings, db, bridge);
+  const engine = new PouchDbSyncEngine(settings, db, bridge, dbFactory);
 
   engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
   engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);
