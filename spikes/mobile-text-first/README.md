@@ -65,11 +65,14 @@ is impossible if 8 GB were on the wire.
 selector {_attachments:{$exists:true}} pulls binary docs only.
 First ~50 binary docs = 37.8 MB on the wire (attachments are heavy per doc).
 Cancel at doc_count=50 -> restart -> continued to doc_count=150 (kept 50, added more).
-resumable = true  (checkpoint on target survives cancel/restart)
+resumable = true  (restart continues forward without re-pulling existing docs)
 ```
 
-Phase-2 is independently runnable and resumable, so binaries can trickle in the
-background at network pace, non-blocking, after the vault is already usable on text.
+Phase-2 is independently runnable and makes forward progress across cancel/restart with
+no data loss, so binaries can trickle in the background at network pace, non-blocking,
+after the vault is already usable on text. (The exact mechanism — checkpoint-resume vs
+re-walking the changes feed and skipping already-written docs — was not isolated; either
+way there is no loss and no full re-pull, which is what matters for the design.)
 
 ### Prod read-only honored
 
@@ -94,6 +97,11 @@ Two-phase initial pull:
 
 ## Gotchas
 
+- The "~20 MB text" premise is STALE. Phase-1 measured 64 MB wire / 48 MB disk, ~3x the
+  raw content-field size. Cause: `docs_written=31813` vs `scratch_doc_count=8305` = ~3.8
+  leaf revisions pulled per doc — this LiveSync vault has conflict-heavy revision trees and
+  replication pulls all leaf revs. Design against ~50-65 MB, not 20 MB. Still tens of MB,
+  not GB, so text-first remains a massive win — but do not quote 20 MB.
 - DB size alone does NOT prove server-side filtering — both client- and server-side end at
   ~tens of MB locally. Always measure wire bytes (fetch wrapper) to be sure.
 - `$exists:false` matches deleted-doc tombstones too; the row count overshoots the live
