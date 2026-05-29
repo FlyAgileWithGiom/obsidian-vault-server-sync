@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createWatcher, resolveStatePath, migrateStateFile, resolvePouchDir } from "./main";
+import { createWatcher, resolveStatePath, migrateStateFile, resolvePouchDir, runDaemonV2Startup } from "./main";
 import type { VaultFile, VaultEntry } from "../src/types";
 
 // ---------------------------------------------------------------------------
@@ -348,3 +348,70 @@ declare module "vitest" {
     toEndWith(suffix: string): R;
   }
 }
+
+// ---------------------------------------------------------------------------
+// BUG #69 — Init-order regression guard
+// ---------------------------------------------------------------------------
+// Verifies that runDaemonV2Startup runs runConverter to completion BEFORE
+// calling bridge.start(). If bridge.start() fires first, a Dropbox/iCloud FS
+// event during boot can trigger writeTextToPouch -> db.put -> doc_count > 0,
+// causing the converter to believe migration already happened and silently
+// skipping the full seed (partial sync with missing files).
+
+describe("runDaemonV2Startup — converter runs before bridge.start (init-order guard)", () => {
+  it("calls runConverter to completion before bridge.start is called", async () => {
+    const callOrder: string[] = [];
+
+    const mockBridge = {
+      start: vi.fn(() => { callOrder.push("bridge.start"); }),
+    };
+
+    const mockConverter = vi.fn(async () => {
+      callOrder.push("runConverter");
+      return { alreadyMigrated: false, migrated: 3, tombstonedSkipped: 0, orphanSkipped: 0 };
+    });
+
+    const mockFsWatcher = {};
+
+    const mockEngine = {
+      start: vi.fn(async () => { callOrder.push("engine.start"); }),
+    };
+
+    await runDaemonV2Startup({
+      bridge: mockBridge,
+      runConverter: mockConverter,
+      fsWatcher: mockFsWatcher,
+      engine: mockEngine,
+      statePath: "/fake/state.json",
+      pouchDir: "/fake/pouch",
+      db: {},
+    });
+
+    // All three must have been called
+    expect(mockConverter).toHaveBeenCalledOnce();
+    expect(mockBridge.start).toHaveBeenCalledOnce();
+    expect(mockEngine.start).toHaveBeenCalledOnce();
+
+    // Critical ordering assertion: converter finishes before bridge is armed
+    expect(callOrder.indexOf("runConverter")).toBeLessThan(callOrder.indexOf("bridge.start"));
+    expect(callOrder.indexOf("bridge.start")).toBeLessThan(callOrder.indexOf("engine.start"));
+  });
+
+  it("passes the fsWatcher to bridge.start", async () => {
+    const mockFsWatcher = { _tag: "fsWatcher" };
+    const mockBridge = { start: vi.fn() };
+    const mockEngine = { start: vi.fn(async () => {}) };
+
+    await runDaemonV2Startup({
+      bridge: mockBridge,
+      runConverter: vi.fn(async () => ({ noStateFile: true })),
+      fsWatcher: mockFsWatcher,
+      engine: mockEngine,
+      statePath: "/fake/state.json",
+      pouchDir: "/fake/pouch",
+      db: {},
+    });
+
+    expect(mockBridge.start).toHaveBeenCalledWith(mockFsWatcher);
+  });
+});

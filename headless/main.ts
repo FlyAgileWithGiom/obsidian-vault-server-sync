@@ -237,6 +237,65 @@ function handleFsEvent(
   engine.handleLocalChange(vaultFile);
 }
 
+/**
+ * Exported startup sequence for DAEMON_V2.
+ *
+ * Extracted for testability: allows unit tests to assert that runConverter
+ * completes (on a cold PouchDB) BEFORE bridge.start() arms the changes-feed
+ * and FS watcher. This ordering prevents the init-race where a Dropbox/iCloud
+ * FS event during boot triggers writeTextToPouch → db.put → doc_count > 0,
+ * making the converter believe migration already happened and silently skipping
+ * the seed of 14700+ docs (issue #69).
+ *
+ * @param deps.bridge       Pre-constructed PouchDbFsBridge (not yet started)
+ * @param deps.runConverter Async fn that seeds PouchDB from state.json revMap
+ * @param deps.fsWatcher    Pre-constructed FsWatcher (not yet started)
+ * @param deps.engine       Pre-constructed PouchDbSyncEngine (not yet started)
+ * @param deps.statePath    Path to state.json passed to runConverter
+ * @param deps.pouchDir     PouchDB data dir passed to runConverter
+ * @param deps.db           PouchDB instance passed to runConverter
+ */
+export async function runDaemonV2Startup(deps: {
+  bridge: { start: (watcher: unknown) => void };
+  runConverter: (statePath: string, pouchDir: string, db: unknown) => Promise<{
+    noStateFile?: boolean;
+    alreadyMigrated?: boolean;
+    migrated?: number;
+    tombstonedSkipped?: number;
+    orphanSkipped?: number;
+  }>;
+  fsWatcher: unknown;
+  engine: { start: () => Promise<void> };
+  statePath: string;
+  pouchDir: string;
+  db: unknown;
+}): Promise<void> {
+  const { bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db } = deps;
+
+  // CRITICAL: converter MUST run on a cold PouchDB (no other writer active).
+  // Arming the changes-feed or FS watcher before this completes risks a
+  // Dropbox/iCloud FS event triggering writeTextToPouch → db.put → doc_count > 0,
+  // making the converter skip the seed and causing silent partial sync.
+  const convResult = await runConverter(statePath, pouchDir, db);
+  if (convResult.noStateFile) {
+    console.log("[vault-sync] No state.json found — PouchDB will fresh-pull from CouchDB");
+  } else if (convResult.alreadyMigrated) {
+    console.log("[vault-sync] PouchDB already has docs — skipping migration");
+  } else {
+    console.log(
+      `[vault-sync] Converter: migrated ${convResult.migrated} docs, ` +
+      `${convResult.tombstonedSkipped} tombstoned skipped, ${convResult.orphanSkipped} orphan skipped`,
+    );
+  }
+
+  // Now arm the changes-feed and FS watcher — PouchDB is fully seeded.
+  bridge.start(fsWatcher);
+
+  // Engine.start() handles isFirstRun() check: if converter migrated docs,
+  // it skips initial pull and goes straight to live sync.
+  await engine.start();
+}
+
 async function mainV2(absVaultRoot: string, settings: VaultSyncSettings): Promise<void> {
   // DAEMON_V2 path: PouchDB (pouchdb-node + LevelDB) + PouchDbSyncEngine
   const PouchDB = require("pouchdb-node") as typeof import("pouchdb-node");
@@ -252,31 +311,14 @@ async function mainV2(absVaultRoot: string, settings: VaultSyncSettings): Promis
   // Construct pouchdb-node database backed by LevelDB at pouchDir
   const db = new PouchDB(pouchDir) as unknown as import("../src/pouchdb-browser").default;
 
-  // Build vault adapter and bridge
+  // Build vault adapter and bridge (bridge not yet started — converter runs first)
   const vaultAdapter = new FilesystemVaultAdapter(absVaultRoot);
   const bridge = new PouchDbFsBridge(vaultAdapter, db);
 
-  // Wire FsWatcher -> bridge before engine.start()
   const excludePatterns = [STATE_FILENAME, CONFIG_FILENAME, ".git", ...settings.excludePatterns];
   const fsWatcher = new FsWatcher(absVaultRoot, excludePatterns);
-  bridge.start(fsWatcher);
 
-  // Run converter: migrate state.json revMap -> PouchDB local docs (idempotent)
-  const statePath = resolveStatePath(absVaultRoot, settings.couchDbName);
-  console.log(`[vault-sync] Running converter (state.json -> PouchDB)...`);
-  const convResult = await runConverter(statePath, pouchDir, db);
-  if (convResult.noStateFile) {
-    console.log("[vault-sync] No state.json found — PouchDB will fresh-pull from CouchDB");
-  } else if (convResult.alreadyMigrated) {
-    console.log("[vault-sync] PouchDB already has docs — skipping migration");
-  } else {
-    console.log(
-      `[vault-sync] Converter: migrated ${convResult.migrated} docs, ` +
-      `${convResult.tombstonedSkipped} tombstoned skipped, ${convResult.orphanSkipped} orphan skipped`,
-    );
-  }
-
-  // Build engine with injected db and pre-started bridge
+  // Build engine with injected db and bridge
   const engine = new PouchDbSyncEngine(settings, db, bridge);
 
   engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
@@ -287,8 +329,11 @@ async function mainV2(absVaultRoot: string, settings: VaultSyncSettings): Promis
     }
   };
 
-  // start() handles isFirstRun() check — if converter migrated docs, skips initial pull
-  await engine.start();
+  const statePath = resolveStatePath(absVaultRoot, settings.couchDbName);
+  console.log(`[vault-sync] Running converter (state.json -> PouchDB)...`);
+
+  // Delegate ordering logic to runDaemonV2Startup (converter first, then bridge.start)
+  await runDaemonV2Startup({ bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db });
 
   // Graceful shutdown
   function shutdown(signal: string): void {
