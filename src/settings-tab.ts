@@ -242,6 +242,20 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       `Last sequence: ${d.lastSeq}`,
       `Pending push: ${d.pendingPushCount}`,
     ];
+    // Two-phase pull observability (#72). The phase is distinct from Status: at
+    // text-ready/binary-backfill the vault is usable but Status honestly stays "syncing"
+    // (binaries still pending), so this line carries the "notes ready" win without ever
+    // letting Status read "Synced" while attachments are missing.
+    lines.push(`Sync phase: ${d.syncPhase}`);
+    if (d.syncPhase === "text-ready" || d.syncPhase === "binary-backfill") {
+      lines.push("Notes ready — attachments syncing in background");
+    }
+    // Only render the count when an honest figure exists. Pattern B's live db.sync exposes
+    // a combined text+binary `pending`, not an attachments-specific N/total, so binaryProgress
+    // is null there — guard against it rather than fabricating a count (or emitting NaN).
+    if (d.binaryProgress) {
+      lines.push(`Attachments: ${d.binaryProgress.fetched} / ${d.binaryProgress.total}`);
+    }
     if (d.pullProgress) {
       lines.push(`Pull progress: ${d.pullProgress.fetched} / ${d.pullProgress.total}`);
       lines.push(`Pull applied: ${d.pullApplied}, skipped: ${d.pullSkipped}`);

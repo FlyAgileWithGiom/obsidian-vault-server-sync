@@ -6,6 +6,90 @@ MCP server). Ships two artifacts from one codebase: an Obsidian plugin
 headless daemon (`vault-sync-daemon`) that syncs a vault on a machine where
 Obsidian is not running.
 
+## Text-first initial sync (v2.1)
+
+As of v2.1.0 the initial pull is **two-phase**, so the vault becomes usable
+after downloading only the notes — not after downloading every attachment. On a
+real vault the binaries (images, PDFs, other media) dwarf the text: a sample
+`vault-obsidiannotes` carries roughly 8,000 text docs but 6,750 binary docs
+whose attachments total several GB. The pre-v2.1 pull was a single unfiltered
+replication that fetched everything before the vault could be edited — the
+blocker on a slow mobile connection.
+
+### How it works
+
+The engine splits `runInitialPull()` into two phases:
+
+```
+Phase 1 (blocking, fast)   pull TEXT docs only, server-side filtered
+Phase 2 (background)       binaries backfill while the vault is already usable
+Steady state               ongoing live bidirectional sync covers both
+```
+
+- **Phase 1 — text only.** The pull passes a CouchDB Mango selector so the
+  server sends back only documents that have no attachments. On the sample vault
+  this is **~64 MB over the wire** (tens of MB, not several GB). When it
+  completes the notes are present and editable.
+- **Phase 2 — binaries backfill.** The engine then starts the normal live
+  bidirectional `db.sync`. The binaries arrive as that sync's natural pull
+  backlog, at network pace, while the vault is already in use. **Push stays live
+  from the first moment of phase 2**, so anything you write during the backfill
+  propagates immediately — your edits are never stranded while gigabytes of
+  attachments download. PouchDB runs `revs_diff` before fetching bodies, so the
+  text revisions already pulled in phase 1 are not re-downloaded.
+
+This is one code path on every platform (plugin on desktop and mobile, and the
+daemon) — there is no mobile-only fork. The only difference is priority: the
+daemon runs the backfill to completion (its copy is the canonical backup),
+while on mobile the backfill is low-priority and resumes from its checkpoint
+after the app is backgrounded.
+
+### `TEXT_SELECTOR` — the filter mechanism
+
+Phase 1 uses a PouchDB `selector` replication option, a Mango query on the
+`_attachments` field:
+
+```
+TEXT_SELECTOR = { _attachments: { $exists: false } }
+```
+
+PouchDB translates this into a server-side `_changes?filter=_selector` filter on
+CouchDB 3.x, so the binary docs never cross the wire during phase 1. There is no
+design-doc filter function and no schema change — text docs are distinguished
+purely by the absence of `_attachments`. (One harmless quirk: the selector also
+matches deleted-doc tombstones, which are tiny metadata, so progress counters
+can read higher than the live text-doc count. That is expected, not a filter
+fault.)
+
+### Diagnostics — `syncPhase` and `binaryProgress`
+
+Because the vault is usable after phase 1 but the binaries are not all here yet,
+the sync status must not read "Synced" prematurely. A `syncPhase` field, distinct
+from the connection state, carries the real progress:
+
+```
+syncPhase: 'idle' | 'text-pull' | 'text-ready' | 'binary-backfill' | 'complete'
+```
+
+At `text-ready` and during `binary-backfill` the connection state deliberately
+stays **`syncing`**, never `ok`, so the UI never claims a full sync while
+attachments are still arriving. The settings tab renders:
+
+```
+Sync phase: <phase>
+Notes ready — attachments syncing in background      (shown at text-ready / backfill)
+Attachments: <fetched> / <total>                     (when a count is available)
+```
+
+A one-shot notice ("Vault Sync: Notes ready, attachments downloading in
+background") fires at the `text-ready` transition so the win is visible the
+moment the notes land.
+
+The companion `binaryProgress` field reports `{ fetched, total }` when a count is
+available. Note that with the live-sync backfill the pending count is the live
+`db.sync` backlog (combined remaining work), not an attachments-exact
+"N / 6,750" counter — it is a pending indicator, not a precise attachment tally.
+
 ## Daemon v2 (PouchDB)
 
 As of v2.0.0 the plugin and the daemon share a single sync engine built on

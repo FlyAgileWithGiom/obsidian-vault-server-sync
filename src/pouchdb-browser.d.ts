@@ -45,18 +45,47 @@ declare module "pouchdb-browser" {
     on(event: "error", handler: (err: unknown) => void): this;
   }
 
+  /**
+   * Superset of the two change-event shapes (verified: spikes/mobile-text-first/
+   * probe-livesync-events.mjs):
+   * - replicate.from emits the FLAT shape: { docs_written, pending }.
+   * - db.sync emits the NESTED shape: { direction, change: { docs_written, pending } } —
+   *   the flat top-level `pending` is ALWAYS undefined there.
+   * A reader after live-sync progress must use `info.change?.pending ?? info.pending`,
+   * never the flat field alone, or it reads 0 on every db.sync change.
+   */
   interface PouchDbChangeInfo {
     docs_written?: number;
     pending?: number;
+    direction?: "pull" | "push";
+    change?: { docs_written?: number; pending?: number };
+  }
+
+  /**
+   * Replication / sync options.
+   *
+   * `selector` is a Mango selector forwarded to CouchDB as a server-side
+   * `_changes?filter=_selector` filter (validated by spikes/mobile-text-first):
+   * it gates which docs cross the wire, enabling the two-phase text-first pull.
+   *
+   * `checkpoint: 'target'` stores the replication checkpoint on the local target
+   * (keeps a read-only source clean and makes a phase resumable); `false` forces a
+   * full changes-feed walk with no checkpoint reuse.
+   */
+  interface PouchDbReplicationOpts {
+    live?: boolean;
+    retry?: boolean;
+    selector?: Record<string, unknown>;
+    checkpoint?: "source" | "target" | false;
   }
 
   class PouchDB {
     constructor(name: string, options?: Record<string, unknown>);
 
-    sync(remote: string, opts?: { live?: boolean; retry?: boolean }): PouchDbSyncHandle;
+    sync(remote: string, opts?: PouchDbReplicationOpts): PouchDbSyncHandle;
 
     replicate: {
-      from(remote: string, opts?: { live?: boolean; retry?: boolean }): PouchDbSyncHandle;
+      from(remote: string, opts?: PouchDbReplicationOpts): PouchDbSyncHandle;
     };
 
     info(): Promise<PouchDbInfo>;

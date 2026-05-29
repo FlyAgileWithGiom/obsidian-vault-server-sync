@@ -125,6 +125,12 @@ function makeDiagnosticsSnapshot(overrides: Partial<SyncDiagnostics> = {}): Sync
     lastError: null,
     unsyncableCount: 0,
     unsyncableSample: [],
+    avgFetchMs: null,
+    fetchSampleCount: 0,
+    avgApplyMs: null,
+    applySampleCount: 0,
+    syncPhase: "idle",
+    binaryProgress: null,
     ...overrides,
   };
 }
@@ -425,6 +431,8 @@ describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visi
       fetchSampleCount: 0,
       avgApplyMs: null,
       applySampleCount: 0,
+      syncPhase: "text-ready",
+      binaryProgress: null,
     };
 
     const output = formatDiagnostics(d);
@@ -456,6 +464,8 @@ describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visi
       fetchSampleCount: 0,
       avgApplyMs: null,
       applySampleCount: 0,
+      syncPhase: "text-ready",
+      binaryProgress: null,
     };
 
     const output = formatDiagnostics(d);
@@ -496,6 +506,49 @@ describe("VaultSyncSettingTab — unsyncable visibility (#P3)", () => {
     const output = formatDiagnostics(d);
     expect(output).toContain("Unsyncable: 0");
     expect(output).not.toContain("Unsyncable sample:");
+  });
+});
+
+describe("VaultSyncSettingTab — two-phase syncPhase + binary progress (#72)", () => {
+  function bindFormat(): (d: SyncDiagnostics) => string {
+    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
+    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
+    return (tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }).formatDiagnostics.bind(tab);
+  }
+
+  it("renders the sync phase line for every phase value", () => {
+    const formatDiagnostics = bindFormat();
+    for (const phase of ["idle", "text-pull", "text-ready", "binary-backfill", "complete"] as const) {
+      const output = formatDiagnostics(makeDiagnosticsSnapshot({ syncPhase: phase }));
+      expect(output).toContain(`Sync phase: ${phase}`);
+    }
+  });
+
+  it("surfaces 'Notes ready' at the text-ready phase so the user sees the win", () => {
+    const formatDiagnostics = bindFormat();
+    const output = formatDiagnostics(makeDiagnosticsSnapshot({ syncPhase: "text-ready", state: "syncing" }));
+    expect(output).toContain("Sync phase: text-ready");
+    expect(output).toMatch(/Notes ready/i);
+  });
+
+  it("renders 'Attachments: N / total' when binaryProgress is non-null (Pattern A path)", () => {
+    const formatDiagnostics = bindFormat();
+    const output = formatDiagnostics(
+      makeDiagnosticsSnapshot({ syncPhase: "binary-backfill", binaryProgress: { fetched: 1500, total: 6750 } })
+    );
+    expect(output).toContain("Attachments: 1500 / 6750");
+  });
+
+  it("omits the attachments count line and never emits NaN when binaryProgress is null (Pattern B)", () => {
+    const formatDiagnostics = bindFormat();
+    const output = formatDiagnostics(
+      makeDiagnosticsSnapshot({ syncPhase: "binary-backfill", binaryProgress: null })
+    );
+    // Pattern B has no honest N/total — do not fabricate one, and never surface NaN.
+    expect(output).not.toContain("NaN");
+    expect(output).not.toContain("Attachments:");
+    // The phase line still tells the user binaries are backfilling.
+    expect(output).toContain("Sync phase: binary-backfill");
   });
 });
 
