@@ -12,13 +12,6 @@ export interface VaultSyncSettings {
    * Default: false.
    */
   disableBinaryPush?: boolean;
-  /**
-   * Strategy override for testing and rollback.
-   * 'auto': iOS -> PouchDB, desktop -> CustomFetch (default)
-   * 'custom': force CustomFetch on all platforms (rollback path)
-   * 'pouchdb': force PouchDB on all platforms (testing on desktop)
-   */
-  syncStrategy?: 'auto' | 'custom' | 'pouchdb';
 }
 
 /** Filename for plugin-managed settings at vault root */
