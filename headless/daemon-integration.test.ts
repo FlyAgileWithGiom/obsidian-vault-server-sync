@@ -231,3 +231,107 @@ describe("Daemon integration — FS <-> PouchDB bridge (C05)", () => {
     expect(db._docs.get(docId)!.content).toBe("version 2");
   });
 });
+
+describe("Daemon integration — content-null guard: seeded docs without content do not overwrite vault files (C05-guard)", () => {
+  let vaultDir: string;
+  let vault: FilesystemVaultAdapter;
+  let watcher: FsWatcher;
+  let db: ReturnType<typeof makePouchMock>;
+  let bridge: PouchDbFsBridge;
+
+  beforeEach(async () => {
+    vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-test-"));
+    vault = new FilesystemVaultAdapter(vaultDir);
+    watcher = new FsWatcher(vaultDir, []);
+    db = makePouchMock();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    bridge.start(watcher);
+    // Allow fs.watch to arm
+    await new Promise((r) => setTimeout(r, 200));
+  });
+
+  afterEach(() => {
+    bridge.stop();
+    try { fs.rmSync(vaultDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it("positive control: remote doc WITH content writes to vault (proves delivery works)", async () => {
+    // Sanity check: a normal remote doc does land on disk.
+    // If this fails, the guard tests below are meaningless (delivery is broken).
+    const docId = pathToDocId("positive-control.md");
+    db._emitChange({
+      _id: docId,
+      _rev: "1-abc",
+      content: "real content here",
+      mtime: Date.now(),
+    });
+
+    await waitFor(() => fs.existsSync(path.join(vaultDir, "positive-control.md")));
+    const written = fs.readFileSync(path.join(vaultDir, "positive-control.md"), "utf-8");
+    expect(written).toBe("real content here");
+  });
+
+  it("content===null guard: seeded text doc without content does not overwrite existing vault file", async () => {
+    // Simulate what the converter seeds: a doc with no content field (revMap migration).
+    // This doc should NOT overwrite an existing vault file with an empty/null write.
+    const filePath = path.join(vaultDir, "protected.md");
+    fs.writeFileSync(filePath, "real content — must survive");
+
+    // Emit a change for this doc with content: null (no content, as seeded by converter)
+    const docId = pathToDocId("protected.md");
+    db._emitChange({
+      _id: docId,
+      _rev: "1-seeded",
+      content: null,      // no content — this is what converter seeds
+      mtime: Date.now(),
+    });
+
+    // Give the bridge time to process the change
+    await new Promise((r) => setTimeout(r, 400));
+
+    // The file must still contain the original content
+    const actual = fs.readFileSync(filePath, "utf-8");
+    expect(actual).toBe("real content — must survive");
+  });
+
+  it("content===undefined guard: seeded text doc without content field does not overwrite existing vault file", async () => {
+    // Variant: content field entirely absent (undefined) — same guard triggers
+    const filePath = path.join(vaultDir, "protected-undef.md");
+    fs.writeFileSync(filePath, "original content");
+
+    const docId = pathToDocId("protected-undef.md");
+    db._emitChange({
+      _id: docId,
+      _rev: "1-seeded",
+      // no content key at all
+      mtime: Date.now(),
+    });
+
+    await new Promise((r) => setTimeout(r, 400));
+
+    const actual = fs.readFileSync(filePath, "utf-8");
+    expect(actual).toBe("original content");
+  });
+
+  it("binary guard: seeded binary doc without _attachments does not overwrite existing binary file", async () => {
+    // For binary files (e.g. .png), the guard is: !_attachments -> return.
+    // A seeded doc without attachments must not erase the real binary on disk.
+    const filePath = path.join(vaultDir, "image.png");
+    const originalBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x01, 0x02]); // fake PNG header
+    fs.writeFileSync(filePath, originalBytes);
+
+    const docId = pathToDocId("image.png");
+    db._emitChange({
+      _id: docId,
+      _rev: "1-seeded",
+      mtime: Date.now(),
+      // _attachments absent — binary guard triggers
+    });
+
+    await new Promise((r) => setTimeout(r, 400));
+
+    const actual = fs.readFileSync(filePath);
+    expect(Buffer.compare(actual, originalBytes)).toBe(0); // bytes unchanged
+  });
+});
