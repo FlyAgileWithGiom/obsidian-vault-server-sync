@@ -1,7 +1,7 @@
 /**
- * Integration tests for commit 10: createStrategy() routing.
+ * Integration tests for createStrategy() routing.
  *
- * Tests that main.ts createStrategy() returns the correct strategy based on
+ * Tests that main.ts createStrategy() returns the correct engine based on
  * Platform.isMobile and settings.syncStrategy override.
  */
 
@@ -28,6 +28,7 @@ vi.mock("./sync-engine", () => ({
     planFullSync: vi.fn().mockResolvedValue({}),
     forceFullSync: vi.fn().mockResolvedValue(undefined),
     resumeFullSync: vi.fn().mockResolvedValue(undefined),
+    replaceLocalFromServer: vi.fn().mockResolvedValue(undefined),
   })),
 }));
 
@@ -41,10 +42,28 @@ vi.mock("./settings-tab", () => ({
   VaultSyncSettingTab: vi.fn().mockImplementation(() => ({})),
 }));
 
-// Mock PouchDbSyncStrategy to avoid loading pouchdb-browser
-vi.mock("./PouchDbSyncStrategy", () => ({
-  PouchDbSyncStrategy: vi.fn().mockImplementation((settings: unknown, app: unknown) => {
-    void settings; void app;
+// Mock pouchdb-browser to avoid loading the real bundle
+vi.mock("pouchdb-browser", () => ({
+  default: vi.fn().mockImplementation(() => ({
+    sync: vi.fn().mockReturnValue({ on: vi.fn().mockReturnThis(), cancel: vi.fn() }),
+    replicate: { from: vi.fn().mockReturnValue({ on: vi.fn().mockReturnThis(), cancel: vi.fn() }) },
+    info: vi.fn().mockResolvedValue({ doc_count: 0, update_seq: 0, db_name: "test" }),
+    destroy: vi.fn().mockResolvedValue(undefined),
+  })),
+}));
+
+// Mock PouchDbFsBridge
+vi.mock("./PouchDbFsBridge", () => ({
+  PouchDbFsBridge: vi.fn().mockImplementation(() => ({
+    start: vi.fn(),
+    stop: vi.fn(),
+  })),
+}));
+
+// Mock PouchDbSyncEngine to avoid importing pouchdb-browser at engine level
+vi.mock("./PouchDbSyncEngine", () => ({
+  PouchDbSyncEngine: vi.fn().mockImplementation((settings: unknown, db: unknown, bridge: unknown) => {
+    void settings; void db; void bridge;
     return {
       isRunning: vi.fn().mockReturnValue(false),
       start: vi.fn().mockResolvedValue(undefined),
@@ -59,6 +78,7 @@ vi.mock("./PouchDbSyncStrategy", () => ({
       planFullSync: vi.fn().mockResolvedValue({}),
       forceFullSync: vi.fn().mockResolvedValue(undefined),
       resumeFullSync: vi.fn().mockResolvedValue(undefined),
+      replaceLocalFromServer: vi.fn().mockResolvedValue(undefined),
     };
   }),
 }));
@@ -69,7 +89,7 @@ vi.mock("./PouchDbSyncStrategy", () => ({
 
 import VaultSyncPlugin from "./main";
 import { CustomFetchSyncStrategy } from "./sync-engine";
-import { PouchDbSyncStrategy } from "./PouchDbSyncStrategy";
+import { PouchDbSyncEngine } from "./PouchDbSyncEngine";
 
 // ---------------------------------------------------------------------------
 // Plugin factory (minimal — no real Obsidian DOM needed)
@@ -133,28 +153,28 @@ describe("VaultSyncPlugin.createStrategy() — routing", () => {
     const plugin = makePlugin({ syncStrategy: "auto" });
     await callCreateStrategy(plugin);
     expect(CustomFetchSyncStrategy).toHaveBeenCalled();
-    expect(PouchDbSyncStrategy).not.toHaveBeenCalled();
+    expect(PouchDbSyncEngine).not.toHaveBeenCalled();
   });
 
   it("returns CustomFetchSyncStrategy on desktop with override=custom (rollback)", async () => {
     const plugin = makePlugin({ syncStrategy: "custom" });
     await callCreateStrategy(plugin);
     expect(CustomFetchSyncStrategy).toHaveBeenCalled();
-    expect(PouchDbSyncStrategy).not.toHaveBeenCalled();
+    expect(PouchDbSyncEngine).not.toHaveBeenCalled();
   });
 
-  it("returns PouchDbSyncStrategy on desktop with override=pouchdb (forced)", async () => {
+  it("returns PouchDbSyncEngine on desktop with override=pouchdb (forced)", async () => {
     const plugin = makePlugin({ syncStrategy: "pouchdb" });
     await callCreateStrategy(plugin);
-    expect(PouchDbSyncStrategy).toHaveBeenCalled();
+    expect(PouchDbSyncEngine).toHaveBeenCalled();
     expect(CustomFetchSyncStrategy).not.toHaveBeenCalled();
   });
 
-  it("returns PouchDbSyncStrategy on mobile with override=auto (iOS default)", async () => {
+  it("returns PouchDbSyncEngine on mobile with override=auto (iOS default)", async () => {
     Platform.isMobile = true;
     const plugin = makePlugin({ syncStrategy: "auto" });
     await callCreateStrategy(plugin);
-    expect(PouchDbSyncStrategy).toHaveBeenCalled();
+    expect(PouchDbSyncEngine).toHaveBeenCalled();
     expect(CustomFetchSyncStrategy).not.toHaveBeenCalled();
   });
 
@@ -163,14 +183,14 @@ describe("VaultSyncPlugin.createStrategy() — routing", () => {
     const plugin = makePlugin({ syncStrategy: "custom" });
     await callCreateStrategy(plugin);
     expect(CustomFetchSyncStrategy).toHaveBeenCalled();
-    expect(PouchDbSyncStrategy).not.toHaveBeenCalled();
+    expect(PouchDbSyncEngine).not.toHaveBeenCalled();
   });
 
-  it("returns PouchDbSyncStrategy on mobile with override=pouchdb", async () => {
+  it("returns PouchDbSyncEngine on mobile with override=pouchdb", async () => {
     Platform.isMobile = true;
     const plugin = makePlugin({ syncStrategy: "pouchdb" });
     await callCreateStrategy(plugin);
-    expect(PouchDbSyncStrategy).toHaveBeenCalled();
+    expect(PouchDbSyncEngine).toHaveBeenCalled();
     expect(CustomFetchSyncStrategy).not.toHaveBeenCalled();
   });
 
@@ -178,14 +198,14 @@ describe("VaultSyncPlugin.createStrategy() — routing", () => {
     const plugin = makePlugin({ syncStrategy: undefined });
     await callCreateStrategy(plugin);
     expect(CustomFetchSyncStrategy).toHaveBeenCalled();
-    expect(PouchDbSyncStrategy).not.toHaveBeenCalled();
+    expect(PouchDbSyncEngine).not.toHaveBeenCalled();
   });
 
-  it("passes settings and app to PouchDbSyncStrategy when selected", async () => {
+  it("passes settings to PouchDbSyncEngine when selected (as first arg)", async () => {
     Platform.isMobile = true;
     const plugin = makePlugin({ syncStrategy: "auto" });
     await callCreateStrategy(plugin);
-    const calls = (PouchDbSyncStrategy as ReturnType<typeof vi.fn>).mock.calls;
+    const calls = (PouchDbSyncEngine as ReturnType<typeof vi.fn>).mock.calls;
     expect(calls.length).toBeGreaterThan(0);
     // First arg should be the settings object
     expect(calls[0][0]).toMatchObject({

@@ -59,7 +59,7 @@
 
 import type { Plugin, EventRef } from "obsidian";
 import { CouchClient, CouchError } from "./couch-client";
-import type { SyncStrategy } from "./sync-strategy";
+// SyncStrategy interface removed in C05 (collapsed to concrete classes).
 import { ATTACHMENT_NAME, contentTypeForPath, isBinaryPath } from "./binary-ext";
 import { pathToDocId, docIdToPath, DOC_PREFIX } from "./doc-id";
 import { buildTextDoc } from "./doc-builder";
@@ -176,7 +176,7 @@ function isRecoverableReadError(e: unknown): { recoverable: boolean; code?: stri
  * - Stores rev map in StateStore to survive plugin reloads without re-fetching
  * - All network calls go through CouchClient (transport-injected, no PouchDB)
  */
-export class CustomFetchSyncStrategy implements SyncStrategy {
+export class CustomFetchSyncStrategy {
   private client: CouchClient;
   private revMap: RevMap = {};
   private lastSeq: string | number = 0;

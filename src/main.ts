@@ -1,7 +1,7 @@
 import { Notice, Platform, Plugin } from "obsidian";
 import { CouchClient } from "./couch-client";
 import { CustomFetchSyncStrategy } from "./sync-engine";
-import type { SyncStrategy } from "./sync-strategy";
+import type { PouchDbSyncEngine } from "./PouchDbSyncEngine";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
 import { ObsidianStateStore } from "./ObsidianStateStore";
 import { ObsidianTransport } from "./ObsidianTransport";
@@ -19,7 +19,7 @@ import { slugify } from "./slugify";
  */
 export default class VaultSyncPlugin extends Plugin {
   settings: VaultSyncSettings = { ...DEFAULT_SETTINGS };
-  private strategy!: SyncStrategy;
+  private strategy!: PouchDbSyncEngine | CustomFetchSyncStrategy;
   private ribbonEl: HTMLElement | null = null;
   private statusBarEl: HTMLElement | null = null;
   private syncState: SyncState = "idle";
@@ -166,23 +166,29 @@ export default class VaultSyncPlugin extends Plugin {
   // --- Strategy factory ---
 
   /**
-   * Creates the active sync strategy.
+   * Creates the active sync engine.
    *
    * Decision tree:
-   *   override === 'pouchdb'               → PouchDbSyncStrategy (forced on all platforms)
-   *   override === 'auto' && isMobile      → PouchDbSyncStrategy (iOS default path)
+   *   override === 'pouchdb'               → PouchDbSyncEngine (forced on all platforms)
+   *   override === 'auto' && isMobile      → PouchDbSyncEngine (iOS default path)
    *   override === 'custom' || desktop     → CustomFetchSyncStrategy
    *
    * Dynamic import keeps pouchdb-browser (~130 KB) out of the main.js bundle.
    * esbuild splitting:true places it in a separate chunk loaded only when needed.
    */
-  private async createStrategy(): Promise<SyncStrategy> {
+  private async createStrategy(): Promise<PouchDbSyncEngine | CustomFetchSyncStrategy> {
     const override = this.settings.syncStrategy ?? 'auto';
     const usePouch = override === 'pouchdb' || (override === 'auto' && Platform.isMobile);
 
     if (usePouch) {
-      const { PouchDbSyncStrategy } = await import("./PouchDbSyncStrategy");
-      return new PouchDbSyncStrategy(this.settings, this.app);
+      const PouchDB = (await import("pouchdb-browser")).default;
+      const { PouchDbFsBridge } = await import("./PouchDbFsBridge");
+      const { PouchDbSyncEngine } = await import("./PouchDbSyncEngine");
+      const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
+      const localDbName = `vault-sync-${this.settings.couchDbName}`;
+      const db = new PouchDB(localDbName);
+      const bridge = new PouchDbFsBridge(vaultAdapter, db);
+      return new PouchDbSyncEngine(this.settings, db, bridge);
     }
 
     const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
@@ -292,7 +298,8 @@ export default class VaultSyncPlugin extends Plugin {
    * Called from the settings tab and from the replace-local-from-server command.
    */
   async replaceLocalFromServer(): Promise<void> {
-    await (this.strategy as CustomFetchSyncStrategy).replaceLocalFromServer();
+    // Both PouchDbSyncEngine and CustomFetchSyncStrategy implement replaceLocalFromServer().
+    await this.strategy.replaceLocalFromServer();
   }
 
   /**
