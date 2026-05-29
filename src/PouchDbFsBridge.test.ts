@@ -322,7 +322,7 @@ describe("PouchDbFsBridge — vault -> PouchDB (text)", () => {
   });
 });
 
-describe("PouchDbFsBridge — echo suppression (Level 1: TTL)", () => {
+describe("PouchDbFsBridge — echo suppression (Level 1: in-memory rev sentinel)", () => {
   let db: ReturnType<typeof makePouchMock>;
   let vault: ReturnType<typeof makeVaultMock>;
   let watcher: ReturnType<typeof makeWatcherMock>;
@@ -343,10 +343,10 @@ describe("PouchDbFsBridge — echo suppression (Level 1: TTL)", () => {
     vi.useRealTimers();
   });
 
-  it("suppresses vault event within 3s TTL window after remote write", async () => {
-    // Setup: vault has "old content", remote pushes "new content"
-    // Bridge writes "new content" to vault -> calls markRemoteWrite
-    // Vault then fires a change event (echo) — should be suppressed within 3s
+  it("suppresses vault event when rev matches the applied sentinel", async () => {
+    // Remote pushes "1-abc" rev with new content -> bridge writes to vault
+    // Bridge stores sentinel: appliedRevs["file/echo.md"] = "1-abc"
+    // Vault fires change event (echo) -> bridge checks: db.get() rev === sentinel -> skip
     vault._addText("echo.md", "old content");
 
     const remoteDoc = {
@@ -357,24 +357,21 @@ describe("PouchDbFsBridge — echo suppression (Level 1: TTL)", () => {
       deleted: false,
     };
     db._emitChange(remoteDoc);
-    // Advance by 1ms to flush async microtasks (applyRemoteChange) without
-    // triggering the 3s TTL cleanup timer in markRemoteWrite
     await flushPromisesFakeTimers();
 
-    // Bridge should have written "new content from remote" to vault and called markRemoteWrite
     expect(vault._getText("echo.md")).toBe("new content from remote");
 
-    // Vault event echoes back (OS fires change after vault write)
-    // Level 1 TTL suppression should prevent writing back to PouchDB
+    // Vault echoes the change — Level 1 sentinel should suppress it
     const putSpy = vi.spyOn(db, "put");
     watcher.emit({ type: "change", path: "echo.md" });
+    // suppressIfEcho does a db.get() — advance to let it resolve
+    await flushPromisesFakeTimers();
     await flushPromisesFakeTimers();
 
     expect(putSpy).not.toHaveBeenCalled();
   });
 
-  it("allows vault event after TTL window expires (> 3s)", async () => {
-    // Remote writes "new remote content", bridge writes it (markRemoteWrite called)
+  it("allows vault event after TTL window expires (> 5s)", async () => {
     vault._addText("echo2.md", "old content");
 
     const remoteDoc = {
@@ -389,13 +386,37 @@ describe("PouchDbFsBridge — echo suppression (Level 1: TTL)", () => {
 
     expect(vault._getText("echo2.md")).toBe("new remote content");
 
-    // Advance time past the 3s TTL — this triggers the cleanup setTimeout in markRemoteWrite
-    await vi.advanceTimersByTimeAsync(3100);
+    // Advance time past the 5s TTL — sentinel is cleared
+    await vi.advanceTimersByTimeAsync(5100);
 
-    // After TTL expired, a genuine local edit should flow through to PouchDB
+    // After TTL expired, no sentinel -> change goes directly to PouchDB
     const putSpy = vi.spyOn(db, "put");
     vault._addText("echo2.md", "locally modified after TTL");
     watcher.emit({ type: "change", path: "echo2.md" });
+    await flushPromisesFakeTimers();
+
+    expect(putSpy).toHaveBeenCalled();
+  });
+
+  it("allows genuine local edit for different docId — independent sentinels", async () => {
+    // Remote applies to "remote.md", then local edits "local.md" — no suppression
+    vault._addText("remote.md", "old");
+    vault._addText("local.md", "local original");
+
+    const remoteDoc = {
+      _id: pathToDocId("remote.md"),
+      _rev: "1-abc",
+      content: "from remote",
+      mtime: 1700000000000,
+      deleted: false,
+    };
+    db._emitChange(remoteDoc);
+    await flushPromisesFakeTimers();
+
+    // Edit local.md — no sentinel for this docId -> should write to PouchDB
+    const putSpy = vi.spyOn(db, "put");
+    vault._addText("local.md", "locally edited");
+    watcher.emit({ type: "change", path: "local.md" });
     await flushPromisesFakeTimers();
 
     expect(putSpy).toHaveBeenCalled();
@@ -686,13 +707,13 @@ describe("PouchDbFsBridge — binary round-trip (vault->PouchDB->vault)", () => 
     }
   });
 
-  it("binary echo suppression: TTL prevents writing same binary back to PouchDB", async () => {
+  it("binary echo suppression: rev sentinel prevents writing same binary back to PouchDB", async () => {
     vi.useFakeTimers();
     try {
       const data = new Uint8Array([1, 2, 3]).buffer;
       await vault.createBinary("echo-img.png", data);
 
-      // Simulate remote binary change -> bridge writes to vault + marks TTL
+      // Simulate remote binary change -> bridge writes to vault + sets rev sentinel
       const docId = pathToDocId("echo-img.png");
       db._docs.set(docId, {
         _id: docId,
@@ -706,10 +727,11 @@ describe("PouchDbFsBridge — binary round-trip (vault->PouchDB->vault)", () => 
       db._emitChange(doc);
       await vi.advanceTimersByTimeAsync(1);
 
-      // Vault fires change event (echo) — should be suppressed by TTL
+      // Vault fires change event (echo) — should be suppressed by rev sentinel
+      // (sentinel present -> suppressIfEcho -> db.get() matches -> skip)
       const putAttachmentSpy = vi.spyOn(db, "putAttachment");
       watcher.emit({ type: "change", path: "echo-img.png" });
-      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(5); // let suppressIfEcho resolve
 
       expect(putAttachmentSpy).not.toHaveBeenCalled();
     } finally {
