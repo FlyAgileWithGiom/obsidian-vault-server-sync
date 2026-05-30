@@ -85,6 +85,12 @@ export const TEXT_SELECTOR = { _attachments: { $exists: false } } as const;
 // SyncPhase (distinct from SyncState) is declared in ./types so the diagnostics consumer
 // and the engine share one definition. State must NOT read "ok" while binaries backfill.
 
+// Exponential backoff config for resilient restart (Refs #74).
+// On transient network failure the engine retries after an increasing delay,
+// capped at MAX_BACKOFF_MS, and resets the counter on any successful change.
+const INITIAL_BACKOFF_MS = 2_000;
+const MAX_BACKOFF_MS = 60_000;
+
 export class PouchDbSyncEngine {
   // --- Callbacks (set by main.ts before register()) ---
   onStateChange: (state: SyncState) => void = () => {};
@@ -102,6 +108,10 @@ export class PouchDbSyncEngine {
   private pullTotal = 0;
   private lastError: string | null = null;
   private currentState: SyncState = "idle";
+
+  // Resilient-restart state (Refs #74): backoff timer and current delay.
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private currentBackoffMs = INITIAL_BACKOFF_MS;
 
   // Two-phase sync tracking (Refs #72)
   private syncPhase: SyncPhase = "idle";
@@ -402,6 +412,10 @@ export class PouchDbSyncEngine {
         this.syncHandle = null;
         const msg = err instanceof Error ? err.message : String(err);
         this.setError(`Initial sync failed: ${msg}`);
+        // Schedule a resilient retry — the promise resolves immediately so start() is
+        // not blocked during a poor-network stall (Refs #74). PouchDB's checkpoint:'target'
+        // means the retry resumes from where it left off, not from zero.
+        this.scheduleRestart("phase-1");
         resolve();
       });
     });
@@ -467,6 +481,13 @@ export class PouchDbSyncEngine {
       // info.pending is always undefined on db.sync changes. Read nested first, fall back to
       // flat for parity with the replicate.from shape; ?? 0 only once a change is observed.
       this.liveSyncPending = info.change?.pending ?? info.pending ?? 0;
+      // Successful change: clear any stale error and reset backoff (Refs #74).
+      // A stale "Initial sync failed" must not persist once the sync has recovered.
+      if (this.lastError !== null) {
+        this.lastError = null;
+        this.onDiagnosticsChange();
+      }
+      this.resetBackoff();
       this.setState("syncing");
     });
 
@@ -489,20 +510,84 @@ export class PouchDbSyncEngine {
     });
 
     emitter.on("complete", () => {
+      // Sync completed cleanly (handle was cancelled). Clear stale errors if any.
+      if (this.lastError !== null) {
+        this.lastError = null;
+        this.onDiagnosticsChange();
+      }
       this.setState("ok");
     });
 
     emitter.on("error", (err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
       this.setError(`PouchDB sync error: ${msg}`);
+      // Resilient restart: schedule a new db.sync after backoff so a transient network
+      // failure (e.g. WebKit "Load failed") does not permanently stall the backfill (Refs #74).
+      // cancelSync() in scheduleRestart's timer clears this handle before creating the new one.
+      this.scheduleRestart("live");
     });
   }
 
   private cancelSync(): void {
+    // Clear any pending backoff restart before cancelling the handle so that
+    // a manual stop() or visibility-driven restart doesn't stack a second sync.
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
     if (this.syncHandle) {
       this.syncHandle.cancel();
       this.syncHandle = null;
     }
+  }
+
+  /**
+   * Schedule a resilient restart after a transient sync or replication error (Refs #74).
+   *
+   * Uses exponential backoff (2s → 4s → 8s … capped at 60s). The backoff counter is
+   * reset by any successful `change` event so a poor-network user who recovers gets
+   * quick retries again rather than accumulating a long delay from prior errors.
+   *
+   * Idempotent: `cancelSync()` clears `retryTimer` before any manual restart (visibility
+   * handler, stop), so there is never more than one pending retry.
+   *
+   * `initialPullRunning` is reset to false before scheduling so the retry's call to
+   * `runInitialPull()` (or `startLiveSync()`) is not a no-op.
+   */
+  private scheduleRestart(phase: "phase-1" | "live"): void {
+    if (!this.started) return;
+    // Clear any existing timer to avoid doubling up.
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    const delay = this.currentBackoffMs;
+    // Advance backoff for the next potential failure (capped).
+    this.currentBackoffMs = Math.min(this.currentBackoffMs * 2, MAX_BACKOFF_MS);
+
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (!this.started) return;
+      // Cancel the (now-stale) error handle before creating a new one.
+      // Do NOT call the full cancelSync() here — that would clear retryTimer (already null)
+      // and cancel the handle. Instead cancel the handle directly so we don't recurse.
+      if (this.syncHandle) {
+        this.syncHandle.cancel();
+        this.syncHandle = null;
+      }
+      if (phase === "phase-1") {
+        // Resume phase-1 from checkpoint. Reset the guard so runInitialPull() runs.
+        this.initialPullRunning = false;
+        void this.runInitialPull();
+      } else {
+        this.startLiveSync();
+      }
+    }, delay);
+  }
+
+  /** Reset backoff counter after a successful change — next error gets a short retry. */
+  private resetBackoff(): void {
+    this.currentBackoffMs = INITIAL_BACKOFF_MS;
   }
 
   private setState(state: SyncState): void {
