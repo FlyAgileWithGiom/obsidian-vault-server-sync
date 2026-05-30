@@ -262,6 +262,10 @@ describe("PouchDbSyncEngine — callbacks", () => {
     lastSyncHandle!._emit("error", new Error("network failure"));
     expect(onError).toHaveBeenCalledWith(expect.stringContaining("network failure"));
     expect(onStateChange).toHaveBeenCalledWith("error");
+    // stop() is REQUIRED here: the error handler now schedules a 2s backoff retry timer.
+    // Without stop(), that timer fires during a later test, reassigns lastSyncHandle,
+    // and causes intermittent failures. stop() → cancelSync() clears the timer.
+    engine.stop();
   });
 
   it("sync 'complete' event calls onStateChange('ok')", async () => {
@@ -272,6 +276,7 @@ describe("PouchDbSyncEngine — callbacks", () => {
     await engine.start();
     lastSyncHandle!._emit("complete");
     expect(onStateChange).toHaveBeenCalledWith("ok");
+    engine.stop();
   });
 });
 
