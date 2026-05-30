@@ -648,6 +648,153 @@ describe("PouchDbSyncEngine — selector constants (Refs #72)", () => {
   });
 });
 
+// ---- Refs #74: resilient resume after transient sync errors -----------------
+
+/**
+ * These tests prove the stall bug (no resume after network error) and verify the fix.
+ *
+ * Strategy: use vi.useFakeTimers() so backoff sleeps don't stall the test suite.
+ * The new test MUST fail on unfixed code (db.sync called only once, error latched forever)
+ * and PASS after the fix (db.sync called again, error cleared on success).
+ */
+describe("PouchDbSyncEngine — resilient resume after transient error (Refs #74)", () => {
+  beforeEach(() => {
+    lastSyncHandle = null;
+    lastReplicateHandle = null;
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.runAllTimers();
+    vi.useRealTimers();
+  });
+
+  it("live-sync error triggers a restart (db.sync called again) after backoff [FAILS on unfixed code]", async () => {
+    // On unfixed code: error handler only calls setError, no restart.
+    // db.sync is called exactly once and stays stopped.
+    // On fixed code: error schedules a backoff restart → db.sync called a second time.
+    const { engine, db } = makeEngine({ docCount: 5 }); // doc_count>0 → goes directly to live sync
+    engine.register(makePlugin());
+    await engine.start();
+
+    const firstHandle = lastSyncHandle!;
+    expect(db.sync).toHaveBeenCalledTimes(1);
+
+    // Simulate transient network failure (WebKit "Load failed")
+    firstHandle._emit("error", new Error("Load failed"));
+
+    // Advance past the first backoff window (2s initial)
+    await vi.advanceTimersByTimeAsync(3000);
+
+    // AFTER fix: db.sync must be called again (a new handle was created)
+    expect(db.sync).toHaveBeenCalledTimes(2);
+    expect(lastSyncHandle).not.toBe(firstHandle);
+
+    engine.stop();
+  });
+
+  it("error clears (lastError → null) when the restarted sync reports a successful change", async () => {
+    // Stale "Initial sync failed" must NOT persist after the sync recovers.
+    const { engine } = makeEngine({ docCount: 5 });
+    const onError = vi.fn();
+    engine.onError = onError;
+    engine.register(makePlugin());
+    await engine.start();
+
+    // Trigger error
+    lastSyncHandle!._emit("error", new Error("Load failed"));
+    expect(engine.getDiagnostics().lastError).not.toBeNull();
+
+    // Advance past backoff → restart fires
+    await vi.advanceTimersByTimeAsync(3000);
+
+    // Simulate successful change on the new handle
+    lastSyncHandle!._emit("change", { direction: "pull", change: { docs_written: 10, pending: 0 } });
+
+    // lastError must be cleared now — stale error must not persist
+    expect(engine.getDiagnostics().lastError).toBeNull();
+
+    engine.stop();
+  });
+
+  it("stop() cancels any pending backoff timer (no leak into later tests)", async () => {
+    const { engine, db } = makeEngine({ docCount: 5 });
+    engine.register(makePlugin());
+    await engine.start();
+
+    lastSyncHandle!._emit("error", new Error("Load failed"));
+    // stop() before backoff fires — timer must be cleared
+    engine.stop();
+
+    await vi.advanceTimersByTimeAsync(10000); // way past any backoff
+
+    // db.sync should NOT be called again after stop()
+    expect(db.sync).toHaveBeenCalledTimes(1);
+  });
+
+  it("phase-1 error triggers a restart of runInitialPull (replicate.from called again)", async () => {
+    // On unfixed code: phase-1 error calls setError and resolves — no restart.
+    // On fixed code: a backoff restart re-runs the initial pull (checkpoint:'target' so no re-download).
+    const db = makeMockDb(0);
+    let replicateCallCount = 0;
+    (db.replicate.from as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      const handle = makeMockSyncHandle();
+      lastReplicateHandle = handle;
+      replicateCallCount++;
+      if (replicateCallCount === 1) {
+        // First call: simulate transient error (WebKit "Load failed")
+        setTimeout(() => handle._emit("error", new Error("Load failed")), 0);
+      } else {
+        // Second call: success
+        setTimeout(() => handle._emit("complete"), 0);
+      }
+      return handle;
+    });
+    const bridge = makeMockBridge();
+    const dbFactory = () => db as unknown as Parameters<typeof PouchDbSyncEngine>[1];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any, dbFactory as any);
+    engine.register(makePlugin());
+
+    // start() must resolve even though phase-1 errored (does not block forever)
+    const startPromise = engine.start();
+    await vi.runAllTimersAsync(); // drain the error timer
+    await startPromise;
+
+    // Advance past backoff → retry fires
+    await vi.advanceTimersByTimeAsync(3000);
+    await vi.runAllTimersAsync(); // drain the complete timer
+
+    // replicate.from must have been called twice (first failed, second succeeded)
+    expect(db.replicate.from).toHaveBeenCalledTimes(2);
+
+    engine.stop();
+  });
+
+  it("backoff resets after a successful change (no stale backoff doubling)", async () => {
+    // After a successful change the backoff counter resets to the base delay.
+    // This test checks the happy path doesn't accrue an ever-growing backoff.
+    const { engine, db } = makeEngine({ docCount: 5 });
+    engine.register(makePlugin());
+    await engine.start();
+
+    // Error → restart
+    lastSyncHandle!._emit("error", new Error("Load failed"));
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(db.sync).toHaveBeenCalledTimes(2);
+
+    // Successful change on restarted handle → backoff resets
+    lastSyncHandle!._emit("change", { direction: "pull", change: { docs_written: 5, pending: 0 } });
+
+    // Another error → backoff should be base (2s), not doubled from previous
+    lastSyncHandle!._emit("error", new Error("Load failed again"));
+    await vi.advanceTimersByTimeAsync(3000); // 2s base + margin
+    expect(db.sync).toHaveBeenCalledTimes(3);
+
+    engine.stop();
+  });
+});
+
 // ---- c5: resume guard (no full re-pull on visibilitychange) -----------------
 
 /**
