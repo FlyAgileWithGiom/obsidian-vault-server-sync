@@ -34,7 +34,6 @@ import type {
   SyncPhase,
   SyncCounts,
   SyncDiagnostics,
-  FullSyncPlan,
 } from "./types";
 
 /**
@@ -260,9 +259,8 @@ export class PouchDbSyncEngine {
     return {
       running: this.started,
       state: this.currentState,
-      revMapSize: 0,
-      knownRevMapSize: 0,
-      lastSeq: 0,
+      // Two-phase initial-pull observability (Refs #72).
+      syncPhase: this.syncPhase,
       // Only expose pullProgress during the text-pull phase. Once phase-1 completes,
       // pullTotal remains set but the live db.sync `pending` covers the whole changes
       // feed (text already-local + binaries + tombstones), so the denominator is wrong
@@ -271,51 +269,22 @@ export class PouchDbSyncEngine {
       pullProgress: this.syncPhase === "text-pull" && this.pullTotal > 0
         ? { fetched: this.pullFetched, total: this.pullTotal }
         : null,
-      pullSkipped: 0,
       pullApplied: this.pullFetched,
-      pendingPushCount: 0,
-      lastError: this.lastError,
-      unsyncableCount: 0,
-      unsyncableSample: [],
-      // avg*/...SampleCount belonged to the retired per-doc-timing PouchDbSyncStrategy; the
-      // engine has no such instrumentation. Report null/0 (not NaN) so the UI renders cleanly.
-      avgFetchMs: null,
-      fetchSampleCount: 0,
-      avgApplyMs: null,
-      applySampleCount: 0,
-      // Two-phase initial-pull observability (Refs #72).
-      syncPhase: this.syncPhase,
       // Pattern B has no binary-specific counter (live db.sync `pending` is combined
       // text+binary), so no honest N/total is available — null, not a fabricated count.
       binaryProgress: null,
+      lastError: this.lastError,
     };
   }
 
-  /**
-   * Dry-run plan — returns approximate doc counts from local PouchDB + db.info().
-   */
-  async planFullSync(_opts?: { bypassOrphanGuard?: boolean }): Promise<FullSyncPlan> {
-    let localDocCount = 0;
+  /** Returns the real local doc count from PouchDB. Used by the Replace modal. */
+  async getLocalDocCount(): Promise<number> {
     try {
       const info = await this.db.info();
-      localDocCount = info.doc_count ?? 0;
+      return info.doc_count ?? 0;
     } catch {
-      // Non-critical, return empty plan
+      throw new Error("Could not read local doc count");
     }
-
-    return {
-      wouldPushNew: { count: localDocCount, sample: [] },
-      wouldPushChanged: { count: 0, sample: [] },
-      wouldPullRevMismatch: { count: 0, sample: [] },
-      wouldSkipOrphanGuard: { count: 0, sample: [] },
-      wouldTombstoneLocal: { count: 0, sample: [] },
-      wouldPullDelete: { count: 0, sample: [] },
-      wouldDeleteLocalTombstoned: { count: 0, sample: [] },
-      alreadyTombstoned: 0,
-      alreadyOrphan: 0,
-      oversizeSkipped: 0,
-      excludedCount: 0,
-    };
   }
 
   async testConnection(): Promise<boolean> {
