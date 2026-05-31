@@ -2,7 +2,7 @@ import { Notice, Plugin } from "obsidian";
 import type { PouchDbSyncEngine } from "./PouchDbSyncEngine";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
 import { VaultSyncSettingTab } from "./settings-tab";
-import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics, FullSyncPlan } from "./types";
+import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics } from "./types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
 import { slugify } from "./slugify";
 
@@ -207,7 +207,6 @@ export default class VaultSyncPlugin extends Plugin {
       data.couchDbName = data.database;
       data.couchDbUser = data.username;
       data.couchDbPassword = data.password;
-      data.syncDebounceMs = (data.debounceMs as number | undefined) ?? DEFAULT_SETTINGS.syncDebounceMs;
       delete data.couchdbUrl;
       delete data.database;
       delete data.username;
@@ -285,18 +284,14 @@ export default class VaultSyncPlugin extends Plugin {
     await this.strategy.replaceLocalFromServer();
   }
 
-  /**
-   * Public: dry-run preview of what Force full sync would do.
-   * Delegates to the engine with bypassOrphanGuard=true (matching forceFullSync behaviour).
-   * Called from the settings tab "Preview Full sync" button.
-   */
-  async previewFullSync(): Promise<FullSyncPlan> {
-    return this.strategy.planFullSync({ bypassOrphanGuard: true });
-  }
-
   /** Public: diagnostics for settings tab observability on mobile */
   getDiagnostics(): SyncDiagnostics {
     return this.strategy.getDiagnostics();
+  }
+
+  /** Public: real local doc count for Replace confirmation modal. */
+  async getLocalDocCount(): Promise<number> {
+    return this.strategy.getLocalDocCount();
   }
 
   subscribeDiagnostics(listener: () => void): void {
