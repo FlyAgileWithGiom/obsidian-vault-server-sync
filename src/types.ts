@@ -3,15 +3,7 @@ export interface VaultSyncSettings {
   couchDbName: string;
   couchDbUser: string;
   couchDbPassword: string;
-  syncDebounceMs: number;
   excludePatterns: string[];
-  /**
-   * Skip binary file push entirely. Use as escape hatch when binary push
-   * is misbehaving (e.g. tombstone 404 loop on resurrected files) and
-   * blocks the daemon from reaching State: ok. Text sync continues normally.
-   * Default: false.
-   */
-  disableBinaryPush?: boolean;
 }
 
 /** Filename for plugin-managed settings at vault root */
@@ -22,7 +14,6 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
   couchDbName: "",
   couchDbUser: "",
   couchDbPassword: "",
-  syncDebounceMs: 500,
   excludePatterns: [".trash/", ".obsidian/", ".vault-sync-state.json", VAULT_SYNC_CONFIG_FILE],
 };
 
@@ -56,32 +47,14 @@ export interface RevMap {
 export interface SyncDiagnostics {
   running: boolean;
   state: SyncState;
-  revMapSize: number;       // total entries (known + tombstoned + orphan)
-  knownRevMapSize: number;  // entries with state: "known" only
-  lastSeq: string | number;
-  pullProgress: { fetched: number; total: number } | null;
-  pullSkipped: number;
-  pullApplied: number;
-  pendingPushCount: number;
-  lastError: string | null;
-  /** Files skipped due to recoverable read errors (EAGAIN, EACCES, EIO, ENOENT) */
-  unsyncableCount: number;
-  /** Up to 5 paths of currently unsyncable files, for diagnostics UI */
-  unsyncableSample: string[];
-  /** Rolling average (last 50 samples) of allDocsByKeys call duration in pullTextDocs, ms */
-  avgFetchMs: number | null;
-  /** Number of samples in the avgFetchMs rolling buffer */
-  fetchSampleCount: number;
-  /** Rolling average (last 50 samples) of applyRemoteDoc call duration in pullTextDocs, ms */
-  avgApplyMs: number | null;
-  /** Number of samples in the avgApplyMs rolling buffer */
-  applySampleCount: number;
   /**
    * Two-phase initial-pull phase (Refs #72). Distinct from `state`: when this is
    * "text-ready" or "binary-backfill", `state` is still "syncing" (binaries pending) —
    * the UI reads this to show "Notes ready, attachments syncing" without claiming "Synced".
    */
   syncPhase: SyncPhase;
+  pullProgress: { fetched: number; total: number } | null;
+  pullApplied: number;
   /**
    * Binary backfill progress during phase-2, or null when unavailable.
    * Pattern B has no binary-specific counter (the live db.sync `pending` is a combined
@@ -89,51 +62,9 @@ export interface SyncDiagnostics {
    * Pattern A exact "attachments N/total". Do not fabricate an N/6750 from combined pending.
    */
   binaryProgress: { fetched: number; total: number } | null;
+  lastError: string | null;
 }
 
-/**
- * Dry-run plan produced by SyncEngine.planFullSync().
- *
- * Models exactly what forceFullSync() would do (bypass=true) without any writes.
- * Each count/sample pair mirrors one decision branch in fullSync.
- *
- * Assumption: the plan is computed with bypassOrphanGuard=true by default because
- * the user-facing button routes through forceFullSync, which sets bypass=true after
- * clearState().  Tests should also cover bypass=false to exercise the guard branch.
- */
-export interface FullSyncPlan {
-  /** Files on FS not present in remoteRevs — would push as new docs */
-  wouldPushNew: { count: number; sample: string[] };
-  /** Files on FS present in remoteRevs but locally changed since last sync */
-  wouldPushChanged: { count: number; sample: string[] };
-  /** Remote docs whose rev differs from revMap (or no revMap entry when bypass=true) — would pull */
-  wouldPullRevMismatch: { count: number; sample: string[] };
-  /**
-   * Remote docs with no revMap entry when bypassOrphanGuard=false — would be skipped.
-   * When bypass=true this bucket is empty and those docs appear in wouldPullRevMismatch.
-   * A non-zero count here is the diagnostic signal that surfaced the PR #30 bug.
-   */
-  wouldSkipOrphanGuard: { count: number; sample: string[] };
-  /** revMap "known" entries with no FS file — would propagate tombstone to remote */
-  wouldTombstoneLocal: { count: number; sample: string[] };
-  /** revMap "known" entries absent from remoteRevs — would delete local file */
-  wouldPullDelete: { count: number; sample: string[] };
-  /**
-   * Files that the server has tombstoned (detected via allDocsByKeys on unknownFiles).
-   * Would cause local deletion.  Separate from wouldPullDelete because these are
-   * files that *exist locally* but the remote has a tombstone for — the most
-   * surprising action a full sync can take.
-   */
-  wouldDeleteLocalTombstoned: { count: number; sample: string[] };
-  /** revMap entries already in tombstoned state (informational — no action taken) */
-  alreadyTombstoned: number;
-  /** revMap entries already in orphan state (informational — no action taken) */
-  alreadyOrphan: number;
-  /** Files skipped because they exceed MAX_FILE_SIZE (same threshold as fullSync) */
-  oversizeSkipped: number;
-  /** Files skipped because they match excludePatterns (informational) */
-  excludedCount: number;
-}
 
 // --- Portable abstractions (used by both Obsidian plugin and headless daemon) ---
 
