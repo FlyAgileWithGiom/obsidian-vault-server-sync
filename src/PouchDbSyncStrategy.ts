@@ -29,7 +29,6 @@ import type {
   SyncState,
   SyncCounts,
   SyncDiagnostics,
-  FullSyncPlan,
 } from "./types";
 
 /** Emitter shape for PouchDB replication/sync handles. */
@@ -147,45 +146,13 @@ export class PouchDbSyncStrategy implements SyncStrategy {
     return {
       running: this.started,
       state: this.currentState,
-      revMapSize: 0,
-      knownRevMapSize: 0,
-      lastSeq: 0,
+      syncPhase: "idle",
       pullProgress: this.pullTotal > 0
         ? { fetched: this.pullFetched, total: this.pullTotal }
         : null,
-      pullSkipped: 0,
       pullApplied: this.pullFetched,
-      pendingPushCount: 0,
+      binaryProgress: null,
       lastError: this.lastError,
-      unsyncableCount: 0,
-      unsyncableSample: [],
-    };
-  }
-
-  /**
-   * Dry-run plan — returns approximate doc counts from local PouchDB + db.info().
-   */
-  async planFullSync(_opts?: { bypassOrphanGuard?: boolean }): Promise<FullSyncPlan> {
-    let localDocCount = 0;
-    try {
-      const info = await this.db.info();
-      localDocCount = info.doc_count ?? 0;
-    } catch {
-      // Non-critical, return empty plan
-    }
-
-    return {
-      wouldPushNew: { count: localDocCount, sample: [] },
-      wouldPushChanged: { count: 0, sample: [] },
-      wouldPullRevMismatch: { count: 0, sample: [] },
-      wouldSkipOrphanGuard: { count: 0, sample: [] },
-      wouldTombstoneLocal: { count: 0, sample: [] },
-      wouldPullDelete: { count: 0, sample: [] },
-      wouldDeleteLocalTombstoned: { count: 0, sample: [] },
-      alreadyTombstoned: 0,
-      alreadyOrphan: 0,
-      oversizeSkipped: 0,
-      excludedCount: 0,
     };
   }
 

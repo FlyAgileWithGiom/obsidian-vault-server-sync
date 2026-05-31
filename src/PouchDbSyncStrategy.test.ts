@@ -401,7 +401,7 @@ describe("PouchDbSyncStrategy — getDiagnostics()", () => {
   });
 });
 
-describe("PouchDbSyncStrategy — forceFullSync() / planFullSync()", () => {
+describe("PouchDbSyncStrategy — forceFullSync()", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     lastSyncHandle = null;
@@ -446,30 +446,6 @@ describe("PouchDbSyncStrategy — forceFullSync() / planFullSync()", () => {
     );
     syncSpy.mockRestore();
   });
-
-  it("planFullSync() resolves with a valid FullSyncPlan object", async () => {
-    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
-    const plan = await strategy.planFullSync();
-    expect(plan).toBeDefined();
-    expect(plan.wouldPushNew).toBeDefined();
-    expect(plan.wouldPushNew.count).toBeGreaterThanOrEqual(0);
-    expect(plan.wouldDeleteLocalTombstoned).toBeDefined();
-    expect(plan.alreadyTombstoned).toBeDefined();
-    expect(plan.excludedCount).toBeDefined();
-  });
-
-  it("planFullSync() returns doc_count from db.info() in wouldPushNew.count", async () => {
-    const PouchDB = (await import("pouchdb-browser")).default;
-    vi.spyOn(PouchDB.prototype, "info").mockResolvedValueOnce({
-      db_name: "test",
-      doc_count: 42,
-      update_seq: 0,
-    });
-
-    const strategy = new PouchDbSyncStrategy(makeSettings(), makeApp());
-    const plan = await strategy.planFullSync();
-    expect(plan.wouldPushNew.count).toBe(42);
-  });
 });
 
 describe("PouchDbSyncStrategy — remote URL construction", () => {
@@ -483,7 +459,6 @@ describe("PouchDbSyncStrategy — remote URL construction", () => {
       couchDbName: "my-vault",
       couchDbUser: "alice",
       couchDbPassword: "s3cr3t",
-      syncDebounceMs: 500,
       excludePatterns: [],
     }, makeApp());
     strategy.register(makePlugin());
@@ -509,7 +484,6 @@ describe("PouchDbSyncStrategy — remote URL construction", () => {
       couchDbName: "test",
       couchDbUser: "",
       couchDbPassword: "",
-      syncDebounceMs: 500,
       excludePatterns: [],
     }, makeApp());
     strategy.register(makePlugin());
