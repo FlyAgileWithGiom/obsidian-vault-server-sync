@@ -98,7 +98,6 @@ function makeSettings(): VaultSyncSettings {
     couchDbName: "test-vault",
     couchDbUser: "alice",
     couchDbPassword: "secret",
-    syncDebounceMs: 500,
     excludePatterns: [],
   };
 }
@@ -289,14 +288,17 @@ describe("PouchDbSyncEngine — getDiagnostics()", () => {
     expect(diag.lastError).toBeNull();
   });
 
-  it("populates the four formerly-missing timing fields as null/0 (no NaN)", () => {
-    // These belonged to the retired PouchDbSyncStrategy; getDiagnostics() omitted them,
-    // violating SyncDiagnostics. They must be present and never NaN.
-    const diag = makeEngine().engine.getDiagnostics();
-    expect(diag.avgFetchMs).toBeNull();
-    expect(diag.fetchSampleCount).toBe(0);
-    expect(diag.avgApplyMs).toBeNull();
-    expect(diag.applySampleCount).toBe(0);
+  it("does not expose removed stub fields (revMapSize, lastSeq, pendingPushCount etc.)", () => {
+    // These fields were always-stub (0 / null) and have been removed from SyncDiagnostics.
+    // Confirm getDiagnostics() no longer returns them.
+    const diag = makeEngine().engine.getDiagnostics() as unknown as Record<string, unknown>;
+    expect(diag).not.toHaveProperty("revMapSize");
+    expect(diag).not.toHaveProperty("lastSeq");
+    expect(diag).not.toHaveProperty("pendingPushCount");
+    expect(diag).not.toHaveProperty("pullSkipped");
+    expect(diag).not.toHaveProperty("avgFetchMs");
+    expect(diag).not.toHaveProperty("avgApplyMs");
+    expect(diag).not.toHaveProperty("unsyncableCount");
   });
 
   it("reports syncPhase 'idle' and binaryProgress null before any pull", () => {
@@ -379,7 +381,7 @@ describe("PouchDbSyncEngine — getDiagnostics()", () => {
   });
 });
 
-describe("PouchDbSyncEngine — forceFullSync() / planFullSync()", () => {
+describe("PouchDbSyncEngine — forceFullSync()", () => {
   beforeEach(() => { lastSyncHandle = null; lastReplicateHandle = null; });
 
   it("forceFullSync() resolves (does not throw)", async () => {
@@ -401,22 +403,25 @@ describe("PouchDbSyncEngine — forceFullSync() / planFullSync()", () => {
     await engine.forceFullSync();
     expect(db.sync).toHaveBeenCalledWith(expect.any(String), { live: true, retry: true });
   });
+});
 
-  it("planFullSync() resolves with a valid FullSyncPlan", async () => {
-    const { engine } = makeEngine();
-    const plan = await engine.planFullSync();
-    expect(plan.wouldPushNew).toBeDefined();
-    expect(plan.wouldDeleteLocalTombstoned).toBeDefined();
-    expect(plan.excludedCount).toBeDefined();
-  });
-
-  it("planFullSync() uses db.info() doc_count for wouldPushNew.count", async () => {
+describe("PouchDbSyncEngine — getLocalDocCount()", () => {
+  it("returns db.info() doc_count", async () => {
     const db = makeMockDb(42);
     const bridge = makeMockBridge();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any);
-    const plan = await engine.planFullSync();
-    expect(plan.wouldPushNew.count).toBe(42);
+    const count = await engine.getLocalDocCount();
+    expect(count).toBe(42);
+  });
+
+  it("throws when db.info() rejects", async () => {
+    const db = makeMockDb(0);
+    (db.info as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("db error"));
+    const bridge = makeMockBridge();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any);
+    await expect(engine.getLocalDocCount()).rejects.toThrow("Could not read local doc count");
   });
 });
 
@@ -427,7 +432,7 @@ describe("PouchDbSyncEngine — remote URL construction", () => {
     const db = makeMockDb(5);
     const bridge = makeMockBridge();
     const engine = new PouchDbSyncEngine(
-      { couchDbUrl: "https://sync.example.com", couchDbName: "my-vault", couchDbUser: "alice", couchDbPassword: "s3cr3t", syncDebounceMs: 500, excludePatterns: [] },
+      { couchDbUrl: "https://sync.example.com", couchDbName: "my-vault", couchDbUser: "alice", couchDbPassword: "s3cr3t", excludePatterns: [] },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       db as any, bridge as any,
     );
@@ -441,7 +446,7 @@ describe("PouchDbSyncEngine — remote URL construction", () => {
     const db = makeMockDb(5);
     const bridge = makeMockBridge();
     const engine = new PouchDbSyncEngine(
-      { couchDbUrl: "http://localhost:5984", couchDbName: "test", couchDbUser: "", couchDbPassword: "", syncDebounceMs: 500, excludePatterns: [] },
+      { couchDbUrl: "http://localhost:5984", couchDbName: "test", couchDbUser: "", couchDbPassword: "", excludePatterns: [] },
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       db as any, bridge as any,
     );
