@@ -263,7 +263,12 @@ export class PouchDbSyncEngine {
       revMapSize: 0,
       knownRevMapSize: 0,
       lastSeq: 0,
-      pullProgress: this.pullTotal > 0
+      // Only expose pullProgress during the text-pull phase. Once phase-1 completes,
+      // pullTotal remains set but the live db.sync `pending` covers the whole changes
+      // feed (text already-local + binaries + tombstones), so the denominator is wrong
+      // for "binaries remaining". Return null during binary-backfill so the UI never
+      // shows a misleading "1603 / 22874" against the full-DB count (Refs #74).
+      pullProgress: this.syncPhase === "text-pull" && this.pullTotal > 0
         ? { fetched: this.pullFetched, total: this.pullTotal }
         : null,
       pullSkipped: 0,

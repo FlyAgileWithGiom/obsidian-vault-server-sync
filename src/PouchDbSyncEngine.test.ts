@@ -330,6 +330,53 @@ describe("PouchDbSyncEngine — getDiagnostics()", () => {
     expect(diag.binaryProgress).toBeNull();
     engine.stop();
   });
+
+  it("pullProgress is non-null during text-pull, null after phase-1 completes (binary-backfill)", async () => {
+    // Drive a non-auto-completing phase-1 so we can assert during the pull.
+    // The standard mock auto-emits "complete" via setTimeout; we override it here
+    // so phase-1 stays in-flight long enough to observe pullProgress mid-pull.
+    const db = makeMockDb(0);
+    (db.replicate.from as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      const handle = makeMockSyncHandle();
+      lastReplicateHandle = handle;
+      // does NOT auto-emit "complete" — caller controls the lifecycle
+      return handle;
+    });
+    const bridge = makeMockBridge();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any, () => db as any);
+    engine.register(makePlugin());
+
+    // Kick off start() without awaiting — phase-1 hangs until we emit "complete".
+    // Flush microtasks so replicate.from is actually issued (db.info await must settle first).
+    void engine.start();
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Simulate progress arriving during phase-1 (flat shape: docs_written + pending).
+    lastReplicateHandle!._emit("change", { docs_written: 1603, pending: 21271 });
+
+    // DURING text-pull: pullProgress must be non-null and carry the phase-1 values.
+    const mid = engine.getDiagnostics();
+    expect(mid.syncPhase).toBe("text-pull");
+    expect(mid.pullProgress).not.toBeNull();
+    expect(mid.pullProgress?.fetched).toBe(1603);
+    expect(mid.pullProgress?.total).toBe(22874); // 1603 + 21271
+
+    // Phase-1 completes → engine moves to text-ready then immediately starts live sync
+    // (binary-backfill). pullTotal is still 22874 on the engine — the fix must suppress it.
+    lastReplicateHandle!._emit("complete");
+    // Flush microtask queue so the complete handler runs and startLiveSync() fires.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // AFTER phase-1, during binary-backfill: pullProgress must be null — the combined
+    // db.sync pending count (text already-local + binaries + tombstones) is not an
+    // honest denominator for "binaries remaining" (Refs #74).
+    const after = engine.getDiagnostics();
+    expect(after.syncPhase).toBe("binary-backfill");
+    expect(after.pullProgress).toBeNull();
+
+    engine.stop();
+  });
 });
 
 describe("PouchDbSyncEngine — forceFullSync() / planFullSync()", () => {
