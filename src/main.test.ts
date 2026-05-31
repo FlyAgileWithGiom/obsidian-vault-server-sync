@@ -51,8 +51,8 @@ vi.mock("./PouchDbSyncEngine", () => ({
     onDiagnosticsChange: null,
     onNotice: null,
     getDiagnostics: vi.fn().mockReturnValue({}),
+    getLocalDocCount: vi.fn().mockResolvedValue(0),
     replaceLocalFromServer: vi.fn().mockResolvedValue(undefined),
-    planFullSync: vi.fn().mockResolvedValue({}),
   })),
 }));
 
@@ -105,7 +105,6 @@ describe("VaultSyncPlugin.loadSettings", () => {
       couchDbName: "my-vault",
       couchDbUser: "alice",
       couchDbPassword: "secret",
-      syncDebounceMs: 300,
       excludePatterns: [".trash/"],
     };
     plugin.app.vault.adapter._setStored(VAULT_SYNC_CONFIG_FILE, JSON.stringify(stored));
@@ -127,8 +126,8 @@ describe("VaultSyncPlugin.loadSettings", () => {
 
     // Explicitly provided
     expect(plugin.settings.couchDbUrl).toBe("https://couch.example.com");
-    // Falls back to default
-    expect(plugin.settings.syncDebounceMs).toBe(DEFAULT_SETTINGS.syncDebounceMs);
+    // Falls back to default for other fields
+    expect(plugin.settings.excludePatterns).toEqual(DEFAULT_SETTINGS.excludePatterns);
   });
 
   it("falls back to data.json when .vault-sync.json is absent and uses DEFAULT_SETTINGS when data.json is empty", async () => {
@@ -159,7 +158,6 @@ describe("VaultSyncPlugin.loadSettings", () => {
       couchDbName: "vault-mine",
       couchDbUser: "bob",
       couchDbPassword: "pass",
-      syncDebounceMs: 500,
       excludePatterns: [".trash/"],
     };
     (plugin.loadData as ReturnType<typeof vi.fn>).mockResolvedValue(legacyData);
@@ -198,7 +196,6 @@ describe("VaultSyncPlugin.loadSettings", () => {
       couchDbName: "vault-obsidiannotes",
       couchDbUser: "alice",
       couchDbPassword: "secret",
-      syncDebounceMs: 500,
       excludePatterns: [".trash/"],
     };
     (plugin.loadData as ReturnType<typeof vi.fn>).mockResolvedValue(legacyData);
@@ -239,7 +236,6 @@ describe("VaultSyncPlugin.saveSettings", () => {
       couchDbName: "vault-test",
       couchDbUser: "user",
       couchDbPassword: "pass",
-      syncDebounceMs: 500,
       excludePatterns: [".trash/"],
     };
   });
@@ -319,8 +315,7 @@ describe("VaultSyncPlugin.onload — auto-derive couchDbName", () => {
         couchDbName: customDbName,
         couchDbUser: "alice",
         couchDbPassword: "secret",
-        syncDebounceMs: 500,
-        excludePatterns: [".trash/"],
+          excludePatterns: [".trash/"],
       })
     );
     (plugin.app.vault as unknown as { getName(): string }).getName = () => "MyNotes";
@@ -341,7 +336,6 @@ describe("VaultSyncPlugin.onload — auto-derive couchDbName", () => {
       couchDbUrl: DEFAULT_SETTINGS.couchDbUrl,
       couchDbUser: "",
       couchDbPassword: "",
-      syncDebounceMs: 500,
       excludePatterns: [],
     });
     (plugin.app.vault as unknown as { getName(): string }).getName = () => "VaultA";
@@ -467,36 +461,6 @@ describe("vault event handlers", () => {
     // Shape b: strategy.register(plugin) is called so the strategy owns vault event subscriptions.
     // main.ts must NOT register vault events directly — that responsibility is in the strategy.
     expect(syncEngineInstance.register).toHaveBeenCalledWith(plugin);
-  });
-});
-
-describe("VaultSyncPlugin.previewFullSync", () => {
-  it("delegates to syncEngine.planFullSync with bypassOrphanGuard=true", async () => {
-    const plugin = makePlugin();
-    const mockPlan = {
-      wouldPushNew: { count: 2, sample: ["a.md", "b.md"] },
-      wouldPushChanged: { count: 0, sample: [] },
-      wouldPullRevMismatch: { count: 1, sample: ["c.md"] },
-      wouldSkipOrphanGuard: { count: 0, sample: [] },
-      wouldTombstoneLocal: { count: 0, sample: [] },
-      wouldPullDelete: { count: 0, sample: [] },
-      wouldDeleteLocalTombstoned: { count: 0, sample: [] },
-      alreadyTombstoned: 0,
-      alreadyOrphan: 0,
-      oversizeSkipped: 0,
-      excludedCount: 1,
-    };
-
-    const planFullSync = vi.fn().mockResolvedValue(mockPlan);
-    // Inject a mock strategy with planFullSync
-    (plugin as unknown as { strategy: unknown }).strategy = {
-      planFullSync,
-    };
-
-    const result = await plugin.previewFullSync();
-
-    expect(planFullSync).toHaveBeenCalledWith({ bypassOrphanGuard: true });
-    expect(result).toBe(mockPlan);
   });
 });
 

@@ -104,7 +104,6 @@ describe("replaceLocalFromServer() — real PouchDB regression", () => {
       couchDbName: "test-vault",
       couchDbUser: "",
       couchDbPassword: "",
-      syncDebounceMs: 500,
       excludePatterns: [],
     };
 

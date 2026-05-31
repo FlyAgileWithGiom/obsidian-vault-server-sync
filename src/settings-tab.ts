@@ -1,6 +1,6 @@
 import { App, Modal, PluginSettingTab, Setting } from "obsidian";
 import type VaultSyncPlugin from "./main";
-import type { SyncDiagnostics, FullSyncPlan } from "./types";
+import type { SyncDiagnostics } from "./types";
 
 /**
  * Settings tab for Vault Sync plugin.
@@ -11,7 +11,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
   // Cached <pre> element — reused across renders to avoid DOM teardown on mobile.
   private diagnosticsPre: HTMLElement | null = null;
   private unsubDiagnostics: (() => void) | null = null;
-  private previewEl: HTMLElement | null = null;
 
   constructor(app: App, private plugin: VaultSyncPlugin) {
     super(app, plugin);
@@ -90,21 +89,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
-
-    new Setting(containerEl)
-      .setName("Sync debounce (ms)")
-      .setDesc("Wait this long after a local change before syncing (reduces writes during typing)")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.syncDebounceMs))
-          .onChange(async (value) => {
-            const num = parseInt(value, 10);
-            if (!isNaN(num) && num >= 0) {
-              this.plugin.settings.syncDebounceMs = num;
-              await this.plugin.saveSettings();
-            }
-          })
-      );
 
     new Setting(containerEl)
       .setName("Exclude patterns")
@@ -187,35 +171,18 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       .setName("Replace local from server")
       .setDesc("Delete local files tracked by sync, then re-download from the server. Local files not yet synced will be LOST. Server is source of truth.")
       .addButton((btn) =>
-        btn.setButtonText("Replace").onClick(() => {
-          const { revMapSize } = this.plugin.getDiagnostics();
-          new ReplaceConfirmModal(this.app, revMapSize, () => {
+        btn.setButtonText("Replace").onClick(async () => {
+          let localCount: number | null = null;
+          try {
+            localCount = await this.plugin.getLocalDocCount();
+          } catch {
+            // Non-fatal: show modal without a count
+          }
+          new ReplaceConfirmModal(this.app, localCount, () => {
             this.plugin.replaceLocalFromServer();
           }).open();
         })
       );
-
-    new Setting(containerEl)
-      .setName("Preview Full sync (dry-run)")
-      .setDesc("Show what Force full sync would do, without changing anything")
-      .addButton((btn) =>
-        btn.setButtonText("Preview").onClick(async () => {
-          btn.setButtonText("Running...");
-          btn.setDisabled(true);
-          try {
-            const plan = await this.plugin.previewFullSync();
-            this.renderPreview(plan);
-          } catch (e) {
-            this.renderPreviewError((e as Error).message);
-          }
-          setTimeout(() => {
-            btn.setButtonText("Preview");
-            btn.setDisabled(false);
-          }, 1000);
-        })
-      );
-
-    this.previewEl = containerEl.createEl("div", { cls: "vault-sync-preview" });
 
     // --- Diagnostics section (provides observability on mobile) ---
     containerEl.createEl("h3", { text: "Diagnostics" });
@@ -238,9 +205,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
       `Version: ${this.plugin.manifest.version}`,
       `Status: ${d.state}`,
       `Running: ${d.running ? "yes" : "no"}`,
-      `Tracked docs (revMap): ${d.revMapSize}`,
-      `Last sequence: ${d.lastSeq}`,
-      `Pending push: ${d.pendingPushCount}`,
     ];
     // Two-phase pull observability (#72). The phase is distinct from Status: at
     // text-ready/binary-backfill the vault is usable but Status honestly stays "syncing"
@@ -258,19 +222,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     }
     if (d.pullProgress) {
       lines.push(`Pull progress: ${d.pullProgress.fetched} / ${d.pullProgress.total}`);
-      lines.push(`Pull applied: ${d.pullApplied}, skipped: ${d.pullSkipped}`);
-    }
-    // Always render throughput lines — "0 samples" is diagnostic when text pulls haven't fired yet
-    // (e.g. still in binary phase, or allDocsByKeys throwing). Hiding them when null masked the
-    // instrumentation from the user entirely, making it impossible to distinguish "not shipped"
-    // from "no text pulls ran" (issue #52).
-    const fetchLabel = d.avgFetchMs !== null ? `${Math.round(d.avgFetchMs)} ms` : "--";
-    lines.push(`Avg fetch (text pull): ${fetchLabel} (${d.fetchSampleCount} samples)`);
-    const applyLabel = d.avgApplyMs !== null ? `${Math.round(d.avgApplyMs)} ms` : "--";
-    lines.push(`Avg apply: ${applyLabel} (${d.applySampleCount} samples)`);
-    lines.push(`Unsyncable: ${d.unsyncableCount}`);
-    if (d.unsyncableCount > 0) {
-      lines.push(`Unsyncable sample: ${d.unsyncableSample.join(", ")}`);
+      lines.push(`Pull applied: ${d.pullApplied}`);
     }
     if (d.lastError) {
       lines.push(`Last error: ${d.lastError}`);
@@ -279,80 +231,6 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     // If this value doesn't update during sync, the render path is broken upstream.
     lines.push(`Last render: ${new Date().toLocaleTimeString()}`);
     return lines.join("\n");
-  }
-
-  private formatPlan(plan: FullSyncPlan): string {
-    function fmtBucket(bucket: { count: number; sample: string[] }): string {
-      if (bucket.count === 0) return "0";
-      const samples = bucket.sample.join(", ");
-      return `${bucket.count} -- ${samples}`;
-    }
-
-    return [
-      "Dry-run Full sync preview",
-      "=========================",
-      `Would push (new):              ${fmtBucket(plan.wouldPushNew)}`,
-      `Would push (changed):          ${fmtBucket(plan.wouldPushChanged)}`,
-      `Would pull (rev diff):         ${fmtBucket(plan.wouldPullRevMismatch)}`,
-      `Would skip (orphan guard):     ${fmtBucket(plan.wouldSkipOrphanGuard)}`,
-      `Would tombstone local:         ${fmtBucket(plan.wouldTombstoneLocal)}`,
-      `Would pull-delete:             ${fmtBucket(plan.wouldPullDelete)}`,
-      `Would delete (server tombst.): ${fmtBucket(plan.wouldDeleteLocalTombstoned)}`,
-      `Already tombstoned:            ${plan.alreadyTombstoned}`,
-      `Already orphan:                ${plan.alreadyOrphan}`,
-      `Oversize skipped:              ${plan.oversizeSkipped}`,
-      `Excluded:                      ${plan.excludedCount}`,
-      "",
-      "Note: plan computed with bypassOrphanGuard=true (matches Force full sync).",
-    ].join("\n");
-  }
-
-  private renderPreview(plan: FullSyncPlan): void {
-    if (!this.previewEl) return;
-    this.previewEl.empty();
-
-    const text = this.formatPlan(plan);
-    const pre = this.previewEl.createEl("pre", {
-      cls: "vault-sync-diag-pre",
-      text,
-    });
-    pre.style.userSelect = "text";
-    pre.style.webkitUserSelect = "text";
-
-    new Setting(this.previewEl)
-      .addButton((btn) =>
-        btn.setButtonText("Copy").onClick(() => {
-          const range = document.createRange();
-          range.selectNodeContents(pre);
-          const sel = window.getSelection();
-          if (sel) {
-            sel.removeAllRanges();
-            sel.addRange(range);
-          }
-          try {
-            navigator.clipboard.writeText(text).then(
-              () => { btn.setButtonText("Copied!"); },
-              () => {
-                document.execCommand("copy");
-                btn.setButtonText("Copied!");
-              }
-            );
-          } catch {
-            document.execCommand("copy");
-            btn.setButtonText("Copied!");
-          }
-          setTimeout(() => btn.setButtonText("Copy"), 1500);
-        })
-      );
-  }
-
-  private renderPreviewError(message: string): void {
-    if (!this.previewEl) return;
-    this.previewEl.empty();
-    this.previewEl.createEl("pre", {
-      cls: "vault-sync-diag-pre",
-      text: `Preview failed: ${message}`,
-    });
   }
 
   private renderDiagnostics(): void {
@@ -412,16 +290,20 @@ export class VaultSyncSettingTab extends PluginSettingTab {
 /**
  * Confirmation modal shown before the destructive "Replace local from server" action.
  * Requires explicit user confirmation before wiping local tracked files.
+ * localCount is the real db.info() doc_count, or null if unavailable.
  */
 class ReplaceConfirmModal extends Modal {
-  constructor(app: App, private trackedCount: number, private onConfirm: () => void) {
+  constructor(app: App, private localCount: number | null, private onConfirm: () => void) {
     super(app);
   }
 
   onOpen(): void {
     this.contentEl.createEl("h3", { text: "Replace local from server" });
+    const countDesc = this.localCount !== null
+      ? `This will delete ${this.localCount} local documents and re-download them from the server.`
+      : "This will delete all locally synced documents and re-download them from the server.";
     this.contentEl.createEl("p", {
-      text: `This will delete ${this.trackedCount} local files and re-download them from the server. Local files not yet synced will be lost. Continue?`,
+      text: `${countDesc} Local files not yet synced will be lost. Continue?`,
     });
     const btnRow = this.contentEl.createDiv({ cls: "modal-button-container" });
     const cancelBtn = btnRow.createEl("button", { text: "Cancel" });

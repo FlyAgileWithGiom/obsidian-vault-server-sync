@@ -115,22 +115,11 @@ function makeDiagnosticsSnapshot(overrides: Partial<SyncDiagnostics> = {}): Sync
   return {
     running: false,
     state: "idle",
-    revMapSize: 0,
-    knownRevMapSize: 0,
-    lastSeq: 0,
-    pullProgress: null,
-    pullSkipped: 0,
-    pullApplied: 0,
-    pendingPushCount: 0,
-    lastError: null,
-    unsyncableCount: 0,
-    unsyncableSample: [],
-    avgFetchMs: null,
-    fetchSampleCount: 0,
-    avgApplyMs: null,
-    applySampleCount: 0,
     syncPhase: "idle",
+    pullProgress: null,
+    pullApplied: 0,
     binaryProgress: null,
+    lastError: null,
     ...overrides,
   };
 }
@@ -146,17 +135,16 @@ function makePluginMock(diagnosticsOverrides: Partial<SyncDiagnostics> = {}): Va
       couchDbName: "vault-test",
       couchDbUser: "user",
       couchDbPassword: "pass",
-      syncDebounceMs: 500,
       excludePatterns: [],
     },
     getDiagnostics: vi.fn(() => diagnostics),
+    getLocalDocCount: vi.fn().mockResolvedValue(0),
     subscribeDiagnostics: vi.fn((listener: () => void) => listeners.add(listener)),
     unsubscribeDiagnostics: vi.fn((listener: () => void) => listeners.delete(listener)),
     saveSettings: vi.fn().mockResolvedValue(undefined),
     testConnection: vi.fn().mockResolvedValue(true),
     forceFullSync: vi.fn().mockResolvedValue(undefined),
     resumeFullSync: vi.fn().mockResolvedValue(undefined),
-    previewFullSync: vi.fn().mockResolvedValue(undefined),
     _setDiagnostics: (d: Partial<SyncDiagnostics>) => {
       diagnostics = { ...diagnostics, ...d };
     },
@@ -180,7 +168,6 @@ function makeTab(plugin: VaultSyncPlugin): VaultSyncSettingTab {
   // Initialize private fields that display() expects
   (tab as unknown as { diagnosticsEl: null }).diagnosticsEl = null;
   (tab as unknown as { diagnosticsPre: null }).diagnosticsPre = null;
-  (tab as unknown as { previewEl: null }).previewEl = null;
   (tab as unknown as { unsubDiagnostics: null }).unsubDiagnostics = null;
   return tab;
 }
@@ -260,7 +247,7 @@ describe("VaultSyncSettingTab — diagnostics live render (sync)", () => {
 
   it("pre.textContent reflects latest data immediately after a single handler call (no rAF needed)", () => {
     (plugin as unknown as { _setDiagnostics: (d: Partial<SyncDiagnostics>) => void })
-      ._setDiagnostics({ state: "syncing", revMapSize: 12345 });
+      ._setDiagnostics({ state: "syncing", pullApplied: 12345 });
 
     // A single handler fire should synchronously update the pre
     (plugin as unknown as { _fireListeners: () => void })._fireListeners();
@@ -268,7 +255,8 @@ describe("VaultSyncSettingTab — diagnostics live render (sync)", () => {
     const pre = (tab as unknown as { diagnosticsPre: MockHTMLElement }).diagnosticsPre;
     expect(pre).not.toBeNull();
     expect(pre!.textContent).toContain("syncing");
-    expect(pre!.textContent).toContain("12345");
+    // pullApplied is only shown when pullProgress is non-null — check state instead
+    expect(pre!.textContent).toContain("Status: syncing");
   });
 
   it("50 handler calls → Setting constructor count is still 0 (pre reused, no DOM rebuild)", () => {
@@ -297,7 +285,7 @@ describe("VaultSyncSettingTab — diagnostics text updates correctly", () => {
 
   it("pre.textContent matches formatDiagnostics output after a direct render call", () => {
     (plugin as unknown as { _setDiagnostics: (d: Partial<SyncDiagnostics>) => void })
-      ._setDiagnostics({ state: "ok", revMapSize: 42, pendingPushCount: 3 });
+      ._setDiagnostics({ state: "ok", syncPhase: "complete" });
 
     const renderDiagnostics = (tab as unknown as { renderDiagnostics: () => void }).renderDiagnostics.bind(tab);
     renderDiagnostics();
@@ -305,8 +293,7 @@ describe("VaultSyncSettingTab — diagnostics text updates correctly", () => {
     const pre = (tab as unknown as { diagnosticsPre: MockHTMLElement }).diagnosticsPre;
     expect(pre).not.toBeNull();
     expect(pre!.textContent).toContain("ok");
-    expect(pre!.textContent).toContain("42");
-    expect(pre!.textContent).toContain("3");
+    expect(pre!.textContent).toContain("complete");
   });
 });
 
@@ -395,119 +382,6 @@ describe("VaultSyncSettingTab — Last render timestamp in formatDiagnostics (#3
   });
 });
 
-describe("VaultSyncSettingTab — formatDiagnostics throughput lines always visible (#52)", () => {
-  // Eliminated hypotheses:
-  //   H2 (getDiagnostics omits fields): sync-engine.ts:263-266 explicitly returns all four fields.
-  //   H6 (stale build): grep -c "avgFetchMs" main.js returns 2 — code is shipped.
-  // Culprit: the `if (d.avgFetchMs !== null)` conditional in formatDiagnostics hides the
-  // instrumentation lines whenever no text-pull batches have completed (pullTextDocs ran
-  // with an empty list, e.g. during the binary-only phase, or allDocsByKeys threw every time).
-  // prod getDiagnostics() always returns avgFetchMs: null (never undefined), so the condition
-  // is always false until the first successful batch — making the lines invisible precisely
-  // when they would be most informative. The existing 1.13.4 test used undefined (not null)
-  // via makeDiagnosticsSnapshot omission, so it never exercised the null path.
-
-  it("Avg fetch line is present even when avgFetchMs is null (0 samples)", () => {
-    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
-    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
-    const formatDiagnostics = (
-      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
-    ).formatDiagnostics.bind(tab);
-
-    const d: SyncDiagnostics = {
-      running: true,
-      state: "syncing",
-      revMapSize: 8072,
-      knownRevMapSize: 8072,
-      lastSeq: "72347-abc",
-      pullProgress: null,
-      pullSkipped: 0,
-      pullApplied: 0,
-      pendingPushCount: 0,
-      lastError: null,
-      unsyncableCount: 0,
-      unsyncableSample: [],
-      avgFetchMs: null,
-      fetchSampleCount: 0,
-      avgApplyMs: null,
-      applySampleCount: 0,
-      syncPhase: "text-ready",
-      binaryProgress: null,
-    };
-
-    const output = formatDiagnostics(d);
-    expect(output).toMatch(/Avg fetch \(text pull\)/);
-    expect(output).toContain("0 samples");
-  });
-
-  it("Avg apply line is present even when avgApplyMs is null (0 samples)", () => {
-    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
-    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
-    const formatDiagnostics = (
-      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
-    ).formatDiagnostics.bind(tab);
-
-    const d: SyncDiagnostics = {
-      running: true,
-      state: "syncing",
-      revMapSize: 8072,
-      knownRevMapSize: 8072,
-      lastSeq: "72347-abc",
-      pullProgress: null,
-      pullSkipped: 0,
-      pullApplied: 0,
-      pendingPushCount: 0,
-      lastError: null,
-      unsyncableCount: 0,
-      unsyncableSample: [],
-      avgFetchMs: null,
-      fetchSampleCount: 0,
-      avgApplyMs: null,
-      applySampleCount: 0,
-      syncPhase: "text-ready",
-      binaryProgress: null,
-    };
-
-    const output = formatDiagnostics(d);
-    expect(output).toMatch(/Avg apply:/);
-    expect(output).toContain("0 samples");
-  });
-});
-
-describe("VaultSyncSettingTab — unsyncable visibility (#P3)", () => {
-  it("formatDiagnostics contains 'Unsyncable:' when unsyncableCount > 0", () => {
-    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
-    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
-    const formatDiagnostics = (
-      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
-    ).formatDiagnostics.bind(tab);
-
-    const d = makeDiagnosticsSnapshot({
-      unsyncableCount: 2,
-      unsyncableSample: ["path/to/file.jpeg", "other/image.png"],
-    });
-
-    const output = formatDiagnostics(d);
-    expect(output).toContain("Unsyncable:");
-    expect(output).toContain("2");
-    expect(output).toContain("path/to/file.jpeg");
-    expect(output).toContain("other/image.png");
-  });
-
-  it("formatDiagnostics contains 'Unsyncable: 0' and no sample line when unsyncableCount is 0", () => {
-    const tab = Object.create(VaultSyncSettingTab.prototype) as VaultSyncSettingTab;
-    (tab as unknown as { plugin: { manifest: { version: string } } }).plugin = { manifest: { version: "0.0.0-test" } };
-    const formatDiagnostics = (
-      tab as unknown as { formatDiagnostics: (d: SyncDiagnostics) => string }
-    ).formatDiagnostics.bind(tab);
-
-    const d = makeDiagnosticsSnapshot({ unsyncableCount: 0, unsyncableSample: [] });
-
-    const output = formatDiagnostics(d);
-    expect(output).toContain("Unsyncable: 0");
-    expect(output).not.toContain("Unsyncable sample:");
-  });
-});
 
 describe("VaultSyncSettingTab — two-phase syncPhase + binary progress (#72)", () => {
   function bindFormat(): (d: SyncDiagnostics) => string {
