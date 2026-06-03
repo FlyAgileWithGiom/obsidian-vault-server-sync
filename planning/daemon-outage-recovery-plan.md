@@ -196,12 +196,16 @@ direction — without overwriting a genuinely-newer remote and without ever sile
   - **Remote doc is a tombstone AND disk file present with local edits** → **CONFLICT-COPY** (keep
     the edited local content; push the conflict-copy; do not delete an edited file). Leans
     keep-over-delete per the data-loss bar. *(existing Cycle 4 tombstone+edit rule)*
-  - **Remote `not_found` (absent from map, no tombstone) AND disk absent** → **SKIP** (both-absent).
-    `not_found` in normal CouchDB operation means only `_purge` (admin-only) or wrong/empty remote
-    DB — NOT compaction (normal deletes return `deleted:true` and survive compaction). In the
-    wrong/empty-DB case every local doc reads `not_found`; `pull` would mass-restore stale copies,
-    `tombstone` would mass-delete. Skip is the only non-destructive action.
-    *(user decision 2026-06-03, verified against live CouchDB)*
+  - **Remote `not_found` (absent from map, no tombstone) AND disk absent** → **TOMBSTONE** (propagate
+    delete). Gone from disk = deleted; we are not a backup system. `not_found` means only `_purge`
+    (admin-only) or wrong/empty remote DB — normal deletes return `deleted:true` and survive
+    compaction. No remote recreation is known → the disk deletion stands → tombstone. The target
+    vault (Dropbox) keeps files materialised in place, so an empty/half-mounted vault at boot is not
+    a concern for this setup.
+    *(user decision 2026-06-03)*
+    **Future work:** guard against propagating deletes on a shallow/un-materialised filesystem
+    (iCloud online-only placeholders, partial mount) — out of scope; the current target (Dropbox)
+    keeps files materialised in place. Detect-and-skip if a future setup uses an online-only FS.
   Signal reliability verified against actual code: `runConverter` (converter.ts:256-264) seeds docs
   with `_id, _rev, mtime` via `bulkDocs({new_edits:false})`, preserving the exact CouchDB `_rev`
   per doc. After migration, `state.json` is renamed to `state.json.migrated`; the PouchDB local

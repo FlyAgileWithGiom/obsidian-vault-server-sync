@@ -271,15 +271,14 @@ describe("reconcile — FS<->PouchDB divergence detection", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Off-table: local doc present + FS absent + remote not_found (purge or wrong DB)
-  // → skip:both-absent (non-destructive).
-  // Verified: normal CouchDB deletes return deleted:true and survive compaction
-  // (handled by AC2.3d). not_found occurs only on _purge (admin) or wrong/empty DB.
-  // In the wrong/empty-DB case every doc would read not_found — pull resurrects
-  // stale copies, tombstone mass-deletes; skip is the only safe action.
-  // User decision 2026-06-03, verified against live CouchDB.
+  // Off-table: local doc present + FS absent + remote not_found (purge/wrong-DB)
+  // → tombstone (propagate delete; we are not a backup system).
+  // not_found = no remote recreation known → gone from disk = deleted → tombstone.
+  // Normal deletes return deleted:true (AC2.3d); not_found = _purge or wrong DB only.
+  // Target vault (Dropbox) keeps files materialised, so half-mount mass-delete
+  // scenario does not apply. User decision 2026-06-03.
   // -------------------------------------------------------------------------
-  it("local doc + FS-absent + remote not_found (purge/DB-swap) → skip:both-absent", async () => {
+  it("local doc + FS-absent + remote not_found (purge/wrong-DB) → tombstone (propagate delete, not a backup system)", async () => {
     const localDoc: LocalDoc = { _rev: "1-abc", content: "was here" };
     const localDocs: LocalDocMap = new Map([["file/note.md", localDoc]]);
 
@@ -288,11 +287,9 @@ describe("reconcile — FS<->PouchDB divergence detection", () => {
       localDocs,
       localDocIds: ["file/note.md"],
       diskContent: new Map(),
-      remoteRevs: new Map(), // remote not_found (purge or wrong/empty DB)
+      remoteRevs: new Map(), // remote not_found
     });
-    expect(actions).toEqual([
-      { kind: "skip", path: "note.md", reason: "both-absent" },
-    ]);
+    expect(actions).toEqual([{ kind: "tombstone", docId: "file/note.md" }]);
   });
 
   // -------------------------------------------------------------------------

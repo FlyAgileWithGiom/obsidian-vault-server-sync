@@ -238,23 +238,28 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileAction[
 
       // Local doc present, FS absent. Three-way branch on remote state:
       //
-      // remote === undefined (not_found): skip:both-absent.
-      //   not_found in normal CouchDB operation means only _purge (admin-only) or
-      //   wrong/empty remote DB — NOT compaction (normal deletes return deleted:true
-      //   and survive compaction, handled by AC2.3d above). In the wrong/empty-DB
-      //   case every local doc reads not_found; pull would mass-restore stale copies,
-      //   tombstone would mass-delete. skip is the only non-destructive choice.
-      //   User decision 2026-06-03, verified against live CouchDB.
+      // Guiding principle: "gone from disk = deleted — propagate it. We are not a
+      // backup system. Exception: if the remote has contradictory info (rev moved),
+      // the remote wins → pull it back."
       //
-      // AC2.3a: local._rev === remote.rev → user deleted on disk → tombstone.
-      // AC2.3b: local._rev !== remote.rev → remote moved during outage → pull.
+      // remote === undefined (not_found): tombstone.
+      //   not_found means _purge (admin-only) or wrong/empty remote DB — normal
+      //   deletes return deleted:true and survive compaction (handled by AC2.3d
+      //   above). No remote recreation is known → the disk deletion stands → tombstone.
+      //   The user's Dropbox vault keeps files materialised in place, so an
+      //   "empty/half-mounted vault → mass-delete" scenario does not apply.
+      //   User decision 2026-06-03.
+      //
+      // AC2.3a: local._rev === remote.rev → remote unchanged → tombstone.
+      // AC2.3b: local._rev !== remote.rev → remote recreated/edited during outage → pull.
       if (remote === undefined) {
-        actions.push({ kind: "skip", path, reason: "both-absent" });
+        // not_found: no remote recreation → gone from disk = deleted → propagate
+        actions.push({ kind: "tombstone", docId });
       } else if (localDoc._rev !== undefined && localDoc._rev === remote.rev) {
-        // AC2.3a: rev-equal → user deleted on disk during outage → tombstone
+        // AC2.3a: rev-equal → remote unchanged → tombstone
         actions.push({ kind: "tombstone", docId });
       } else {
-        // AC2.3b: rev differs → remote moved during outage → pull
+        // AC2.3b: rev differs → remote recreated/edited during outage → pull
         actions.push({ kind: "pull", path });
       }
     }
