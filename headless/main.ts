@@ -4,9 +4,13 @@ import * as fs from "node:fs";
 import * as http from "node:http";
 import * as https from "node:https";
 import { FilesystemVaultAdapter } from "./VaultAdapter";
-import type { VaultSyncSettings } from "../src/types";
+import type { VaultSyncSettings, VaultFile } from "../src/types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "../src/types";
 import type { RemoteDbForPhantomCheck } from "./converter";
+import { fetchRemoteRevs } from "./remote-revs";
+import { reconcile } from "./reconcile";
+import { pathToDocId } from "../src/doc-id";
+import { isBinaryPath } from "../src/binary-ext";
 
 /**
  * Build a RemoteDbForPhantomCheck that uses node:http or node:https directly.
@@ -189,6 +193,214 @@ function loadConfig(vaultRoot: string): VaultSyncSettings {
 }
 
 /**
+ * Minimal PouchDB interface needed by runReconcileOnStartup.
+ * Only the fields the reconcile wiring reads from the real db.
+ */
+interface PouchDbForReconcile {
+  info(): Promise<{ doc_count: number }>;
+  allDocs(opts: { include_docs: false }): Promise<{ rows: Array<{ id: string }> }>;
+  get(id: string): Promise<unknown>;
+}
+
+/**
+ * Bridge reconcile interface — public methods used during startup reconciliation.
+ */
+interface BridgeReconcile {
+  reconcilePush(path: string): Promise<void>;
+  reconcilePull(docId: string, path: string): Promise<void>;
+  reconcileTombstone(docId: string): Promise<void>;
+  /**
+   * Register an echo-suppression sentinel for an original file in a conflict-copy
+   * scenario without writing to PouchDB. Prevents macOS FSEvents stale events from
+   * pushing the divergent disk content into the original doc's local PouchDB entry.
+   */
+  reconcileSuppressEcho(docId: string, currentLocalRev: string): void;
+}
+
+/**
+ * Run the startup reconciliation pass (non-first-run only).
+ *
+ * Exported for direct unit-testing of the skip-on-fetch-fail and gate logic
+ * without needing the full runDaemonV2Startup harness.
+ *
+ * Returns a summary of applied action counts for the boot log.
+ */
+export async function runReconcileOnStartup(opts: {
+  db: PouchDbForReconcile;
+  bridge: BridgeReconcile;
+  vaultAdapter: {
+    getFiles(): VaultFile[];
+    readText(file: VaultFile): Promise<string>;
+    readBinary(file: VaultFile): Promise<ArrayBuffer>;
+    createText(path: string, content: string): Promise<VaultFile>;
+    createBinary(path: string, data: ArrayBuffer): Promise<VaultFile>;
+    getEntryByPath(path: string): import("../src/types").VaultEntry | null;
+  };
+  remoteDb: RemoteDbForPhantomCheck;
+  excludePatterns: string[];
+}): Promise<{
+  push: number;
+  pull: number;
+  tombstone: number;
+  conflictCopy: number;
+  skip: number;
+} | null> {
+  const { db, bridge, vaultAdapter, remoteDb, excludePatterns } = opts;
+
+  // Non-first-run gate (AC2.6): skip reconcile entirely on first run.
+  // First run = PouchDB is empty. The two-phase pull (#72) owns first-run population.
+  const info = await db.info();
+  if (info.doc_count === 0) {
+    console.log("[vault-sync] reconcile: first-run detected (doc_count=0) — skipping reconcile");
+    return null;
+  }
+
+  // Build the candidate doc-id sets.
+  // UNION(local, disk) is required (AC2.0): a stranded disk file has no local doc,
+  // so querying only local ids would treat every such file as "remote-absent" → blind push.
+  const allDocsResult = await db.allDocs({ include_docs: false });
+  const localDocIds = allDocsResult.rows.map((r) => r.id);
+
+  const vaultFiles = vaultAdapter.getFiles();
+  const vaultFileDocIds = vaultFiles.map((f) => pathToDocId(f.path));
+
+  // Union key set: start from localDocIds, add any disk-only ids not in DB.
+  const unionIds = [...new Set([...localDocIds, ...vaultFileDocIds])];
+
+  // Skip-on-fetch-fail (critical safety): if remote is unreachable, SKIP reconcile
+  // this boot and proceed to bridge.start + live sync. A later restart reconciles.
+  // Never push/tombstone blind without remote knowledge (plan §3 lines ~352-354).
+  let remoteRevs: Map<string, import("./remote-revs").RemoteRevEntry>;
+  try {
+    remoteRevs = await fetchRemoteRevs(remoteDb, unionIds);
+  } catch (e) {
+    console.warn(
+      `[vault-sync] reconcile: remote fetch failed — skipping reconcile this boot. ` +
+      `A later restart will reconcile. Error: ${e}`,
+    );
+    return null;
+  }
+
+  // FsWatcher isExcluded logic: exact match or path-prefix match against excludePatterns.
+  // Reusing the same predicate (not just ALWAYS_EXCLUDED) ensures reconcile and live sync
+  // exclude identically — diverging exclusion is the failure class this cycle exists to fix (AC2.5).
+  const isExcluded = (p: string): boolean =>
+    excludePatterns.some((pat) => p === pat || p.startsWith(pat + "/") || p.startsWith(pat + path.sep));
+
+  // localGet: wrap db.get, returning undefined for 404.
+  const localGet = async (docId: string): Promise<import("./reconcile").LocalDoc | undefined> => {
+    try {
+      return await db.get(docId) as import("./reconcile").LocalDoc;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const readDiskText = (file: VaultFile): Promise<string> => vaultAdapter.readText(file);
+
+  const actions = await reconcile({
+    vaultFiles,
+    localDocIds,
+    localGet,
+    readDiskText,
+    remoteRevs,
+    isExcluded,
+  });
+
+  // Apply actions
+  const counts = { push: 0, pull: 0, tombstone: 0, conflictCopy: 0, skip: 0 };
+  for (const action of actions) {
+    switch (action.kind) {
+      case "push":
+        await bridge.reconcilePush(action.path);
+        counts.push++;
+        break;
+      case "pull":
+        await bridge.reconcilePull(pathToDocId(action.path), action.path);
+        counts.pull++;
+        break;
+      case "tombstone":
+        await bridge.reconcileTombstone(action.docId);
+        counts.tombstone++;
+        break;
+      case "conflict-copy": {
+        // AC2.4 — non-destructive conflict handling.
+        // Both sides diverged (local content ≠ DB content AND local rev ≠ remote rev).
+        // Strategy:
+        //   1. Derive a safe conflict-copy path (insert " (reconcile-conflict <ts>)" before ext).
+        //   2. Read the LOCAL disk content (the divergent copy the user cares about).
+        //   3. Write it to the conflict-copy path (createText / createBinary).
+        //   4. Push the new conflict-copy doc to PouchDB via bridge.reconcilePush.
+        //      The ORIGINAL doc at action.path is NOT touched — live sync will pull
+        //      the remote winning rev into it, preserving the remote lineage.
+        //
+        // No echo risk: reconcile runs before bridge.start, so no FS watcher is armed
+        // and the `since:"now"` changes feed does not exist yet (ordering guarantee).
+        const ts = new Date().toISOString().replace(/:/g, "-");
+        const ext = path.extname(action.path);
+        const base = action.path.slice(0, action.path.length - ext.length);
+        const conflictPath = `${base} (reconcile-conflict ${ts})${ext}`;
+
+        try {
+          if (isBinaryPath(action.path)) {
+            const entry = vaultAdapter.getEntryByPath(action.path);
+            if (entry && entry.kind === "file") {
+              const data = await vaultAdapter.readBinary(entry);
+              await vaultAdapter.createBinary(conflictPath, data);
+            }
+          } else {
+            const entry = vaultAdapter.getEntryByPath(action.path);
+            if (entry && entry.kind === "file") {
+              const content = await vaultAdapter.readText(entry);
+              await vaultAdapter.createText(conflictPath, content);
+            }
+          }
+          await bridge.reconcilePush(conflictPath);
+
+          // Suppress stale FSEvents for the ORIGINAL file.
+          //
+          // The original file stays on disk with divergent content (not pushed, not
+          // deleted — live sync will overwrite it with the remote winning rev). macOS
+          // FSEvents can deliver a stale event for the original path after bridge.start()
+          // arms the FS watcher; without a sentinel, onVaultEvent pushes the divergent
+          // disk content into the original doc, clobbering the outage-surviving rev.
+          //
+          // Fix: register the original doc's current local rev as the echo-suppression
+          // sentinel. suppressIfEcho sees _rev === sentinel → treats the stale FSEvent
+          // as an echo and silently discards it.
+          const origDocId = pathToDocId(action.path);
+          try {
+            const origDoc = await db.get(origDocId);
+            const origRev = (origDoc as { _rev?: string })._rev;
+            if (origRev) bridge.reconcileSuppressEcho(origDocId, origRev);
+          } catch {
+            // Original doc not in DB (edge case) — sentinel not critical, skip
+          }
+
+          console.warn(
+            `[vault-sync] reconcile: conflict-copy created — original=${action.path} copy=${conflictPath}`,
+          );
+        } catch (e) {
+          console.error(`[vault-sync] reconcile: conflict-copy FAILED for ${action.path}: ${e}`);
+        }
+        counts.conflictCopy++;
+        break;
+      }
+      case "skip":
+        counts.skip++;
+        break;
+    }
+  }
+
+  console.log(
+    `[vault-sync] reconcile: ↑push=${counts.push} ↓pull=${counts.pull} ` +
+    `✗tombstone=${counts.tombstone} ⚡conflict-copy=${counts.conflictCopy} ` +
+    `–skip=${counts.skip}`,
+  );
+  return counts;
+}
+
+/**
  * Exported startup sequence for the PouchDB daemon.
  *
  * Extracted for testability: allows unit tests to assert that runConverter
@@ -200,6 +412,7 @@ function loadConfig(vaultRoot: string): VaultSyncSettings {
  *
  * @param deps.bridge       Pre-constructed PouchDbFsBridge (not yet started)
  * @param deps.runConverter Async fn that seeds PouchDB from state.json revMap
+ * @param deps.runReconcile Async fn that reconciles FS vs PouchDB (non-first-run)
  * @param deps.fsWatcher    Pre-constructed FsWatcher (not yet started)
  * @param deps.engine       Pre-constructed PouchDbSyncEngine (not yet started)
  * @param deps.statePath    Path to state.json passed to runConverter
@@ -222,6 +435,7 @@ export async function runDaemonV2Startup(deps: {
     orphanSkipped?: number;
     phantomSkipped?: number;
   }>;
+  runReconcile: () => Promise<unknown>;
   fsWatcher: unknown;
   engine: { start: () => Promise<void> };
   statePath: string;
@@ -229,7 +443,7 @@ export async function runDaemonV2Startup(deps: {
   db: unknown;
   remoteDb: RemoteDbForPhantomCheck;
 }): Promise<void> {
-  const { bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db, remoteDb } = deps;
+  const { bridge, runConverter, runReconcile, fsWatcher, engine, statePath, pouchDir, db, remoteDb } = deps;
 
   // CRITICAL: converter MUST run on a cold PouchDB (no other writer active).
   // Arming the changes-feed or FS watcher before this completes risks a
@@ -251,7 +465,11 @@ export async function runDaemonV2Startup(deps: {
     );
   }
 
-  // Now arm the changes-feed and FS watcher — PouchDB is fully seeded.
+  // Reconciliation: runs AFTER converter and BEFORE bridge.start (AC2.6/#69).
+  // Writes only to local PouchDB — live db.sync replicates afterward.
+  await runReconcile();
+
+  // Now arm the changes-feed and FS watcher — PouchDB is fully seeded + reconciled.
   bridge.start(fsWatcher);
 
   // Engine.start() handles isFirstRun() check: if converter migrated docs,
@@ -314,8 +532,32 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   const remoteDb = makeHttpRemoteDb(remoteDbUrl);
   console.log(`[vault-sync] Phantom check remote: ${proto}${host}/${couchDbName}`);
 
-  // Delegate ordering logic to runDaemonV2Startup (converter first, then bridge.start)
-  await runDaemonV2Startup({ bridge, runConverter, fsWatcher, engine, statePath, pouchDir, db, remoteDb });
+  // Build the exclusion list passed to reconcile (same as live watcher — AC2.5).
+  const reconcileExcludePatterns = [STATE_FILENAME, CONFIG_FILENAME, ".git", ...settings.excludePatterns];
+
+  // runReconcile closure: captures db, bridge, vaultAdapter, remoteDb, excludePatterns.
+  // Injected into runDaemonV2Startup so ordering tests can substitute a spy.
+  // After reconcile completes, records the conflict-copy count on the engine (AC2.4).
+  const runReconcile = async () => {
+    const counts = await runReconcileOnStartup({
+      db: db as PouchDbForReconcile,
+      bridge,
+      vaultAdapter,
+      remoteDb,
+      excludePatterns: reconcileExcludePatterns,
+    });
+    if (counts !== null) {
+      engine.recordReconcileConflicts(counts.conflictCopy);
+    }
+    return counts;
+  };
+
+  // Delegate ordering logic to runDaemonV2Startup (converter first, then reconcile, then bridge.start).
+  // Cast bridge/db/runConverter to the narrow interfaces used by runDaemonV2Startup —
+  // the real types are compatible at runtime; the cast avoids needlessly widening the
+  // public dep interfaces (which are kept simple for testability).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  await runDaemonV2Startup({ bridge: bridge as any, runConverter: runConverter as any, runReconcile, fsWatcher, engine, statePath, pouchDir, db, remoteDb });
 
   // Graceful shutdown
   function shutdown(signal: string): void {

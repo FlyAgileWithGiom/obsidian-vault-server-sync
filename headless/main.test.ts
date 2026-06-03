@@ -1,7 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, it, expect, vi } from "vitest";
-import { resolveStatePath, resolvePouchDir, runDaemonV2Startup } from "./main";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { resolveStatePath, resolvePouchDir, runDaemonV2Startup, runReconcileOnStartup } from "./main";
 
 // ---------------------------------------------------------------------------
 // State file location (issue #54)
@@ -170,6 +170,7 @@ declare module "vitest" {
 // skipping the full seed (partial sync with missing files).
 
 const FAKE_REMOTE_DB = { async allDocs() { return { rows: [] }; } };
+const FAKE_RECONCILE = vi.fn(async () => null);
 
 describe("runDaemonV2Startup — converter runs before bridge.start (init-order guard)", () => {
   it("calls runConverter to completion before bridge.start is called", async () => {
@@ -184,6 +185,11 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
       return { alreadyMigrated: false, migrated: 3, tombstonedSkipped: 0, orphanSkipped: 0, phantomSkipped: 0 };
     });
 
+    const mockReconcile = vi.fn(async () => {
+      callOrder.push("runReconcile");
+      return null;
+    });
+
     const mockFsWatcher = {};
 
     const mockEngine = {
@@ -193,6 +199,7 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
     await runDaemonV2Startup({
       bridge: mockBridge,
       runConverter: mockConverter,
+      runReconcile: mockReconcile,
       fsWatcher: mockFsWatcher,
       engine: mockEngine,
       statePath: "/fake/state.json",
@@ -201,13 +208,15 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
       remoteDb: FAKE_REMOTE_DB,
     });
 
-    // All three must have been called
+    // All four must have been called
     expect(mockConverter).toHaveBeenCalledOnce();
+    expect(mockReconcile).toHaveBeenCalledOnce();
     expect(mockBridge.start).toHaveBeenCalledOnce();
     expect(mockEngine.start).toHaveBeenCalledOnce();
 
-    // Critical ordering assertion: converter finishes before bridge is armed
-    expect(callOrder.indexOf("runConverter")).toBeLessThan(callOrder.indexOf("bridge.start"));
+    // Critical ordering: converter → reconcile → bridge.start → engine.start
+    expect(callOrder.indexOf("runConverter")).toBeLessThan(callOrder.indexOf("runReconcile"));
+    expect(callOrder.indexOf("runReconcile")).toBeLessThan(callOrder.indexOf("bridge.start"));
     expect(callOrder.indexOf("bridge.start")).toBeLessThan(callOrder.indexOf("engine.start"));
   });
 
@@ -219,6 +228,7 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
     await runDaemonV2Startup({
       bridge: mockBridge,
       runConverter: vi.fn(async () => ({ noStateFile: true })),
+      runReconcile: FAKE_RECONCILE,
       fsWatcher: mockFsWatcher,
       engine: mockEngine,
       statePath: "/fake/state.json",
@@ -248,6 +258,7 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
     await runDaemonV2Startup({
       bridge: { start: vi.fn() },
       runConverter: mockConverter as never,
+      runReconcile: FAKE_RECONCILE,
       fsWatcher: {},
       engine: { start: vi.fn(async () => {}) },
       statePath: "/fake/state.json",
@@ -259,5 +270,144 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
     // arg[0]=statePath, [1]=pouchDir, [2]=db, [3]=dryRun=false, [4]=remoteDb
     expect(capturedArgs[4]).toBe(fakeRemoteDb);
     expect(capturedArgs[3]).toBe(false); // dryRun must be false in daemon mode
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reconcile gate + skip-on-fail (RC2 Cycle 3)
+// ---------------------------------------------------------------------------
+
+describe("runReconcileOnStartup — first-run gate (AC2.6)", () => {
+  it("skips reconcile on first run: returns null when doc_count === 0", async () => {
+    const db = {
+      info: vi.fn(async () => ({ doc_count: 0 })),
+      allDocs: vi.fn(async () => ({ rows: [] })),
+      get: vi.fn(async () => { throw { status: 404 }; }),
+    };
+
+    const result = await runReconcileOnStartup({
+      db,
+      bridge: {
+        reconcilePush: vi.fn(),
+        reconcilePull: vi.fn(),
+        reconcileTombstone: vi.fn(),
+        reconcileSuppressEcho: vi.fn(),
+      },
+      vaultAdapter: { getFiles: () => [], async readText() { throw new Error("not called"); }, async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); }, async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, getEntryByPath(): import("../src/types").VaultEntry | null { return null; } },
+      remoteDb: { async allDocs() { return { rows: [] }; } },
+      excludePatterns: [],
+    });
+
+    expect(result).toBeNull();
+    // allDocs / reconcile actions must NOT have been called
+    expect(db.allDocs).not.toHaveBeenCalled();
+  });
+
+  it("runs reconcile when doc_count > 0 (non-first-run)", async () => {
+    const db = {
+      info: vi.fn(async () => ({ doc_count: 5 })),
+      allDocs: vi.fn(async () => ({ rows: [] })),
+      get: vi.fn(async () => { throw { status: 404 }; }),
+    };
+
+    const result = await runReconcileOnStartup({
+      db,
+      bridge: {
+        reconcilePush: vi.fn(),
+        reconcilePull: vi.fn(),
+        reconcileTombstone: vi.fn(),
+        reconcileSuppressEcho: vi.fn(),
+      },
+      vaultAdapter: { getFiles: () => [], async readText() { throw new Error("not called"); }, async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); }, async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, getEntryByPath(): import("../src/types").VaultEntry | null { return null; } },
+      remoteDb: { async allDocs() { return { rows: [] }; } },
+      excludePatterns: [],
+    });
+
+    // With no vault files and no local docs, counts are all zero but non-null
+    expect(result).not.toBeNull();
+    expect(db.allDocs).toHaveBeenCalled();
+  });
+});
+
+describe("runReconcileOnStartup — skip-on-fetch-fail (critical safety)", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("skips reconcile and returns null when fetchRemoteRevs throws (CouchDB unreachable)", async () => {
+    // Pre-seed some local doc IDs so the union set is non-empty and allDocs IS called.
+    // fetchRemoteRevs has retry logic (PHANTOM_BATCH_MAX_RETRIES=3 + backoff);
+    // we use fake timers so the test doesn't actually wait 7s.
+    const db = {
+      info: vi.fn(async () => ({ doc_count: 5 })),
+      allDocs: vi.fn(async () => ({ rows: [
+        { id: "file/doc-a.md" },
+        { id: "file/doc-b.md" },
+      ] })),
+      get: vi.fn(async () => { throw { status: 404 }; }),
+    };
+    const bridge = {
+      reconcilePush: vi.fn(),
+      reconcilePull: vi.fn(),
+      reconcileTombstone: vi.fn(),
+      reconcileSuppressEcho: vi.fn(),
+    };
+
+    // Simulate CouchDB unreachable: remoteDb throws on every allDocs call
+    const unreachableRemoteDb = {
+      async allDocs() { throw new Error("ECONNREFUSED"); },
+    };
+
+    // Kick off reconcile (it will stall in the retry backoff setTimeout calls)
+    const resultPromise = runReconcileOnStartup({
+      db,
+      bridge,
+      vaultAdapter: { getFiles: () => [], async readText() { throw new Error("not called"); }, async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); }, async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, getEntryByPath(): import("../src/types").VaultEntry | null { return null; } },
+      remoteDb: unreachableRemoteDb,
+      excludePatterns: [],
+    });
+
+    // Advance through all retry backoffs (1s + 2s + 4s = 7s, run all pending timers)
+    await vi.runAllTimersAsync();
+
+    const result = await resultPromise;
+    expect(result).toBeNull();
+    // No push/tombstone must have been applied without remote knowledge
+    expect(bridge.reconcilePush).not.toHaveBeenCalled();
+    expect(bridge.reconcileTombstone).not.toHaveBeenCalled();
+  });
+
+  it("bridge.start and engine.start still called after skip-on-fetch-fail", async () => {
+    const callOrder: string[] = [];
+
+    // A db with docs so the gate passes
+    const db = {
+      info: vi.fn(async () => ({ doc_count: 5 })),
+      allDocs: vi.fn(async () => ({ rows: [] })),
+      get: vi.fn(async () => { throw { status: 404 }; }),
+    };
+
+    const failingReconcile = async () => {
+      // Simulate fetchRemoteRevs throwing inside runReconcileOnStartup;
+      // the result is null (skip-on-fail) — bridge.start must still be called.
+      callOrder.push("runReconcile");
+      return null;
+    };
+
+    const mockBridge = { start: vi.fn(() => { callOrder.push("bridge.start"); }) };
+    const mockEngine = { start: vi.fn(async () => { callOrder.push("engine.start"); }) };
+
+    await runDaemonV2Startup({
+      bridge: mockBridge,
+      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
+      runReconcile: failingReconcile,
+      fsWatcher: {},
+      engine: mockEngine,
+      statePath: "/fake/state.json",
+      pouchDir: "/fake/pouch",
+      db,
+      remoteDb: FAKE_REMOTE_DB,
+    });
+
+    expect(callOrder).toEqual(["runReconcile", "bridge.start", "engine.start"]);
   });
 });

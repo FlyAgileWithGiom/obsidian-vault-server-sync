@@ -419,4 +419,101 @@ export class PouchDbFsBridge {
       await this.vault.createDirectory(parentPath);
     }
   }
+
+  // --- Reconcile public entries (startup only, called before bridge.start) ---
+
+  /**
+   * Push a vault file to local PouchDB during startup reconciliation.
+   *
+   * Mirrors the change branch of onVaultEvent: reads the file from the vault
+   * adapter and writes it to local PouchDB (text or binary).
+   *
+   * No echo sentinel needed here: this writes TO PouchDB, not FROM PouchDB.
+   * The live changes feed (since:"now") is not yet armed when reconcile runs
+   * (bridge.start has not been called), so there is no loop risk.
+   */
+  async reconcilePush(path: string): Promise<void> {
+    const entry = this.vault.getEntryByPath(path);
+    if (!entry || entry.kind !== "file") return;
+    if (isBinaryPath(path)) {
+      await this.writeBinaryToPouch(entry);
+    } else {
+      await this.writeTextToPouch(entry);
+    }
+    // Set the echo-suppression sentinel AFTER writing to PouchDB.
+    //
+    // Why: conflict-copy files are written to disk by runReconcileOnStartup BEFORE
+    // bridge.start() arms the FS watcher. Once bridge.start() runs, macOS FSEvents
+    // may deliver stale events for those pre-existing files. Without the sentinel,
+    // onVaultEvent fires and calls writeTextToPouch a second time, bumping the rev.
+    // Setting the sentinel here makes onVaultEvent treat the first FSEvent as an echo
+    // of this push and suppress it.
+    //
+    // All reconcilePush callers write the file to disk before calling this method
+    // (stranded-file push: file was already on disk; conflict-copy: createText first).
+    // The sentinel is correct in both cases: the first watcher event after start()
+    // is always an echo of content already in PouchDB.
+    const docId = pathToDocId(path);
+    try {
+      const written = await this.db.get(docId);
+      const rev = (written as { _rev?: string })._rev;
+      if (rev) this.setAppliedRev(docId, rev);
+    } catch {
+      // Doc vanished between put and get — sentinel not critical, skip
+    }
+  }
+
+  /**
+   * Register an echo-suppression sentinel for a docId WITHOUT writing to PouchDB.
+   *
+   * Used by the conflict-copy reconcile path: the original file (e.g. "p.md") is left
+   * on disk with divergent content, and its local PouchDB doc is NOT touched by reconcile.
+   * However, macOS FSEvents may deliver a stale event for the original file after
+   * bridge.start() arms the FS watcher. Without a sentinel, onVaultEvent would push
+   * the divergent disk content into the local doc, clobbering the outage-surviving rev.
+   *
+   * Fix: set the sentinel to the doc's current rev in local PouchDB. When FSEvents fires,
+   * suppressIfEcho fetches the doc and sees _rev === sentinelRev → echo suppressed.
+   */
+  reconcileSuppressEcho(docId: string, currentLocalRev: string): void {
+    this.setAppliedRev(docId, currentLocalRev);
+  }
+
+  /**
+   * Apply a "pull" action from startup reconciliation.
+   *
+   * Design decision: (b) logged near-no-op, relying on live sync to deliver.
+   *
+   * WHY option (b) is correct:
+   *   - AC2.3c (no local doc): local PouchDB has nothing to write to disk — a write
+   *     is literally impossible without first fetching the remote content.
+   *   - AC2.3b (local doc present, rev differs): local PouchDB holds the OLD rev
+   *     (last-synced content before the outage). Writing it to disk would put stale
+   *     content there; the remote's new content arrives only after live sync runs.
+   *   After bridge.start, the changes feed (since:"now") is armed. After engine.start,
+   *   live db.sync pulls the remote rev into local PouchDB, which fires applyRemoteChange
+   *   → disk write automatically. That path is tested in the integration tests via
+   *   db._emitChange (simulating live-sync delivery) after runDaemonV2Startup returns.
+   *
+   * This is NOT a masking no-op: the contract is that live sync delivers the file.
+   * If live sync never delivers it, that is a live-sync bug, not a reconcile bug.
+   * A caller that needs proof: see the "downtime-remote-edit pull" integration test.
+   */
+  async reconcilePull(_docId: string, path: string): Promise<void> {
+    // No-op at reconcile time — live sync (engine.start → db.sync → applyRemoteChange)
+    // delivers the remote content to disk after bridge.start arms the changes feed.
+    // See design decision comment above.
+    console.log(`[vault-sync] reconcile: pull queued for live-sync delivery — ${path}`);
+  }
+
+  /**
+   * Tombstone a local PouchDB doc during startup reconciliation.
+   *
+   * Reuses markDeletedInPouch directly. No echo sentinel needed: this writes
+   * to PouchDB only, not to the FS. The FS file is already absent (caller
+   * guarantees this via the FS-absent reconcile branch).
+   */
+  async reconcileTombstone(docId: string): Promise<void> {
+    await this.markDeletedInPouch(docId);
+  }
 }

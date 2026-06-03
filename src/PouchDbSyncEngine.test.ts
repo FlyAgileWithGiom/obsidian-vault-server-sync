@@ -425,6 +425,18 @@ describe("PouchDbSyncEngine — getLocalDocCount()", () => {
   });
 });
 
+describe("PouchDbSyncEngine — recordReconcileConflicts()", () => {
+  it("sets reconcileConflicts on getDiagnostics()", () => {
+    const { engine } = makeEngine();
+    engine.recordReconcileConflicts(3);
+    expect(engine.getDiagnostics().reconcileConflicts).toBe(3);
+  });
+
+  it("is initialised to 0 on construction", () => {
+    expect(makeEngine().engine.getDiagnostics().reconcileConflicts).toBe(0);
+  });
+});
+
 describe("PouchDbSyncEngine — remote URL construction", () => {
   beforeEach(() => { lastSyncHandle = null; });
 
