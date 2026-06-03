@@ -271,14 +271,15 @@ describe("reconcile — FS<->PouchDB divergence detection", () => {
   });
 
   // -------------------------------------------------------------------------
-  // Off-table: local doc present + FS absent + remote ABSENT (not_found) → pull
-  // Documented decision: lean keep-over-delete (tombstone compaction case).
-  // If remote was deleted+compacted, we cannot distinguish from "never synced".
-  // Safe direction is pull (recoverable); tombstone on unknown remote state
-  // risks silently discarding a doc that never reached the server.
-  // See off-table note in reconcile.ts for full rationale.
+  // Off-table: local doc present + FS absent + remote not_found (purge or wrong DB)
+  // → skip:both-absent (non-destructive).
+  // Verified: normal CouchDB deletes return deleted:true and survive compaction
+  // (handled by AC2.3d). not_found occurs only on _purge (admin) or wrong/empty DB.
+  // In the wrong/empty-DB case every doc would read not_found — pull resurrects
+  // stale copies, tombstone mass-deletes; skip is the only safe action.
+  // User decision 2026-06-03, verified against live CouchDB.
   // -------------------------------------------------------------------------
-  it("off-table: local-doc + FS-absent + remote-absent → pull (documented decision)", async () => {
+  it("local doc + FS-absent + remote not_found (purge/DB-swap) → skip:both-absent", async () => {
     const localDoc: LocalDoc = { _rev: "1-abc", content: "was here" };
     const localDocs: LocalDocMap = new Map([["file/note.md", localDoc]]);
 
@@ -287,10 +288,11 @@ describe("reconcile — FS<->PouchDB divergence detection", () => {
       localDocs,
       localDocIds: ["file/note.md"],
       diskContent: new Map(),
-      remoteRevs: new Map(), // remote absent (not_found / compacted tombstone)
+      remoteRevs: new Map(), // remote not_found (purge or wrong/empty DB)
     });
-    // Decision: pull (data-preserving; see reconcile.ts off-table comment)
-    expect(actions).toEqual([{ kind: "pull", path: "note.md" }]);
+    expect(actions).toEqual([
+      { kind: "skip", path: "note.md", reason: "both-absent" },
+    ]);
   });
 
   // -------------------------------------------------------------------------
