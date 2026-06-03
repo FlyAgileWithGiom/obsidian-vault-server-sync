@@ -291,8 +291,9 @@ describe("runReconcileOnStartup — first-run gate (AC2.6)", () => {
         reconcilePush: vi.fn(),
         reconcilePull: vi.fn(),
         reconcileTombstone: vi.fn(),
+        reconcileSuppressEcho: vi.fn(),
       },
-      vaultAdapter: { getFiles: () => [], async readText() { throw new Error("not called"); } },
+      vaultAdapter: { getFiles: () => [], async readText() { throw new Error("not called"); }, async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); }, async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, getEntryByPath(): import("../src/types").VaultEntry | null { return null; } },
       remoteDb: { async allDocs() { return { rows: [] }; } },
       excludePatterns: [],
     });
@@ -315,8 +316,9 @@ describe("runReconcileOnStartup — first-run gate (AC2.6)", () => {
         reconcilePush: vi.fn(),
         reconcilePull: vi.fn(),
         reconcileTombstone: vi.fn(),
+        reconcileSuppressEcho: vi.fn(),
       },
-      vaultAdapter: { getFiles: () => [], async readText() { throw new Error("not called"); } },
+      vaultAdapter: { getFiles: () => [], async readText() { throw new Error("not called"); }, async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); }, async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, getEntryByPath(): import("../src/types").VaultEntry | null { return null; } },
       remoteDb: { async allDocs() { return { rows: [] }; } },
       excludePatterns: [],
     });
@@ -347,6 +349,7 @@ describe("runReconcileOnStartup — skip-on-fetch-fail (critical safety)", () =>
       reconcilePush: vi.fn(),
       reconcilePull: vi.fn(),
       reconcileTombstone: vi.fn(),
+      reconcileSuppressEcho: vi.fn(),
     };
 
     // Simulate CouchDB unreachable: remoteDb throws on every allDocs call
@@ -358,7 +361,7 @@ describe("runReconcileOnStartup — skip-on-fetch-fail (critical safety)", () =>
     const resultPromise = runReconcileOnStartup({
       db,
       bridge,
-      vaultAdapter: { getFiles: () => [], async readText() { throw new Error("not called"); } },
+      vaultAdapter: { getFiles: () => [], async readText() { throw new Error("not called"); }, async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); }, async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); }, getEntryByPath(): import("../src/types").VaultEntry | null { return null; } },
       remoteDb: unreachableRemoteDb,
       excludePatterns: [],
     });

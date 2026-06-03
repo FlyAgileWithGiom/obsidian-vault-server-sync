@@ -440,6 +440,43 @@ export class PouchDbFsBridge {
     } else {
       await this.writeTextToPouch(entry);
     }
+    // Set the echo-suppression sentinel AFTER writing to PouchDB.
+    //
+    // Why: conflict-copy files are written to disk by runReconcileOnStartup BEFORE
+    // bridge.start() arms the FS watcher. Once bridge.start() runs, macOS FSEvents
+    // may deliver stale events for those pre-existing files. Without the sentinel,
+    // onVaultEvent fires and calls writeTextToPouch a second time, bumping the rev.
+    // Setting the sentinel here makes onVaultEvent treat the first FSEvent as an echo
+    // of this push and suppress it.
+    //
+    // All reconcilePush callers write the file to disk before calling this method
+    // (stranded-file push: file was already on disk; conflict-copy: createText first).
+    // The sentinel is correct in both cases: the first watcher event after start()
+    // is always an echo of content already in PouchDB.
+    const docId = pathToDocId(path);
+    try {
+      const written = await this.db.get(docId);
+      const rev = (written as { _rev?: string })._rev;
+      if (rev) this.setAppliedRev(docId, rev);
+    } catch {
+      // Doc vanished between put and get — sentinel not critical, skip
+    }
+  }
+
+  /**
+   * Register an echo-suppression sentinel for a docId WITHOUT writing to PouchDB.
+   *
+   * Used by the conflict-copy reconcile path: the original file (e.g. "p.md") is left
+   * on disk with divergent content, and its local PouchDB doc is NOT touched by reconcile.
+   * However, macOS FSEvents may deliver a stale event for the original file after
+   * bridge.start() arms the FS watcher. Without a sentinel, onVaultEvent would push
+   * the divergent disk content into the local doc, clobbering the outage-surviving rev.
+   *
+   * Fix: set the sentinel to the doc's current rev in local PouchDB. When FSEvents fires,
+   * suppressIfEcho fetches the doc and sees _rev === sentinelRev → echo suppressed.
+   */
+  reconcileSuppressEcho(docId: string, currentLocalRev: string): void {
+    this.setAppliedRev(docId, currentLocalRev);
   }
 
   /**

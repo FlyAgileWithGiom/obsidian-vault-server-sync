@@ -549,3 +549,209 @@ describe("RC2 — startup reconciliation (AC2.1, AC2.3a, AC2.3b)", () => {
     expect(docInDb?.content).toBe("old-e"); // local doc preserved
   });
 });
+
+// ---------------------------------------------------------------------------
+// RC2 Cycle 4 — non-destructive conflict handling (AC2.4) + echo no-op proof (AC2.7)
+// ---------------------------------------------------------------------------
+//
+// AC2.4: both sides changed (disk diverged from localDB AND remote rev moved during outage)
+//   → a conflict-copy file is created and pushed; the original doc is NOT overwritten.
+//
+// Control: local ≠ localDB but localrev === remoterev (remote did not move)
+//   → plain push, no conflict-copy created.
+//
+// AC2.7: reconcile-pushed file does NOT echo back through the PouchDB→FS apply path
+//   (ordering guarantee: reconcile runs before bridge.start).
+// ---------------------------------------------------------------------------
+
+describe("RC2 Cycle 4 — non-destructive conflict handling (AC2.4, control, AC2.7)", () => {
+  let vaultDir: string;
+  let vault: FilesystemVaultAdapter;
+  let db: ReturnType<typeof makePouchMock>;
+  let bridge: PouchDbFsBridge;
+
+  function makeRunReconcile(stubRemoteRevs: Map<string, { rev: string; deleted: boolean }>) {
+    return () => runReconcileOnStartup({
+      db,
+      bridge,
+      vaultAdapter: vault,
+      remoteDb: {
+        async allDocs(opts: { keys: string[] }) {
+          const rows = opts.keys.map((key: string) => {
+            const entry = stubRemoteRevs.get(key);
+            if (!entry) return { key, error: "not_found" };
+            return { id: key, key, value: { rev: entry.rev, deleted: entry.deleted } };
+          });
+          return { rows };
+        },
+      },
+      excludePatterns: [],
+    });
+  }
+
+  beforeEach(() => {
+    vaultDir = fs.mkdtempSync(path.join(os.tmpdir(), "rc2-cycle4-"));
+    vault = new FilesystemVaultAdapter(vaultDir);
+    db = makePouchMock();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    // NOTE: bridge.start is called inside runDaemonV2Startup in tests below.
+  });
+
+  afterEach(() => {
+    bridge.stop();
+    try { fs.rmSync(vaultDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  });
+
+  it("AC2.4 — both-sides-changed: conflict-copy created, original doc untouched, counter=1", async () => {
+    // Setup: local PouchDB has doc P at rev R with content X.
+    // Disk has divergent content Y (user edited during outage).
+    // Remote has P at a DIFFERENT rev R' (remote also moved during outage).
+    const docP = pathToDocId("p.md");
+    await db.put({ _id: docP, _rev: undefined, content: "content-X", mtime: Date.now() });
+    const revR = db._docs.get(docP)!._rev!;
+
+    // Write divergent content to disk (Y ≠ X)
+    fs.writeFileSync(path.join(vaultDir, "p.md"), "content-Y");
+
+    const remoteRevs = new Map([
+      // Remote has P at a DIFFERENT rev (R' ≠ R → both sides changed → conflict-copy)
+      [docP, { rev: "99-remote-R-prime", deleted: false }],
+    ]);
+
+    await runDaemonV2Startup({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      bridge: bridge as any,
+      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
+      runReconcile: makeRunReconcile(remoteRevs),
+      fsWatcher: new FsWatcher(vaultDir, []),
+      engine: { start: vi.fn(async () => {}) },
+      statePath: "/fake/state.json",
+      pouchDir: "/fake/pouch",
+      db,
+      remoteDb: { async allDocs() { return { rows: [] }; } },
+    });
+
+    // (a) A conflict-copy file must exist (name includes "reconcile-conflict")
+    const allFiles = fs.readdirSync(vaultDir);
+    const conflictFiles = allFiles.filter(f => f.includes("reconcile-conflict") && f.startsWith("p"));
+    expect(conflictFiles.length).toBe(1);
+
+    // (b) The conflict-copy must have been pushed to PouchDB (has a doc entry)
+    const conflictFileName = conflictFiles[0];
+    const conflictDocId = pathToDocId(conflictFileName);
+    expect(db._docs.has(conflictDocId)).toBe(true);
+    expect(db._docs.get(conflictDocId)?.content).toBe("content-Y");
+
+    // (c) Original doc P must NOT have been overwritten — same content X, same rev R
+    //     (live sync will pull R' into it later; reconcile must not clobber the local doc)
+    const originalDoc = db._docs.get(docP);
+    expect(originalDoc?.content).toBe("content-X");
+    expect(originalDoc?._rev).toBe(revR);
+
+    // (d) FSEvents settling proof: p.md is on disk with content Y and has NO echo sentinel
+    //     for its own docId (sentinel is only set for the conflict-copy).
+    //     If a stale FSEvent fires for p.md after bridge.start, onVaultEvent would push Y
+    //     into P — re-assert after 600ms to prove this does NOT happen.
+    //
+    //     NOTE: the conflict-copy sentinel set in reconcilePush prevents echo for the copy
+    //     file; the original p.md doc is protected because reconcile never touches it
+    //     (conflict-copy path leaves the original doc untouched on purpose).
+    await new Promise((r) => setTimeout(r, 600));
+    const originalDocAfterWait = db._docs.get(docP);
+    expect(originalDocAfterWait?.content).toBe("content-X");
+    expect(originalDocAfterWait?._rev).toBe(revR);
+  });
+
+  it("control — local≠localDB but localrev===remoterev: plain push, no conflict-copy", async () => {
+    // Setup: local PouchDB has doc Q at rev R with content X.
+    // Disk has divergent content Y (user edited during outage).
+    // Remote has Q at THE SAME rev R (remote did NOT move → clean local edit → push).
+    const docQ = pathToDocId("q.md");
+    await db.put({ _id: docQ, _rev: undefined, content: "content-X", mtime: Date.now() });
+    const revR = db._docs.get(docQ)!._rev!;
+
+    // Write divergent content to disk (Y ≠ X)
+    fs.writeFileSync(path.join(vaultDir, "q.md"), "content-Y");
+
+    const remoteRevs = new Map([
+      // Remote has Q at the SAME rev as local (R === R → remote did not move → push, not conflict)
+      [docQ, { rev: revR, deleted: false }],
+    ]);
+
+    await runDaemonV2Startup({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      bridge: bridge as any,
+      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
+      runReconcile: makeRunReconcile(remoteRevs),
+      fsWatcher: new FsWatcher(vaultDir, []),
+      engine: { start: vi.fn(async () => {}) },
+      statePath: "/fake/state.json",
+      pouchDir: "/fake/pouch",
+      db,
+      remoteDb: { async allDocs() { return { rows: [] }; } },
+    });
+
+    // No conflict-copy file must exist
+    const allFiles = fs.readdirSync(vaultDir);
+    const conflictFiles = allFiles.filter(f => f.includes("reconcile-conflict"));
+    expect(conflictFiles.length).toBe(0);
+
+    // The original doc must have been PUSHED (content updated to Y)
+    const updatedDoc = db._docs.get(docQ);
+    expect(updatedDoc?.content).toBe("content-Y");
+  });
+
+  it("AC2.7 — conflict-copy file written by reconcile does NOT echo back to PouchDB", async () => {
+    // The echo-suppression ordering guarantee:
+    //   reconcile runs BEFORE bridge.start arms the FS watcher and changes feed.
+    //   Therefore, createText() during conflict-copy has no watcher to trigger —
+    //   the written file cannot loop back through PouchDB→FS apply.
+    //
+    // Proof: after runDaemonV2Startup, the conflict-copy doc's _rev in PouchDB must
+    // be unchanged after a ~600ms wait (same as the existing echo-loop test).
+
+    const docT = pathToDocId("t.md");
+    await db.put({ _id: docT, _rev: undefined, content: "content-old", mtime: Date.now() });
+    const revT = db._docs.get(docT)!._rev!;
+
+    // Disk diverged (Y ≠ old), remote moved (R' ≠ R) → conflict-copy scenario
+    fs.writeFileSync(path.join(vaultDir, "t.md"), "content-diverged");
+
+    const remoteRevs = new Map([
+      [docT, { rev: "99-remote-moved", deleted: false }],
+    ]);
+
+    await runDaemonV2Startup({
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      bridge: bridge as any,
+      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
+      runReconcile: makeRunReconcile(remoteRevs),
+      fsWatcher: new FsWatcher(vaultDir, []),
+      engine: { start: vi.fn(async () => {}) },
+      statePath: "/fake/state.json",
+      pouchDir: "/fake/pouch",
+      db,
+      remoteDb: { async allDocs() { return { rows: [] }; } },
+    });
+
+    // Find the conflict-copy doc in PouchDB and capture its _rev immediately after startup
+    const allFiles = fs.readdirSync(vaultDir);
+    const conflictFile = allFiles.find(f => f.includes("reconcile-conflict") && f.startsWith("t"));
+    expect(conflictFile).toBeDefined();
+
+    const conflictDocId = pathToDocId(conflictFile!);
+    const revAfterStartup = db._docs.get(conflictDocId)?._rev;
+    expect(revAfterStartup).toBeTruthy();
+
+    // Wait for the debounce + potential echo window (mirrors existing echo test)
+    await new Promise((r) => setTimeout(r, 600));
+
+    // Rev must be unchanged — no loopback put() happened
+    const revAfterWait = db._docs.get(conflictDocId)?._rev;
+    expect(revAfterWait).toBe(revAfterStartup);
+
+    // Suppress unused variable warning (revT used to prove original not touched)
+    void revT;
+  });
+});

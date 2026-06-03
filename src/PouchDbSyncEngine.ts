@@ -133,6 +133,9 @@ export class PouchDbSyncEngine {
   private static readonly PENDING_UNKNOWN = -1;
   private liveSyncPending = PouchDbSyncEngine.PENDING_UNKNOWN;
 
+  // RC2 — startup reconciliation conflict counter (AC2.4)
+  private _reconcileConflicts = 0;
+
   constructor(
     private settings: VaultSyncSettings,
     private db: PouchDB,
@@ -274,7 +277,16 @@ export class PouchDbSyncEngine {
       // text+binary), so no honest N/total is available — null, not a fabricated count.
       binaryProgress: null,
       lastError: this.lastError,
+      reconcileConflicts: this._reconcileConflicts,
     };
+  }
+
+  /**
+   * Record the number of conflict-copies created during the most recent startup
+   * reconciliation pass (AC2.4). Called by runDaemon after runReconcile completes.
+   */
+  recordReconcileConflicts(n: number): void {
+    this._reconcileConflicts = n;
   }
 
   /** Returns the real local doc count from PouchDB. Used by the Replace modal. */

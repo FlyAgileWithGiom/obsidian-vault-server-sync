@@ -120,6 +120,7 @@ function makeDiagnosticsSnapshot(overrides: Partial<SyncDiagnostics> = {}): Sync
     pullApplied: 0,
     binaryProgress: null,
     lastError: null,
+    reconcileConflicts: 0,
     ...overrides,
   };
 }

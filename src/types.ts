@@ -63,6 +63,12 @@ export interface SyncDiagnostics {
    */
   binaryProgress: { fetched: number; total: number } | null;
   lastError: string | null;
+  /**
+   * Count of conflict-copy files created during the most recent startup reconciliation pass.
+   * Additive field (AC2.4): zero on first run, zero if no conflicts detected.
+   * Resets to 0 on engine construction (not accumulated across restarts).
+   */
+  reconcileConflicts: number;
 }
 
 
