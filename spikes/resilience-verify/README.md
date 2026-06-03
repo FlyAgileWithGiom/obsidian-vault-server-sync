@@ -125,3 +125,99 @@ node spikes/resilience-verify/verify-live-stall.mjs
 ```
 
 Expected output (3 consistent runs, ~30s each): `BRANCH C` verdict, canary found.
+
+---
+
+## RC2 — real reconcile + live-sync smoke (2026-06-03)
+
+**File:** `verify-reconcile-real.ts`
+
+### Claim under test
+
+`reconcilePull` is a deliberate no-op. For a "pull" action (AC2.3b: file absent on disk,
+local PouchDB has old rev R, remote has newer rev R′), option (b) states the fix is to rely
+on LIVE `db.sync` to pull R′ into local PouchDB after `bridge.start` + `engine.start`,
+which then fires the `since:"now"` changes feed → `applyRemoteChange` → writes the file.
+
+The existing integration test "proves" this only with `db._emitChange(...)`, which directly
+fires the feed and BYPASSES the real question: does REAL `db.sync` with the doc already at
+rev R locally and a checkpoint in place actually re-pull R′ and deliver the file to disk?
+
+### Method
+
+1. **Seed** three situations against a fresh CouchDB + fresh local PouchDB + tmpdir vault:
+   - **P (AC2.3b pull):** PUT P@R (content X) on couch; replicate.from couch→local to copy rev
+     R verbatim; write P to disk. Synced state.
+   - **B (AC2.1 stranded push):** file on disk only — NOT in local PouchDB, NOT on couch.
+   - **D (AC2.3a downtime-delete):** PUT D@S (content Y) on couch; replicate.from to local
+     (same rev S verbatim); write D to disk. Synced state.
+2. **Simulate outage window** (direct edits, no daemon):
+   - Update P on couch → rev R′ (content Z).
+   - Delete P's file from disk.
+   - Delete D's file from disk (D on couch unchanged at rev S).
+3. **Run real startup cycle** (no mocks): `runReconcileOnStartup` →
+   `bridge.start(fsWatcher)` → `engine.start()`. NOT via `runDaemonV2Startup` (no converter).
+4. **Intermediate check** (proves no-op is real): after reconcile, before engine.start —
+   P file must be absent on disk, local P content must still be X.
+5. **Poll** (up to 60s) for disk outcomes to settle.
+
+### Critical design note
+
+`replicate.from` is used (not `local.put`) to seed the "synced" state. This copies the
+couch rev hash verbatim into local PouchDB, so `local._rev === remote.rev` for D (AC2.3a
+tombstone branch) and P (AC2.3b pull branch). Using `local.put` generates a different rev
+hash and would mis-route D to the pull branch instead of tombstone, invalidating the test.
+
+### Results (2 independent runs)
+
+Both runs produced identical outcomes in ~1.7s poll time.
+
+**Intermediate check (proves reconcilePull is a genuine no-op):**
+- P file absent from disk after `runReconcileOnStartup`, before `engine.start`: YES
+- P local PouchDB content still X at midpoint: YES
+
+**Final asserts:**
+
+| Assert | Outcome |
+|--------|---------|
+| AC2.3b (CRITICAL): P file on disk with content Z | PASS |
+| AC2.1: B doc exists in couch | PASS |
+| AC2.3a: D tombstoned (couch `reason:deleted`) | PASS |
+| AC2.3a: D file absent from disk | PASS |
+
+**AC2.3a note:** `reconcileTombstone` marks D as `_deleted` in local PouchDB; live `db.sync`
+pushes the tombstone to couch. Local `db.get(D, {latest:true})` returns `not_found`
+(PouchDB compacts local tombstones); couch returns `{"error":"not_found","reason":"deleted"}`,
+which is the authoritative tombstone confirmation.
+
+### Headline answer
+
+| Question | Answer |
+|----------|--------|
+| Does real `db.sync` pull R′ and deliver content Z to disk? | YES — ~1.7s after engine.start |
+| Is reconcilePull's no-op genuinely a no-op (not a false pass)? | YES — intermediate check confirms |
+| Does AC2.3b downtime-remote-edit recovery work end-to-end? | YES |
+
+### Option-(b) verdict
+
+**HOLDS.** `reconcilePull` is correctly a no-op. Real `db.sync` pulls P@R′ (content Z)
+into local PouchDB within ~1.7s of `engine.start`, fires the `since:"now"` changes feed,
+and `applyRemoteChange` writes content Z to disk. The mock-driven integration test's
+`db._emitChange` simulation is confirmed to match real behavior for this scenario.
+
+AC2.3b/AC2.3c files edited or created on the remote during a daemon outage **will come
+back** via live sync. No ship-blocker.
+
+### Reproduce
+
+```
+# From repo root, CouchDB running at localhost:5986:
+SCRATCH_URL=http://smoke:smokepass@localhost:5986 \
+npx tsx spikes/resilience-verify/verify-reconcile-real.ts
+
+# With custom CouchDB:
+SCRATCH_URL=http://admin:pass@localhost:5984 \
+npx tsx spikes/resilience-verify/verify-reconcile-real.ts
+```
+
+Expected output (2 consistent runs, ~2s each): all-PASS, `HOLDS` verdict.
