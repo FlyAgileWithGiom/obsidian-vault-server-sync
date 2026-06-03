@@ -11,6 +11,7 @@ import { fetchRemoteRevs } from "./remote-revs";
 import { reconcile } from "./reconcile";
 import { pathToDocId } from "../src/doc-id";
 import { isBinaryPath } from "../src/binary-ext";
+import { isPathExcluded } from "./exclude";
 
 /**
  * Build a RemoteDbForPhantomCheck that uses node:http or node:https directly.
@@ -281,11 +282,10 @@ export async function runReconcileOnStartup(opts: {
     return null;
   }
 
-  // FsWatcher isExcluded logic: exact match or path-prefix match against excludePatterns.
-  // Reusing the same predicate (not just ALWAYS_EXCLUDED) ensures reconcile and live sync
-  // exclude identically — diverging exclusion is the failure class this cycle exists to fix (AC2.5).
-  const isExcluded = (p: string): boolean =>
-    excludePatterns.some((pat) => p === pat || p.startsWith(pat + "/") || p.startsWith(pat + path.sep));
+  // Shared exclusion predicate: normalises trailing slashes in patterns so that
+  // ".trash/" excludes ".trash/foo.md" correctly (without this, pat + "/" = ".trash//").
+  // Identical predicate used by FsWatcher.isExcluded — the two code-paths cannot diverge.
+  const isExcluded = (p: string): boolean => isPathExcluded(p, excludePatterns);
 
   // localGet: wrap db.get, returning undefined for 404.
   const localGet = async (docId: string): Promise<import("./reconcile").LocalDoc | undefined> => {

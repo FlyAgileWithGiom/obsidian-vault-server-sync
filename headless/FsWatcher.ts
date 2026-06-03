@@ -11,6 +11,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { VaultWatcher, FileEvent } from "../src/WatcherAdapter";
+import { isPathExcluded } from "./exclude";
 
 const DEBOUNCE_MS = 100;
 
@@ -73,9 +74,7 @@ export class FsWatcher implements VaultWatcher {
   }
 
   private isExcluded(rel: string): boolean {
-    return this.excludePatterns.some(
-      (p) => rel === p || rel.startsWith(p + path.sep)
-    );
+    return isPathExcluded(rel, this.excludePatterns);
   }
 
   private dispatchEvent(rel: string): void {

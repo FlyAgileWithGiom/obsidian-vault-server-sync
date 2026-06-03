@@ -241,6 +241,31 @@ describe("FsWatcher — exclusions", () => {
     expect(events).toHaveLength(1);
     watcher.stop();
   });
+
+  it("skips a file inside a trailing-slash pattern (.trash/ excludes .trash/foo.md)", async () => {
+    const events: FileEvent[] = [];
+    // Pattern with trailing slash — as stored in real vault config
+    const watcher = new FsWatcher(VAULT_ROOT, [".trash/"]);
+    watcher.start((e) => events.push(e));
+
+    lastFsWatcher!._triggerChange("rename", ".trash/foo.md");
+    await flushDebounce();
+
+    expect(events).toHaveLength(0);
+    watcher.stop();
+  });
+
+  it("does NOT skip a sibling folder (.trash/ does not exclude .trasher/note.md)", async () => {
+    const events: FileEvent[] = [];
+    const watcher = new FsWatcher(VAULT_ROOT, [".trash/"]);
+    watcher.start((e) => events.push(e));
+
+    lastFsWatcher!._triggerChange("rename", ".trasher/note.md");
+    await flushDebounce();
+
+    expect(events).toHaveLength(1);
+    watcher.stop();
+  });
 });
 
 describe("FsWatcher — stop()", () => {
