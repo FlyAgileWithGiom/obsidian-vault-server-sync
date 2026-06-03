@@ -239,12 +239,28 @@ export async function reconcile(input: ReconcileInput): Promise<ReconcileAction[
       // Local doc present, FS absent.
       // AC2.3a: local._rev === remote winning rev → user deleted on disk → tombstone
       // AC2.3b: local._rev !== remote winning rev → remote moved during outage → pull
+      //
+      // OFF-TABLE CELL: local doc present + FS absent + remote ABSENT (not_found).
+      // Reachable when a remote doc was deleted+compacted (tombstone GC'd) while
+      // the daemon was down, so remoteRevs returns not_found (not a tombstone entry).
+      // Decision: treat as AC2.3b (pull), i.e. "remote has changed since our last
+      // sync" — the safe/data-preserving direction.
+      // Acknowledged risk: if the user intentionally deleted the file on disk AND
+      // remote was independently compacted, this will restore the file. However:
+      //   - compacted tombstones are rare (CouchDB compaction is not frequent)
+      //   - false-positive pull is recoverable (user re-deletes the file on disk)
+      //   - false-negative tombstone on a valid pull would lose remote data
+      // Lean keep-over-delete per the plan's data-loss bar.
+      // NOTE to Cycle 3 wiring author: Cycle 3 builds remoteRevs over
+      // union(localDocIds, vaultFileDocIds) — not_found here means the doc was
+      // never synced to the queried remote OR the tombstone was compacted away.
+      // If this cell fires often in production, consider checking local _rev
+      // prefix (1-) as a "never synced" signal.
       if (localDoc._rev !== undefined && localDoc._rev === remote?.rev) {
-        // AC2.3a
+        // AC2.3a: rev-equal → user deleted on disk during outage → tombstone
         actions.push({ kind: "tombstone", docId });
       } else {
-        // AC2.3b (rev differs) or remote absent (undefined — treat as remote has something
-        // different from local baseline → pull to be safe)
+        // AC2.3b (rev differs) or remote absent (not_found — see off-table note above)
         actions.push({ kind: "pull", path });
       }
     }

@@ -271,6 +271,29 @@ describe("reconcile — FS<->PouchDB divergence detection", () => {
   });
 
   // -------------------------------------------------------------------------
+  // Off-table: local doc present + FS absent + remote ABSENT (not_found) → pull
+  // Documented decision: lean keep-over-delete (tombstone compaction case).
+  // If remote was deleted+compacted, we cannot distinguish from "never synced".
+  // Safe direction is pull (recoverable); tombstone on unknown remote state
+  // risks silently discarding a doc that never reached the server.
+  // See off-table note in reconcile.ts for full rationale.
+  // -------------------------------------------------------------------------
+  it("off-table: local-doc + FS-absent + remote-absent → pull (documented decision)", async () => {
+    const localDoc: LocalDoc = { _rev: "1-abc", content: "was here" };
+    const localDocs: LocalDocMap = new Map([["file/note.md", localDoc]]);
+
+    const actions = await runReconcile({
+      vaultFiles: [], // FS absent
+      localDocs,
+      localDocIds: ["file/note.md"],
+      diskContent: new Map(),
+      remoteRevs: new Map(), // remote absent (not_found / compacted tombstone)
+    });
+    // Decision: pull (data-preserving; see reconcile.ts off-table comment)
+    expect(actions).toEqual([{ kind: "pull", path: "note.md" }]);
+  });
+
+  // -------------------------------------------------------------------------
   // Binary: same size → skip:identical
   // -------------------------------------------------------------------------
   it("binary same size → skip:identical", async () => {
