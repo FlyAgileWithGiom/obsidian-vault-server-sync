@@ -89,7 +89,7 @@ function makeMockDb(docCount = 0) {
 }
 
 function makeMockBridge() {
-  return { start: vi.fn(), stop: vi.fn(), setDb: vi.fn() };
+  return { start: vi.fn(), stop: vi.fn(), setDb: vi.fn(), pruneOrphans: vi.fn().mockResolvedValue(undefined) };
 }
 
 function makeSettings(): VaultSyncSettings {
@@ -102,13 +102,13 @@ function makeSettings(): VaultSyncSettings {
   };
 }
 
-function makeEngine(opts: { docCount?: number } = {}) {
+function makeEngine(opts: { docCount?: number; fetchServerDocIds?: () => Promise<string[]> } = {}) {
   const db = makeMockDb(opts.docCount ?? 0);
   const bridge = makeMockBridge();
   // dbFactory returns the same mock db so destroy+recreate keeps assertions on same object.
   const dbFactory = () => db as unknown as Parameters<typeof PouchDbSyncEngine>[1];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any, dbFactory as any);
+  const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any, dbFactory as any, opts.fetchServerDocIds);
   return { engine, db, bridge };
 }
 
@@ -679,6 +679,57 @@ describe("PouchDbSyncEngine — replaceLocalFromServer()", () => {
           (db.replicate.from as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0],
         )
       : undefined; // Invocation order check
+  });
+
+  // ---- Orphan pruning (BUG #77) --------------------------------------------
+
+  it("calls bridge.pruneOrphans with server doc-id set after pull when fetchServerDocIds provided", async () => {
+    const serverIds = ["file/kept.md", "file/image.png"];
+    const fetchServerDocIds = vi.fn().mockResolvedValue(serverIds);
+    const { engine, bridge } = makeEngine({ fetchServerDocIds });
+    engine.register(makePlugin());
+    await engine.replaceLocalFromServer();
+    expect(bridge.pruneOrphans).toHaveBeenCalledOnce();
+    const [keepSet] = bridge.pruneOrphans.mock.calls[0] as [Set<string>, unknown];
+    expect(keepSet).toBeInstanceOf(Set);
+    expect([...keepSet]).toEqual(expect.arrayContaining(serverIds));
+  });
+
+  it("does NOT call bridge.pruneOrphans when fetchServerDocIds is absent", async () => {
+    const { engine, bridge } = makeEngine({ docCount: 5 });
+    engine.register(makePlugin());
+    await engine.replaceLocalFromServer();
+    expect(bridge.pruneOrphans).not.toHaveBeenCalled();
+  });
+
+  it("skips prune (no bridge.pruneOrphans call) when fetchServerDocIds rejects", async () => {
+    const fetchServerDocIds = vi.fn().mockRejectedValue(new Error("network error"));
+    const { engine, bridge } = makeEngine({ fetchServerDocIds });
+    engine.register(makePlugin());
+    // Should resolve without throwing even though fetch fails
+    await expect(engine.replaceLocalFromServer()).resolves.toBeUndefined();
+    expect(bridge.pruneOrphans).not.toHaveBeenCalled();
+  });
+
+  it("skips prune when fetchServerDocIds returns empty array (safety guard)", async () => {
+    const fetchServerDocIds = vi.fn().mockResolvedValue([]);
+    const { engine, bridge } = makeEngine({ fetchServerDocIds });
+    engine.register(makePlugin());
+    await engine.replaceLocalFromServer();
+    expect(bridge.pruneOrphans).not.toHaveBeenCalled();
+  });
+
+  it("uses server doc-id list (text+binary) not local db.allDocs as keep-set", async () => {
+    // Local db.allDocs returns text-only mock rows; server has both text and binary.
+    // The keep-set passed to pruneOrphans must include the binary id from the server fetcher.
+    const textDocId = "file/notes.md";
+    const binaryDocId = "file/photo.png"; // binary — NOT in local db.allDocs mock
+    const fetchServerDocIds = vi.fn().mockResolvedValue([textDocId, binaryDocId]);
+    const { engine, bridge } = makeEngine({ fetchServerDocIds });
+    engine.register(makePlugin());
+    await engine.replaceLocalFromServer();
+    const [keepSet] = bridge.pruneOrphans.mock.calls[0] as [Set<string>, unknown];
+    expect(keepSet.has(binaryDocId)).toBe(true); // binary id preserved from server list
   });
 });
 

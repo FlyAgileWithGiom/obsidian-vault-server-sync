@@ -1,4 +1,4 @@
-import { Notice, Plugin } from "obsidian";
+import { Notice, Plugin, requestUrl } from "obsidian";
 import type { PouchDbSyncEngine } from "./PouchDbSyncEngine";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
 import { VaultSyncSettingTab } from "./settings-tab";
@@ -178,7 +178,30 @@ export default class VaultSyncPlugin extends Plugin {
     const dbFactory = () => new PouchDB(localDbName);
     const db = dbFactory();
     const bridge = new PouchDbFsBridge(vaultAdapter, db);
-    return new PouchDbSyncEngine(this.settings, db, bridge, dbFactory);
+
+    // Build fetchServerDocIds for replaceLocalFromServer() orphan pruning (BUG-77).
+    // Uses Obsidian's requestUrl API (not raw fetch) to call the remote CouchDB.
+    // requestUrl bypasses CORS restrictions and works identically on desktop and
+    // iOS without throwing on credential-in-URL requests (Fetch spec rejects those).
+    // Credentials are passed as an Authorization header, never embedded in the URL.
+    const { couchDbUrl, couchDbName, couchDbUser, couchDbPassword } = this.settings;
+    const base = couchDbUrl.replace(/\/$/, "");
+    const allDocsUrl = `${base}/${couchDbName}/_all_docs?include_docs=false`;
+    const authHeader = (couchDbUser && couchDbPassword)
+      ? `Basic ${btoa(`${couchDbUser}:${couchDbPassword}`)}`
+      : undefined;
+    const fetchServerDocIds = async (): Promise<string[]> => {
+      const res = await requestUrl({
+        url: allDocsUrl,
+        method: "GET",
+        headers: authHeader ? { Authorization: authHeader } : undefined,
+      });
+      if (res.status !== 200) throw new Error(`_all_docs fetch failed: ${res.status}`);
+      const json = res.json as { rows: { id: string }[] };
+      return json.rows.map((r) => r.id);
+    };
+
+    return new PouchDbSyncEngine(this.settings, db, bridge, dbFactory, fetchServerDocIds);
   }
 
   // --- Settings persistence ---

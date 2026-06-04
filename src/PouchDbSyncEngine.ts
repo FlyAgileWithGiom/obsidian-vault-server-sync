@@ -28,6 +28,7 @@ import type { Plugin } from "obsidian";
 import type PouchDB from "pouchdb-browser";
 import { ObsidianVaultWatcher } from "./ObsidianVaultWatcher";
 import { PouchDbFsBridge } from "./PouchDbFsBridge";
+import { isPathExcluded } from "./exclude";
 import type {
   VaultSyncSettings,
   SyncState,
@@ -141,6 +142,7 @@ export class PouchDbSyncEngine {
     private db: PouchDB,
     private readonly bridge: PouchDbFsBridge,
     private readonly dbFactory?: () => PouchDB,
+    private readonly fetchServerDocIds?: () => Promise<string[]>,
   ) {}
 
   // --- Lifecycle ---
@@ -243,6 +245,41 @@ export class PouchDbSyncEngine {
     this.started = true;
     await this.runInitialPull();
     // runInitialPull's complete handler calls startLiveSync() + setState("ok").
+
+    // Prune orphan vault files absent from the server's authoritative doc set.
+    // Skip if no fetcher is configured (degraded mode: no deletions).
+    if (this.fetchServerDocIds) {
+      await this.pruneOrphansAfterReplace();
+    }
+  }
+
+  /**
+   * Fetch the server's full doc-id set and delete local vault files not in it.
+   *
+   * Skips entirely (no deletions) if the fetch fails or returns an empty list —
+   * an empty server response is most likely a transient error, not a genuinely
+   * empty vault, so we prefer false negatives (orphan survives) over data loss.
+   */
+  private async pruneOrphansAfterReplace(): Promise<void> {
+    let serverIds: string[];
+    try {
+      serverIds = await this.fetchServerDocIds!();
+    } catch (e) {
+      console.warn("[vault-sync] replaceLocalFromServer: failed to fetch server doc-ids for prune — skipping prune", e);
+      return;
+    }
+    if (serverIds.length === 0) {
+      console.warn("[vault-sync] replaceLocalFromServer: server returned empty doc-id list — skipping prune to avoid data loss");
+      return;
+    }
+    // Augment the settings exclude patterns with .git to protect hidden Git repos.
+    // The plugin's DEFAULT_SETTINGS already excludes .trash/, .obsidian/,
+    // .vault-sync-state.json, and .vault-sync.json.
+    const excludePatterns = [".git", ...this.settings.excludePatterns];
+    await this.bridge.pruneOrphans(
+      new Set(serverIds),
+      (relPath) => isPathExcluded(relPath, excludePatterns),
+    );
   }
 
   isRunning(): boolean {

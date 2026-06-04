@@ -516,4 +516,38 @@ export class PouchDbFsBridge {
   async reconcileTombstone(docId: string): Promise<void> {
     await this.markDeletedInPouch(docId);
   }
+
+  /**
+   * Delete local vault files whose doc-ids are absent from the server's authoritative set.
+   *
+   * Called after replaceLocalFromServer() completes the initial pull.  At that
+   * point local PouchDB contains only TEXT docs (binary backfill runs later via
+   * live db.sync), so we cannot use local db.allDocs as the keep-set — it would
+   * miss every binary file and delete all of them.  The caller must provide the
+   * keep-set from the SERVER's _all_docs (text + binary).
+   *
+   * Safety rules:
+   *   - Only touches files returned by vault.getFiles() (vault-managed files only).
+   *   - Skips any path where isExcluded returns true.
+   *   - Sets the echo-suppression sentinel BEFORE vault.deleteFile() so the FS
+   *     watcher does not push a phantom delete back into PouchDB.
+   *
+   * @param keepDocIds  Full set of doc-ids present on the server (text + binary).
+   * @param isExcluded  Predicate wrapping the caller's exclude-patterns list.
+   */
+  async pruneOrphans(
+    keepDocIds: Set<string>,
+    isExcluded: (relPath: string) => boolean,
+  ): Promise<void> {
+    const files = this.vault.getFiles();
+    for (const file of files) {
+      if (isExcluded(file.path)) continue;
+      const docId = pathToDocId(file.path);
+      if (!keepDocIds.has(docId)) {
+        // Set sentinel BEFORE delete so the FS watcher does not re-push the file.
+        this.setAppliedRev(docId, "");
+        await this.vault.deleteFile(file);
+      }
+    }
+  }
 }
