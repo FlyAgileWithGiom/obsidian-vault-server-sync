@@ -31,14 +31,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build
+      # build:release produces the single self-contained CJS bundle BRAT installs
+      # (dist/release/main.js). NOT `npm run build`: that ESM+splitting build pulls
+      # pouchdb-browser's ESM entry (import EE from 'events'), which esbuild cannot
+      # resolve for the browser target -> the release build died on every tag since
+      # v2.0.0. build:release resolves pouchdb-browser's CJS entry and has no such
+      # bare Node-builtin import.
+      - name: Build release bundle
+        run: npm run build:release
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            main.js
-            manifest.json
-            styles.css
+            dist/release/main.js
+            dist/release/manifest.json
+            dist/release/styles.css
