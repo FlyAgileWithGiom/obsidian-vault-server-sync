@@ -583,6 +583,60 @@ describe("PouchDbSyncEngine — isFirstRun() branching", () => {
     engine.stop();
   });
 
+  it("caught-up scenario: active then paused with NO change → state 'ok' / phase 'complete'", async () => {
+    // Real probe evidence (spikes/paused-probe.mjs): when the initial pull already fetched
+    // everything, the live db.sync fires ONLY active → paused with zero change events.
+    // liveSyncPending stays at PENDING_UNKNOWN (-1) → the old pending===0 guard never fires.
+    // With liveSyncContacted: active sets contacted=true, so paused latches ok.
+    const onStateChange = vi.fn();
+    const { engine } = makeEngine({ docCount: 0 });
+    engine.onStateChange = onStateChange;
+    engine.register(makePlugin());
+    await engine.start();
+    onStateChange.mockClear();
+    // Caught-up sequence from real probe: active, then paused — no change events.
+    lastSyncHandle!._emit("active");
+    lastSyncHandle!._emit("paused");
+    expect(onStateChange).toHaveBeenCalledWith("ok");
+    expect(engine.getDiagnostics().state).toBe("ok");
+    expect(engine.getDiagnostics().syncPhase).toBe("complete");
+    engine.stop();
+  });
+
+  it("never-connected backoff: paused alone (no active/change) → stays 'syncing'", async () => {
+    // Real probe evidence (spikes/paused-error-probe.mjs): dead-remote fires paused repeatedly
+    // with no active, no change, no error (PouchDB hides network failure behind retry pauses).
+    // liveSyncContacted stays false → paused must NOT latch ok.
+    const onStateChange = vi.fn();
+    const { engine } = makeEngine({ docCount: 0 });
+    engine.onStateChange = onStateChange;
+    engine.register(makePlugin());
+    await engine.start();
+    onStateChange.mockClear();
+    // Never-connected backoff: only paused fires, nothing else.
+    lastSyncHandle!._emit("paused");
+    lastSyncHandle!._emit("paused");
+    expect(onStateChange).not.toHaveBeenCalledWith("ok");
+    expect(engine.getDiagnostics().state).toBe("syncing");
+    engine.stop();
+  });
+
+  it("drained regression guard: change pending:0 then paused → 'ok' (contacted set by change)", async () => {
+    // Standard drained scenario: change reports pending===0, then paused fires.
+    // liveSyncContacted is set true by the change handler; paused latches ok.
+    const onStateChange = vi.fn();
+    const { engine } = makeEngine({ docCount: 0 });
+    engine.onStateChange = onStateChange;
+    engine.register(makePlugin());
+    await engine.start();
+    onStateChange.mockClear();
+    lastSyncHandle!._emit("change", { direction: "pull", change: { docs_written: 1, pending: 0 } });
+    lastSyncHandle!._emit("paused");
+    expect(onStateChange).toHaveBeenCalledWith("ok");
+    expect(engine.getDiagnostics().state).toBe("ok");
+    engine.stop();
+  });
+
   it("fires a one-shot 'Notes ready' notice at the text-ready transition", async () => {
     const notices: string[] = [];
     const { engine } = makeEngine({ docCount: 0 });
@@ -884,6 +938,41 @@ describe("PouchDbSyncEngine — resilient resume after transient error (Refs #74
     lastSyncHandle!._emit("error", new Error("Load failed again"));
     await vi.advanceTimersByTimeAsync(3000); // 2s base + margin
     expect(db.sync).toHaveBeenCalledTimes(3);
+
+    engine.stop();
+  });
+
+  it("reconnect after error: contacted reset → paused stays syncing; new session active+paused → ok", async () => {
+    // Full scenario: error fires (liveSyncContacted reset); scheduleRestart fires after backoff
+    // (startLiveSync resets both pending and contacted); new session active→paused latches ok.
+    const { engine, db } = makeEngine({ docCount: 5 }); // doc_count>0 → goes directly to live sync
+    engine.register(makePlugin());
+    await engine.start();
+
+    const firstHandle = lastSyncHandle!;
+    // Establish some sync activity on the first session.
+    firstHandle._emit("change", { direction: "pull", change: { docs_written: 5, pending: 2 } });
+    firstHandle._emit("active");
+
+    // Error fires → liveSyncContacted reset to false.
+    firstHandle._emit("error", new Error("Network failure"));
+    // A paused immediately after error (before restart) must NOT latch ok:
+    // contacted=false, pending=2 so noOutstandingWork=false anyway.
+    firstHandle._emit("paused");
+    expect(engine.getDiagnostics().state).not.toBe("ok");
+
+    // Advance past backoff → scheduleRestart fires → startLiveSync() creates new handle.
+    // startLiveSync() resets liveSyncPending = PENDING_UNKNOWN and liveSyncContacted = false.
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(db.sync).toHaveBeenCalledTimes(2); // new handle created
+    const newHandle = lastSyncHandle!;
+    expect(newHandle).not.toBe(firstHandle);
+
+    // New session: caught-up sequence (active → paused, no change) → must latch ok.
+    newHandle._emit("active");
+    newHandle._emit("paused");
+    expect(engine.getDiagnostics().state).toBe("ok");
+    expect(engine.getDiagnostics().syncPhase).toBe("complete");
 
     engine.stop();
   });

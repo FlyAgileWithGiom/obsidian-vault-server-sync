@@ -133,6 +133,16 @@ export class PouchDbSyncEngine {
    */
   private static readonly PENDING_UNKNOWN = -1;
   private liveSyncPending = PouchDbSyncEngine.PENDING_UNKNOWN;
+  /**
+   * Whether the remote was contacted in the current live-sync session.
+   * Set by `active` (server responded) or `change` (data flowing).
+   * Reset at the top of startLiveSync() and on `error` (real transient drop).
+   *
+   * Discriminates the caught-up pause (contacted=true, active fired) from the
+   * never-connected backoff pause (contacted=false, only paused fires repeatedly).
+   * Real probe evidence: spikes/paused-event/README.md.
+   */
+  private liveSyncContacted = false;
 
   // RC2 — startup reconciliation conflict counter (AC2.4)
   private _reconcileConflicts = 0;
@@ -464,6 +474,8 @@ export class PouchDbSyncEngine {
     this.syncHandle = emitter;
     // Sentinel: no change observed yet. A paused before the first change must NOT latch ok.
     this.liveSyncPending = PouchDbSyncEngine.PENDING_UNKNOWN;
+    // New session: server not yet contacted.
+    this.liveSyncContacted = false;
     // Entering live sync means there may be backlog (binaries, or steady-state catch-up).
     // Do not rely on `active` to enter this phase: the combined db.sync `active` only fires
     // once one direction is already paused, so it may not fire at startup.
@@ -477,6 +489,8 @@ export class PouchDbSyncEngine {
       // info.pending is always undefined on db.sync changes. Read nested first, fall back to
       // flat for parity with the replicate.from shape; ?? 0 only once a change is observed.
       this.liveSyncPending = info.change?.pending ?? info.pending ?? 0;
+      // Data flowing → server was contacted.
+      this.liveSyncContacted = true;
       // Successful change: clear any stale error and reset backoff (Refs #74).
       // A stale "Initial sync failed" must not persist once the sync has recovered.
       if (this.lastError !== null) {
@@ -488,6 +502,8 @@ export class PouchDbSyncEngine {
     });
 
     emitter.on("active", () => {
+      // Server responded: mark contacted so the next paused can latch ok if appropriate.
+      this.liveSyncContacted = true;
       if (this.syncPhase !== "complete") {
         this.setPhase("binary-backfill");
       }
@@ -495,11 +511,18 @@ export class PouchDbSyncEngine {
     });
 
     emitter.on("paused", () => {
-      // Caught up only when an actual change reported the feed drained (pending === 0). The
-      // sentinel (PENDING_UNKNOWN = -1) means no change has been observed yet, so a paused
-      // firing first — the error-backoff case — stays syncing. A no-arg pause with pending
-      // still > 0 is likewise an error-backoff pause, not caught-up.
-      if (this.liveSyncPending === 0) {
+      // Latch "ok"/"complete" only when BOTH conditions hold:
+      //   1. liveSyncContacted — the server was actually reached this session (active or change
+      //      fired). Discriminates caught-up pause from never-connected backoff pause (which
+      //      fires paused repeatedly with no active/change; real probe: spikes/paused-event/).
+      //   2. noOutstandingWork — no change reported pending > 0. The sentinel (PENDING_UNKNOWN)
+      //      means no change at all observed yet, which is fine for the caught-up case (the
+      //      initial pull already drained the feed before live sync started). A pending > 0
+      //      seen via change means backfill is still in flight → backoff pause, not caught-up.
+      const noOutstandingWork =
+        this.liveSyncPending === 0 ||
+        this.liveSyncPending === PouchDbSyncEngine.PENDING_UNKNOWN;
+      if (this.liveSyncContacted && noOutstandingWork) {
         this.setPhase("complete");
         this.setState("ok");
       }
@@ -515,6 +538,9 @@ export class PouchDbSyncEngine {
     });
 
     emitter.on("error", (err: unknown) => {
+      // A real transient drop: clear contacted so a paused arriving during the backoff window
+      // does not falsely latch ok. The next startLiveSync() will reset it again at the top.
+      this.liveSyncContacted = false;
       const msg = err instanceof Error ? err.message : String(err);
       this.setError(`PouchDB sync error: ${msg}`);
       // Resilient restart: schedule a new db.sync after backoff so a transient network
