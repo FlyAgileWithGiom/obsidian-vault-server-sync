@@ -83,67 +83,6 @@ export function makeHttpRemoteDb(rawUrl: string): RemoteDbForPhantomCheck {
   };
 }
 
-/**
- * Fetch all doc IDs from a remote CouchDB database using a full (unkeyed)
- * GET /_all_docs?include_docs=false request.
- *
- * Used by replaceLocalFromServer() to build the keep-set for orphan pruning.
- * The keep-set must come from the server (not local PouchDB) because the two-
- * phase initial pull only copies text docs in phase-1; binary docs arrive later
- * via live replication. Using the server list ensures binary files are not
- * incorrectly pruned as orphans.
- *
- * Returns the list of all row IDs (e.g. ["file/Notes/foo.md", ...]). Design
- * docs (_design/*) are included by CouchDB but are harmless in the keep-set
- * (the bridge never creates vault files for them).
- */
-export function makeFetchAllDocIds(rawUrl: string): () => Promise<string[]> {
-  const parsed = new URL(rawUrl);
-  const isHttps = parsed.protocol === "https:";
-  const auth = parsed.username
-    ? `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}`
-    : undefined;
-
-  const reqUrl = new URL(rawUrl);
-  reqUrl.username = "";
-  reqUrl.password = "";
-  const baseUrl = reqUrl.toString().replace(/\/$/, "");
-
-  return () =>
-    new Promise<string[]>((resolve, reject) => {
-      const endpoint = `${baseUrl}/_all_docs?include_docs=false`;
-      const endpointParsed = new URL(endpoint);
-
-      const reqOptions = {
-        hostname: endpointParsed.hostname,
-        port: endpointParsed.port || (isHttps ? 443 : 80),
-        path: endpointParsed.pathname + endpointParsed.search,
-        method: "GET",
-        headers: {
-          ...(auth ? { "Authorization": auth } : {}),
-          "Connection": "close",
-        },
-      };
-
-      const transport = isHttps ? https : http;
-      const req = transport.request(reqOptions, (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (c: Buffer) => chunks.push(c));
-        res.on("end", () => {
-          try {
-            const json = JSON.parse(Buffer.concat(chunks).toString("utf-8")) as { rows: { id: string }[] };
-            resolve(json.rows.map((r) => r.id));
-          } catch (e) {
-            reject(new Error(`Failed to parse _all_docs response: ${e}`));
-          }
-        });
-        res.on("error", reject);
-      });
-
-      req.on("error", reject);
-      req.end();
-    });
-}
 
 const STATE_FILENAME = "state.json";
 const STATE_APP_DIR = "vault-sync-daemon";
@@ -564,8 +503,7 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   const excludePatterns = [STATE_FILENAME, CONFIG_FILENAME, ".git", ...settings.excludePatterns];
   const fsWatcher = new FsWatcher(absVaultRoot, excludePatterns);
 
-  // Build the remoteDb adapter for the phantom check (C04-bis) and the
-  // fetchServerDocIds fetcher for replaceLocalFromServer() orphan pruning (BUG-77).
+  // Build the remoteDb adapter for the phantom check (C04-bis).
   // Uses node:http(s) directly instead of pouchdb-node's HTTP adapter, which
   // hangs on _all_docs POST requests under Fly.io CouchDB (keep-alive issue).
   // This covers localhost:5986 (smoke/http) and production Fly.io (https).
@@ -578,13 +516,10 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
     : "";
   const remoteDbUrl = `${proto}${authPart}${host}/${couchDbName}`;
   const remoteDb = makeHttpRemoteDb(remoteDbUrl);
-  const fetchServerDocIds = makeFetchAllDocIds(remoteDbUrl);
   console.log(`[vault-sync] Phantom check remote: ${proto}${host}/${couchDbName}`);
 
   // Build engine with injected db and bridge.
-  // fetchServerDocIds is wired for replaceLocalFromServer() orphan pruning (BUG-77):
-  // after wiping the local DB it deletes vault files that the server no longer has.
-  const engine = new PouchDbSyncEngine(settings, db, bridge, dbFactory, fetchServerDocIds);
+  const engine = new PouchDbSyncEngine(settings, db, bridge, dbFactory);
 
   engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
   engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);

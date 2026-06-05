@@ -1,17 +1,21 @@
 /**
- * Regression test for "database is destroyed" bug in replaceLocalFromServer().
+ * Regression tests for replaceLocalFromServer().
  *
- * Bug (prod iOS, v2.0.0): after db.destroy(), runInitialPull() called
- * db.replicate.from() on the destroyed handle → "Initial sync failed: database
- * is destroyed". Root cause: the engine held a stale db reference post-destroy.
+ * Covers two scenarios:
  *
- * Fix: dbFactory recreates the db; bridge.setDb() re-arms the changes listener.
+ * 1. "database is destroyed" regression (v2.0.0 bug) — uses real pouchdb-node
+ *    with a temp LevelDB dir to reproduce the original error.
  *
- * Uses real pouchdb-node + LevelDB (fs.mkdtempSync) so PouchDB's actual
- * "database is destroyed" error is reproducible. pouchdb-node does not support
- * adapter:'memory', so temp dirs are used and cleaned up in afterEach.
+ * 2. Wipe-and-pull integration (replaces BUG-77 prune-orphans approach) — uses
+ *    real CouchDB (localhost:5985, admin:devpass) to validate that after
+ *    replaceLocalFromServer():
+ *      - LOCAL-ONLY orphan files are deleted from disk
+ *      - files seeded on the server appear on disk after re-pull
+ *      - excluded paths (.obsidian/) are untouched
  *
- * This test MUST fail on the pre-fix code and pass after the fix.
+ * The wipe-and-pull test is tagged @localdb and skipped when COUCHDB_URL is
+ * not set (CI without a CouchDB service). To run locally:
+ *   COUCHDB_URL=http://admin:devpass@localhost:5985 npm test
  */
 
 import * as fs from "node:fs";
@@ -22,6 +26,7 @@ import { describe, it, expect, afterEach } from "vitest";
 // Minimal VaultAdapter stub — bridge methods won't be called in this test
 // because we don't start the bridge.
 const stubVault = {
+  getFiles: () => [],
   getEntryByPath: () => null,
   readText: async () => "",
   readBinary: async () => new ArrayBuffer(0),
@@ -33,13 +38,14 @@ const stubVault = {
   createDirectory: async () => {},
 };
 
-// Minimal bridge stub — we only need setDb and stop; startChangesListener is
-// not exercised here because the bridge is never started.
+// Minimal bridge stub — we only need setDb, stop, and wipeLocalFiles; the
+// bridge is never started in this test.
 function makeStubBridge() {
   return {
     start: () => {},
     stop: () => {},
     setDb: (_db: unknown) => {},
+    wipeLocalFiles: async () => {},
   };
 }
 
@@ -143,4 +149,99 @@ describe("replaceLocalFromServer() — real PouchDB regression", () => {
     expect(info).toBeDefined();
     await (dir2Db as unknown as { destroy(): Promise<void> }).destroy();
   });
+});
+
+// ---- Wipe-and-pull integration test (real CouchDB) -------------------------
+// Skipped unless COUCHDB_URL is set, e.g.:
+//   COUCHDB_URL=http://admin:devpass@localhost:5985 npm test
+
+const COUCH_URL = process.env["COUCHDB_URL"];
+
+describe.skipIf(!COUCH_URL)("replaceLocalFromServer() — wipe-and-pull real CouchDB", () => {
+  const couchBase = COUCH_URL ?? "http://admin:devpass@localhost:5985";
+  const dbName = "vault-sync-wipe-test";
+  const remoteUrl = `${couchBase}/${dbName}`;
+
+  afterEach(async () => {
+    // Clean up test DB
+    try {
+      const PouchDB = require("pouchdb-node") as typeof import("pouchdb-node");
+      const remote = new PouchDB(remoteUrl);
+      await (remote as unknown as { destroy(): Promise<void> }).destroy();
+    } catch {
+      // ignore
+    }
+  });
+
+  it("wipes LOCAL-ONLY orphan, pulls server docs, leaves excluded path untouched", async () => {
+    const PouchDB = require("pouchdb-node") as typeof import("pouchdb-node");
+    const { PouchDbFsBridge } = await import("../src/PouchDbFsBridge");
+    const { PouchDbSyncEngine } = await import("../src/PouchDbSyncEngine");
+    const { FilesystemVaultAdapter } = await import("./VaultAdapter");
+    const { FsWatcher } = await import("./FsWatcher");
+
+    // -- 1. Seed a text doc in the remote CouchDB --
+    const remote = new PouchDB(remoteUrl);
+    await (remote as unknown as PouchDB).put({ _id: "file/server-note.md", content: "from server", mtime: 1000 });
+
+    // -- 2. Set up local vault dir --
+    const vaultDir = makeTempDir();
+    const pouchDir = makeTempDir();
+
+    // Create a LOCAL-ONLY orphan file (not on server)
+    const orphanPath = path.join(vaultDir, "orphan-local.md");
+    fs.writeFileSync(orphanPath, "I am local only");
+
+    // Create an excluded file (.obsidian/) that must survive
+    const obsidianDir = path.join(vaultDir, ".obsidian");
+    fs.mkdirSync(obsidianDir, { recursive: true });
+    const obsidianFile = path.join(obsidianDir, "app.json");
+    fs.writeFileSync(obsidianFile, '{"theme":"default"}');
+
+    // -- 3. Create local PouchDB, bridge, engine --
+    const settings = {
+      couchDbUrl: couchBase,
+      couchDbName: dbName,
+      couchDbUser: "",
+      couchDbPassword: "",
+      excludePatterns: [".obsidian/"],
+    };
+
+    const vaultAdapter = new FilesystemVaultAdapter(vaultDir);
+    let callCount = 0;
+    const dbFactory = () => {
+      callCount++;
+      return new PouchDB(pouchDir) as unknown as import("../src/pouchdb-browser").default;
+    };
+    const db = dbFactory();
+    const bridge = new PouchDbFsBridge(vaultAdapter, db as never);
+
+    // Start the bridge with a real FsWatcher so the PouchDB changes listener is
+    // active: replicated docs from the server will be applied to disk.
+    const excludePatterns = [".obsidian/"];
+    const fsWatcher = new FsWatcher(vaultDir, excludePatterns);
+    bridge.start(fsWatcher);
+
+    const engine = new PouchDbSyncEngine(settings, db as never, bridge as never, dbFactory as never);
+
+    await engine.replaceLocalFromServer();
+
+    // Allow the bridge's change listener callbacks (fire-and-forget applyRemoteChange
+    // calls) to complete before asserting on the filesystem state.
+    await new Promise((r) => setTimeout(r, 500));
+
+    engine.stop();
+
+    // -- 4. Assert: orphan file GONE --
+    expect(fs.existsSync(orphanPath)).toBe(false);
+
+    // -- 5. Assert: excluded path (.obsidian/) untouched --
+    expect(fs.existsSync(obsidianFile)).toBe(true);
+    expect(fs.readFileSync(obsidianFile, "utf-8")).toBe('{"theme":"default"}');
+
+    // -- 6. Assert: server doc present on disk after pull --
+    const pulledFile = path.join(vaultDir, "server-note.md");
+    expect(fs.existsSync(pulledFile)).toBe(true);
+    expect(fs.readFileSync(pulledFile, "utf-8")).toBe("from server");
+  }, 30_000);
 });

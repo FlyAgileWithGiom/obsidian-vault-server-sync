@@ -518,36 +518,29 @@ export class PouchDbFsBridge {
   }
 
   /**
-   * Delete local vault files whose doc-ids are absent from the server's authoritative set.
+   * Delete all local vault files not matched by the exclude predicate.
    *
-   * Called after replaceLocalFromServer() completes the initial pull.  At that
-   * point local PouchDB contains only TEXT docs (binary backfill runs later via
-   * live db.sync), so we cannot use local db.allDocs as the keep-set — it would
-   * miss every binary file and delete all of them.  The caller must provide the
-   * keep-set from the SERVER's _all_docs (text + binary).
+   * Called at the start of replaceLocalFromServer(), BEFORE the local PouchDB is
+   * destroyed and re-pulled from the server.  Wiping first means we never need to
+   * fetch the server's _all_docs to know what to keep — the fresh initial pull
+   * recreates everything authoritatively.
    *
    * Safety rules:
    *   - Only touches files returned by vault.getFiles() (vault-managed files only).
-   *   - Skips any path where isExcluded returns true.
-   *   - Sets the echo-suppression sentinel BEFORE vault.deleteFile() so the FS
-   *     watcher does not push a phantom delete back into PouchDB.
+   *   - Skips any path where isExcluded returns true (.obsidian/, .trash/, .git/, …).
+   *   - Sets the echo-suppression sentinel to "" BEFORE vault.deleteFile() so the
+   *     FS watcher does not push a phantom tombstone back into PouchDB.
    *
-   * @param keepDocIds  Full set of doc-ids present on the server (text + binary).
    * @param isExcluded  Predicate wrapping the caller's exclude-patterns list.
    */
-  async pruneOrphans(
-    keepDocIds: Set<string>,
-    isExcluded: (relPath: string) => boolean,
-  ): Promise<void> {
+  async wipeLocalFiles(isExcluded: (relPath: string) => boolean): Promise<void> {
     const files = this.vault.getFiles();
     for (const file of files) {
       if (isExcluded(file.path)) continue;
       const docId = pathToDocId(file.path);
-      if (!keepDocIds.has(docId)) {
-        // Set sentinel BEFORE delete so the FS watcher does not re-push the file.
-        this.setAppliedRev(docId, "");
-        await this.vault.deleteFile(file);
-      }
+      // Set sentinel BEFORE delete so the FS watcher does not re-push the file.
+      this.setAppliedRev(docId, "");
+      await this.vault.deleteFile(file);
     }
   }
 }

@@ -999,9 +999,9 @@ describe("PouchDbFsBridge — LWW conflict resolution (resolveConflictsByMtime)"
   });
 });
 
-// ---- pruneOrphans() ---------------------------------------------------------
+// ---- wipeLocalFiles() -------------------------------------------------------
 
-describe("PouchDbFsBridge — pruneOrphans()", () => {
+describe("PouchDbFsBridge — wipeLocalFiles()", () => {
   function makeBridge() {
     const db = makePouchMock();
     const vault = makeVaultMock();
@@ -1011,57 +1011,39 @@ describe("PouchDbFsBridge — pruneOrphans()", () => {
     return { bridge, vault, db };
   }
 
-  it("deletes a vault file whose docId is absent from the keep-set", async () => {
+  it("deletes a normal vault file when not excluded", async () => {
     const { bridge, vault } = makeBridge();
-    vault._addText("orphan.md", "stale content");
-    // Keep-set does NOT include "file/orphan.md"
-    await bridge.pruneOrphans(new Set(["file/other.md"]), () => false);
-    expect(vault._getText("orphan.md")).toBeUndefined();
+    vault._addText("notes.md", "some content");
+    await bridge.wipeLocalFiles(() => false);
+    expect(vault._getText("notes.md")).toBeUndefined();
   });
 
-  it("keeps a vault file whose docId is in the keep-set", async () => {
-    const { bridge, vault } = makeBridge();
-    vault._addText("kept.md", "important");
-    await bridge.pruneOrphans(new Set(["file/kept.md"]), () => false);
-    expect(vault._getText("kept.md")).toBe("important");
-  });
-
-  it("skips files matched by the isExcluded predicate even if absent from keep-set", async () => {
+  it("skips files matched by the isExcluded predicate (.obsidian/app.json)", async () => {
     const { bridge, vault } = makeBridge();
     vault._addText(".obsidian/app.json", "{}");
-    await bridge.pruneOrphans(new Set([]), (p) => p.startsWith(".obsidian"));
-    // .obsidian/app.json must survive because it is excluded
+    await bridge.wipeLocalFiles((p) => p.startsWith(".obsidian"));
     expect(vault._getText(".obsidian/app.json")).toBe("{}");
-  });
-
-  it("handles binary files — deletes binary orphan absent from keep-set", async () => {
-    const { bridge, vault } = makeBridge();
-    const buf = new ArrayBuffer(4);
-    await vault.createBinary("photo.png", buf);
-    await bridge.pruneOrphans(new Set([]), () => false);
-    expect(vault._getBinary("photo.png")).toBeUndefined();
-  });
-
-  it("keeps binary files present in the keep-set", async () => {
-    const { bridge, vault } = makeBridge();
-    const buf = new ArrayBuffer(4);
-    await vault.createBinary("photo.png", buf);
-    await bridge.pruneOrphans(new Set(["file/photo.png"]), () => false);
-    expect(vault._getBinary("photo.png")).toBe(buf);
   });
 
   it("does nothing when vault has no files", async () => {
     const { bridge } = makeBridge();
-    // Should resolve without throwing
-    await expect(bridge.pruneOrphans(new Set([]), () => false)).resolves.toBeUndefined();
+    await expect(bridge.wipeLocalFiles(() => false)).resolves.toBeUndefined();
   });
 
-  it("deletes only orphans when vault has a mix of kept and orphaned files", async () => {
+  it("deletes binary files", async () => {
     const { bridge, vault } = makeBridge();
-    vault._addText("kept.md", "keep me");
-    vault._addText("orphan.md", "delete me");
-    await bridge.pruneOrphans(new Set(["file/kept.md"]), () => false);
-    expect(vault._getText("kept.md")).toBe("keep me");
-    expect(vault._getText("orphan.md")).toBeUndefined();
+    const buf = new ArrayBuffer(4);
+    await vault.createBinary("photo.png", buf);
+    await bridge.wipeLocalFiles(() => false);
+    expect(vault._getBinary("photo.png")).toBeUndefined();
+  });
+
+  it("deletes all non-excluded files when vault has a mix", async () => {
+    const { bridge, vault } = makeBridge();
+    vault._addText("notes.md", "delete me");
+    vault._addText(".obsidian/app.json", "keep me");
+    await bridge.wipeLocalFiles((p) => p.startsWith(".obsidian"));
+    expect(vault._getText("notes.md")).toBeUndefined();
+    expect(vault._getText(".obsidian/app.json")).toBe("keep me");
   });
 });
