@@ -53,7 +53,12 @@ const pouchDir = path.join(os.tmpdir(), "vault-sync-dry-run-pouch");
 
 console.log(`[vault-sync] Converter ${dryRun ? "DRY-RUN" : "LIVE"} on: ${absStatePath}`);
 if (remoteUrl) {
-  console.log(`[vault-sync] Remote phantom check: ${remoteUrl}`);
+  // Strip any user:pass@ from the URL before logging — an operator-supplied
+  // --remote can carry inline credentials that would otherwise hit stdout/logs.
+  const sanitized = new URL(remoteUrl);
+  sanitized.username = "";
+  sanitized.password = "";
+  console.log(`[vault-sync] Remote phantom check: ${sanitized.href}`);
 }
 
 /**
