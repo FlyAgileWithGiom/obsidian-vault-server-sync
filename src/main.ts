@@ -272,19 +272,36 @@ export default class VaultSyncPlugin extends Plugin {
     // Migrate data.json to .vault-sync.json when any meaningful setting is present.
     // Guard is intentionally broad: users who keep the default URL but have credentials
     // or a DB name set must still be migrated so BRAT upgrades don't wipe their settings.
+    // Computed from the data.json-merged values, BEFORE applySecretStore() resolves
+    // env/store precedence — so the decision to migrate is unaffected by where the
+    // credential ultimately came from.
     const hasMeaningfulSettings =
       (this.settings.couchDbName && this.settings.couchDbName !== DEFAULT_SETTINGS.couchDbName) ||
       (this.settings.couchDbUser && this.settings.couchDbUser !== DEFAULT_SETTINGS.couchDbUser) ||
       (this.settings.couchDbPassword && this.settings.couchDbPassword !== DEFAULT_SETTINGS.couchDbPassword);
+
+    // Run Phase A FIRST: durably copy any legacy in-vault secret into the store
+    // (write-new) before we write .vault-sync.json. With the store available this
+    // guarantees the secret is preserved out-of-vault, so the migration write can
+    // safely omit it instead of leaking credentials into the synced file (CWE-312).
+    await this.applySecretStore();
+
     if (hasMeaningfulSettings) {
+      // When the secret store is available the secret now lives there, so strip
+      // couchDbUser/couchDbPassword from the synced file. When the store is
+      // unavailable (Obsidian < 1.11.4 / feature absent), keep the legacy in-vault
+      // credential — stripping it would lose it entirely → auth lockout (invariant 7).
+      let toWrite: object = this.settings;
+      if (this.getSecretStore().isAvailable()) {
+        const { couchDbUser: _user, couchDbPassword: _password, ...nonSecret } = this.settings;
+        toWrite = nonSecret;
+      }
       await this.app.vault.adapter.write(
         VAULT_SYNC_CONFIG_FILE,
-        JSON.stringify(this.settings, null, 2)
+        JSON.stringify(toWrite, null, 2)
       );
       await this.saveData({});
     }
-
-    await this.applySecretStore();
   }
 
   /**

@@ -197,6 +197,7 @@ describe("VaultSyncPlugin.loadSettings", () => {
   it("migrates data.json to .vault-sync.json when user has credentials even if couchDbUrl is default", async () => {
     // Bug: previous migration guard was `couchDbUrl !== DEFAULT_SETTINGS.couchDbUrl`.
     // A user keeping the default URL but with credentials set would never migrate → settings lost on BRAT upgrade.
+    // The guard must still fire on credentials alone (default URL kept).
     const legacyData = {
       couchDbUrl: DEFAULT_SETTINGS.couchDbUrl, // default URL kept
       couchDbName: "vault-obsidiannotes",
@@ -208,11 +209,15 @@ describe("VaultSyncPlugin.loadSettings", () => {
 
     await plugin.loadSettings();
 
-    // Should have written to .vault-sync.json despite default URL
+    // Migration fired despite the default URL...
     const written = plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE);
     expect(written).toBeDefined();
     const parsed = JSON.parse(written!);
-    expect(parsed.couchDbUser).toBe("alice");
+    expect(parsed.couchDbName).toBe("vault-obsidiannotes");
+    // ...but with secretStorage AVAILABLE (the makePlugin default), the secret is
+    // NOT written into the synced file (CWE-312) — it lives in the store instead.
+    expect(parsed.couchDbUser).toBeUndefined();
+    expect(parsed.couchDbPassword).toBeUndefined();
 
     // data.json cleared
     expect(plugin.saveData).toHaveBeenCalledWith({});
@@ -355,6 +360,77 @@ describe("VaultSyncPlugin.loadSettings — secret store precedence (#78)", () =>
     // Store value preserved (write-new only).
     expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_USER)).toBe("store-user");
     expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_PASSWORD)).toBe("store-pass");
+  });
+});
+
+// ---- Secret store: data.json → .vault-sync.json migration write must not leak the secret (CWE-312, #78) ----
+
+describe("VaultSyncPlugin.loadSettings — data.json migration write does not leak the secret (#78)", () => {
+  let plugin: VaultSyncPlugin;
+
+  beforeEach(() => {
+    plugin = makePlugin();
+  });
+
+  function secretStorage(plugin: VaultSyncPlugin): SecretStorage {
+    return (plugin as unknown as { app: { secretStorage: SecretStorage } }).app.secretStorage;
+  }
+
+  const legacyData = {
+    couchDbUrl: "https://couch.example.com",
+    couchDbName: "vault-mine",
+    couchDbUser: "alice",
+    couchDbPassword: "hunter2",
+    excludePatterns: [".trash/"],
+  };
+
+  it("store AVAILABLE: writes a secret-stripped .vault-sync.json and copies the secret into the store", async () => {
+    (plugin.loadData as ReturnType<typeof vi.fn>).mockResolvedValue({ ...legacyData });
+
+    await plugin.loadSettings();
+
+    // The synced file carries non-secret config but NOT the credentials (CWE-312).
+    const written = plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE);
+    expect(written).toBeDefined();
+    const parsed = JSON.parse(written!);
+    expect(parsed.couchDbUrl).toBe("https://couch.example.com");
+    expect(parsed.couchDbName).toBe("vault-mine");
+    expect(parsed.couchDbUser).toBeUndefined();
+    expect(parsed.couchDbPassword).toBeUndefined();
+
+    // The secret is durably held in the store instead — nothing lost.
+    expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_USER)).toBe("alice");
+    expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_PASSWORD)).toBe("hunter2");
+
+    // The engine boundary is unchanged: in-memory settings still carry the creds.
+    expect(plugin.settings.couchDbUser).toBe("alice");
+    expect(plugin.settings.couchDbPassword).toBe("hunter2");
+
+    // data.json cleared as part of the migration.
+    expect(plugin.saveData).toHaveBeenCalledWith({});
+  });
+
+  it("store UNAVAILABLE (feature-absent): keeps the legacy secret in the written file — graceful fallback, nothing lost", async () => {
+    // Simulate an Obsidian runtime without secretStorage (pre-1.11.4 / sideload):
+    // getSecretStore() feature-detects an absent store and degrades to isAvailable() === false.
+    delete (plugin as unknown as { app: { secretStorage?: SecretStorage } }).app.secretStorage;
+    (plugin.loadData as ReturnType<typeof vi.fn>).mockResolvedValue({ ...legacyData });
+
+    await plugin.loadSettings();
+
+    // No store to hold the secret → the migration write MUST keep the legacy
+    // in-vault credential, otherwise it is lost entirely (auth lockout, invariant 7).
+    const written = plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE);
+    expect(written).toBeDefined();
+    const parsed = JSON.parse(written!);
+    expect(parsed.couchDbUser).toBe("alice");
+    expect(parsed.couchDbPassword).toBe("hunter2");
+
+    // And the resolved in-memory creds are non-empty — nothing lost.
+    expect(plugin.settings.couchDbUser).toBe("alice");
+    expect(plugin.settings.couchDbPassword).toBe("hunter2");
+
+    expect(plugin.saveData).toHaveBeenCalledWith({});
   });
 });
 
