@@ -188,6 +188,10 @@ function makeVaultMock() {
       if (textFiles.has(path)) return textFiles.get(path)!.file;
       if (binaryFiles.has(path)) return binaryFiles.get(path)!.file;
       if (dirs.has(path)) return { kind: "folder", path } as VaultFolder;
+      // Implicit folder: any file lives under this path.
+      const prefix = path + "/";
+      for (const p of textFiles.keys()) if (p.startsWith(prefix)) return { kind: "folder", path } as VaultFolder;
+      for (const p of binaryFiles.keys()) if (p.startsWith(prefix)) return { kind: "folder", path } as VaultFolder;
       return null;
     },
 
@@ -230,7 +234,12 @@ function makeVaultMock() {
       binaryFiles.delete(file.path);
     },
 
-    async deleteDirectory(_dir: VaultFolder): Promise<void> {},
+    async deleteDirectory(dir: VaultFolder): Promise<void> {
+      const prefix = dir.path + "/";
+      for (const p of [...textFiles.keys()]) if (p === dir.path || p.startsWith(prefix)) textFiles.delete(p);
+      for (const p of [...binaryFiles.keys()]) if (p === dir.path || p.startsWith(prefix)) binaryFiles.delete(p);
+      dirs.delete(dir.path);
+    },
 
     async isDirectoryEmpty(_path: string): Promise<boolean> { return true; },
 
@@ -1045,5 +1054,44 @@ describe("PouchDbFsBridge — wipeLocalFiles()", () => {
     await bridge.wipeLocalFiles((p) => p.startsWith(".obsidian"));
     expect(vault._getText("notes.md")).toBeUndefined();
     expect(vault._getText(".obsidian/app.json")).toBe("keep me");
+  });
+
+  it("bulk-deletes a top-level folder via deleteDirectory, not per inner file", async () => {
+    const { bridge, vault } = makeBridge();
+    vault._addText("Archives/2024/a.md", "x");
+    vault._addText("Archives/b.md", "y");
+    const dirSpy = vi.spyOn(vault, "deleteDirectory");
+    const fileSpy = vi.spyOn(vault, "deleteFile");
+    await bridge.wipeLocalFiles(() => false);
+    expect(dirSpy).toHaveBeenCalledWith(expect.objectContaining({ kind: "folder", path: "Archives" }));
+    expect(fileSpy).not.toHaveBeenCalled(); // folder removed in one call, no per-file deletes
+    expect(vault._getText("Archives/2024/a.md")).toBeUndefined();
+    expect(vault._getText("Archives/b.md")).toBeUndefined();
+  });
+
+  it("does NOT delete an excluded top-level folder but bulk-deletes the others", async () => {
+    const { bridge, vault } = makeBridge();
+    vault._addText("Notes/keep.md", "del");
+    vault._addText(".obsidian/app.json", "{}");
+    const dirSpy = vi.spyOn(vault, "deleteDirectory");
+    await bridge.wipeLocalFiles((p) => p.startsWith(".obsidian"));
+    expect(vault._getText(".obsidian/app.json")).toBe("{}"); // excluded folder untouched
+    expect(vault._getText("Notes/keep.md")).toBeUndefined();
+    const dirPaths = dirSpy.mock.calls.map((c) => (c[0] as VaultFolder).path);
+    expect(dirPaths).toContain("Notes");
+    expect(dirPaths).not.toContain(".obsidian");
+  });
+
+  it("falls back to per-file deletion for a folder with a nested-excluded path", async () => {
+    const { bridge, vault } = makeBridge();
+    vault._addText("Work/report.md", "del");
+    vault._addText("Work/private/secret.md", "keep");
+    const dirSpy = vi.spyOn(vault, "deleteDirectory");
+    const fileSpy = vi.spyOn(vault, "deleteFile");
+    await bridge.wipeLocalFiles((p) => p.startsWith("Work/private"));
+    expect(dirSpy).not.toHaveBeenCalled(); // nested exclusion blocks the bulk delete
+    expect(fileSpy).toHaveBeenCalled();
+    expect(vault._getText("Work/report.md")).toBeUndefined(); // non-excluded removed
+    expect(vault._getText("Work/private/secret.md")).toBe("keep"); // nested exclusion preserved
   });
 });

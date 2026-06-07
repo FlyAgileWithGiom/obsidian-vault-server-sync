@@ -56,6 +56,14 @@ export class PouchDbFsBridge {
   private appliedRevs: Map<string, string> = new Map();
   /** Handle for the PouchDB changes listener, so it can be cancelled on stop. */
   private changesHandle: { cancel(): void } | null = null;
+  /**
+   * When true, all vault->PouchDB event handling is suspended. Set during
+   * replaceLocalFromServer (wipe + initial pull) so the bulk wipe's FS delete
+   * events — and the pull's FS write events — never propagate back to PouchDB,
+   * and thus never push deletions/edits upstream. "Replace from server" means the
+   * server is authoritative for the whole operation.
+   */
+  private suppressVaultEvents = false;
 
   constructor(
     private readonly vault: VaultAdapter,
@@ -109,9 +117,21 @@ export class PouchDbFsBridge {
     }
   }
 
+  /**
+   * Suspend or resume vault->PouchDB event handling. Used by
+   * PouchDbSyncEngine.replaceLocalFromServer to ignore all local FS events for
+   * the duration of a wipe-and-pull (server is authoritative).
+   */
+  setSuppressVaultEvents(suppress: boolean): void {
+    this.suppressVaultEvents = suppress;
+  }
+
   // --- Vault -> PouchDB ---
 
   private onVaultEvent(event: FileEvent): void {
+    // Fully suspended during replaceLocalFromServer (wipe + pull): ignore all
+    // local FS events so neither the bulk wipe nor the pull leaks back to PouchDB.
+    if (this.suppressVaultEvents) return;
     if (event.type === "delete") {
       const docId = pathToDocId(event.path);
       // For deletes, check the sentinel too: if bridge just applied a remote
@@ -535,12 +555,46 @@ export class PouchDbFsBridge {
    */
   async wipeLocalFiles(isExcluded: (relPath: string) => boolean): Promise<void> {
     const files = this.vault.getFiles();
-    for (const file of files) {
-      if (isExcluded(file.path)) continue;
-      const docId = pathToDocId(file.path);
-      // Set sentinel BEFORE delete so the FS watcher does not re-push the file.
-      this.setAppliedRev(docId, "");
-      await this.vault.deleteFile(file);
+
+    // Partition into root-level files and the set of top-level directory names.
+    const rootFiles: import("./types").VaultFile[] = [];
+    const topDirs = new Set<string>();
+    for (const f of files) {
+      const slash = f.path.indexOf("/");
+      if (slash === -1) rootFiles.push(f);
+      else topDirs.add(f.path.slice(0, slash));
+    }
+
+    // Root files: delete individually (skip excluded).
+    for (const f of rootFiles) {
+      if (isExcluded(f.path)) continue;
+      await this.vault.deleteFile(f);
+    }
+
+    // Top-level directories: ONE recursive delete each — dozens of calls instead of
+    // thousands of per-file deletes. A directory is bulk-deleted only when neither it
+    // nor anything inside it is excluded; otherwise its files are removed individually
+    // so nested exclusions (e.g. "Folder/private/") are honoured.
+    for (const dir of topDirs) {
+      if (isExcluded(dir)) continue; // whole directory excluded
+      const dirFiles = files.filter(
+        (f) => f.path === dir || f.path.startsWith(dir + "/"),
+      );
+      const hasExcludedInside = dirFiles.some((f) => isExcluded(f.path));
+      if (hasExcludedInside) {
+        for (const f of dirFiles) {
+          if (isExcluded(f.path)) continue;
+          await this.vault.deleteFile(f);
+        }
+        continue;
+      }
+      const entry = this.vault.getEntryByPath(dir);
+      if (entry && entry.kind === "folder") {
+        await this.vault.deleteDirectory(entry);
+      } else {
+        // No folder entry (unexpected) — fall back to per-file deletion.
+        for (const f of dirFiles) await this.vault.deleteFile(f);
+      }
     }
   }
 }

@@ -180,17 +180,27 @@ describe.skipIf(!COUCH_URL)("replaceLocalFromServer() — wipe-and-pull real Cou
     const { FilesystemVaultAdapter } = await import("./VaultAdapter");
     const { FsWatcher } = await import("./FsWatcher");
 
-    // -- 1. Seed a text doc in the remote CouchDB --
+    // -- 1. Seed the remote CouchDB: one root doc + one doc inside a folder --
     const remote = new PouchDB(remoteUrl);
     await (remote as unknown as PouchDB).put({ _id: "file/server-note.md", content: "from server", mtime: 1000 });
+    await (remote as unknown as PouchDB).put({ _id: "file/Notes/server-nested.md", content: "nested from server", mtime: 1000 });
+
+    // Capture the authoritative server doc set BEFORE the replace (server-safety baseline).
+    const serverIdsBefore = (await (remote as unknown as PouchDB).allDocs()).rows.map((r) => r.id).sort();
 
     // -- 2. Set up local vault dir --
     const vaultDir = makeTempDir();
     const pouchDir = makeTempDir();
 
-    // Create a LOCAL-ONLY orphan file (not on server)
+    // Create a LOCAL-ONLY orphan file at root (not on server)
     const orphanPath = path.join(vaultDir, "orphan-local.md");
     fs.writeFileSync(orphanPath, "I am local only");
+
+    // Create a LOCAL-ONLY orphan FOLDER (exercises the bulk deleteDirectory path)
+    const orphanDir = path.join(vaultDir, "OldStuff");
+    fs.mkdirSync(orphanDir, { recursive: true });
+    fs.writeFileSync(path.join(orphanDir, "a.md"), "old a");
+    fs.writeFileSync(path.join(orphanDir, "b.md"), "old b");
 
     // Create an excluded file (.obsidian/) that must survive
     const obsidianDir = path.join(vaultDir, ".obsidian");
@@ -232,16 +242,27 @@ describe.skipIf(!COUCH_URL)("replaceLocalFromServer() — wipe-and-pull real Cou
 
     engine.stop();
 
-    // -- 4. Assert: orphan file GONE --
+    // -- 4. Assert: local-only orphans GONE (root file + bulk-deleted folder) --
     expect(fs.existsSync(orphanPath)).toBe(false);
+    expect(fs.existsSync(orphanDir)).toBe(false);
 
     // -- 5. Assert: excluded path (.obsidian/) untouched --
     expect(fs.existsSync(obsidianFile)).toBe(true);
     expect(fs.readFileSync(obsidianFile, "utf-8")).toBe('{"theme":"default"}');
 
-    // -- 6. Assert: server doc present on disk after pull --
+    // -- 6. Assert: server docs present on disk after pull (root + nested) --
     const pulledFile = path.join(vaultDir, "server-note.md");
     expect(fs.existsSync(pulledFile)).toBe(true);
     expect(fs.readFileSync(pulledFile, "utf-8")).toBe("from server");
+    const pulledNested = path.join(vaultDir, "Notes", "server-nested.md");
+    expect(fs.existsSync(pulledNested)).toBe(true);
+
+    // -- 7. SERVER SAFETY: the server doc set must be UNCHANGED — the local wipe
+    //       must never push deletions upstream. (Re-open the remote handle fresh.)
+    const remoteAfter = new PouchDB(remoteUrl);
+    const serverIdsAfter = (await (remoteAfter as unknown as PouchDB).allDocs()).rows.map((r) => r.id).sort();
+    expect(serverIdsAfter).toEqual(serverIdsBefore);
+    expect(serverIdsAfter).toContain("file/server-note.md");
+    expect(serverIdsAfter).toContain("file/Notes/server-nested.md");
   }, 30_000);
 });

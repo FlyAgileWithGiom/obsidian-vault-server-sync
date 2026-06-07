@@ -89,7 +89,7 @@ function makeMockDb(docCount = 0) {
 }
 
 function makeMockBridge() {
-  return { start: vi.fn(), stop: vi.fn(), setDb: vi.fn(), wipeLocalFiles: vi.fn().mockResolvedValue(undefined) };
+  return { start: vi.fn(), stop: vi.fn(), setDb: vi.fn(), wipeLocalFiles: vi.fn().mockResolvedValue(undefined), setSuppressVaultEvents: vi.fn() };
 }
 
 function makeSettings(): VaultSyncSettings {
@@ -758,6 +758,22 @@ describe("PouchDbSyncEngine — replaceLocalFromServer()", () => {
     expect(isExcluded(".git/config")).toBe(true);
     // non-excluded paths pass through
     expect(isExcluded("notes.md")).toBe(false);
+  });
+
+  it("suspends vault events for the whole replace: ON before wipe, OFF after pull", async () => {
+    const { engine, bridge } = makeEngine({ docCount: 5 });
+    engine.register(makePlugin());
+    await engine.replaceLocalFromServer();
+    const suppress = bridge.setSuppressVaultEvents as ReturnType<typeof vi.fn>;
+    // Called with true (suspend) then false (resume).
+    expect(suppress).toHaveBeenCalledWith(true);
+    expect(suppress).toHaveBeenCalledWith(false);
+    const onOrder = suppress.mock.invocationCallOrder[0];   // true
+    const offOrder = suppress.mock.invocationCallOrder[1];  // false
+    const wipeOrder = (bridge.wipeLocalFiles as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    // Suspend before the wipe; resume only after wipe (and the pull) completed.
+    expect(onOrder).toBeLessThan(wipeOrder);
+    expect(offOrder).toBeGreaterThan(wipeOrder);
   });
 });
 

@@ -108,7 +108,10 @@ export class FilesystemVaultAdapter implements VaultAdapter {
   }
 
   async deleteDirectory(dir: VaultFolder): Promise<void> {
-    await fs.promises.rmdir(this.abs(dir.path));
+    // Recursive: matches ObsidianVaultAdapter (vault.delete on a folder removes its
+    // contents too). The sole caller is wipeLocalFiles, which deletes whole folders.
+    // Plain rmdir throws ENOTEMPTY on non-empty dirs; rm({recursive}) does not.
+    await fs.promises.rm(this.abs(dir.path), { recursive: true, force: true });
   }
 
   async isDirectoryEmpty(relativePath: string): Promise<boolean> {

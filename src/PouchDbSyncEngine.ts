@@ -242,27 +242,39 @@ export class PouchDbSyncEngine {
     this.initialPullRunning = false;
     this.setState("syncing");
 
-    // Wipe local vault files BEFORE destroying the DB.
-    // The plugin's DEFAULT_SETTINGS already excludes .trash/, .obsidian/,
-    // .vault-sync-state.json, and .vault-sync.json.  Add .git for Git repos.
-    const excludePatterns = [".git", ...this.settings.excludePatterns];
-    await this.bridge.wipeLocalFiles(
-      (relPath) => isPathExcluded(relPath, excludePatterns),
-    );
-
+    // Suspend vault->PouchDB event handling for the WHOLE operation. The bulk wipe
+    // fires an FS delete event per file, and the pull fires FS write events; none
+    // must propagate back to PouchDB, or the wipe could push deletions UPSTREAM to
+    // the server (catastrophic) and the pull would echo-write. The server is
+    // authoritative during a replace. Cleared in finally once the pull has settled.
+    this.bridge.setSuppressVaultEvents(true);
     try {
-      await (this.db as unknown as { destroy(): Promise<void> }).destroy();
-    } catch (e) {
-      // Non-fatal: log and continue — we are creating a fresh instance regardless.
-      console.warn("[vault-sync] replaceLocalFromServer: db.destroy() failed:", e);
+      // Wipe local vault files BEFORE destroying the DB.
+      // The plugin's DEFAULT_SETTINGS already excludes .trash/, .obsidian/,
+      // .vault-sync-state.json, and .vault-sync.json.  Add .git for Git repos.
+      const excludePatterns = [".git", ...this.settings.excludePatterns];
+      await this.bridge.wipeLocalFiles(
+        (relPath) => isPathExcluded(relPath, excludePatterns),
+      );
+
+      try {
+        await (this.db as unknown as { destroy(): Promise<void> }).destroy();
+      } catch (e) {
+        // Non-fatal: log and continue — we are creating a fresh instance regardless.
+        console.warn("[vault-sync] replaceLocalFromServer: db.destroy() failed:", e);
+      }
+      // Recreate the db and propagate the new instance to the bridge so its
+      // changes listener and all subsequent db.put/db.get calls use the fresh db.
+      this.db = this.dbFactory();
+      this.bridge.setDb(this.db);
+      this.started = true;
+      await this.runInitialPull();
+      // runInitialPull's complete handler calls startLiveSync() + setState("ok").
+    } finally {
+      // Resume normal vault->PouchDB handling. The pull's own writes are covered by
+      // the per-doc echo sentinel set in applyRemoteChange, so steady state is safe.
+      this.bridge.setSuppressVaultEvents(false);
     }
-    // Recreate the db and propagate the new instance to the bridge so its
-    // changes listener and all subsequent db.put/db.get calls use the fresh db.
-    this.db = this.dbFactory();
-    this.bridge.setDb(this.db);
-    this.started = true;
-    await this.runInitialPull();
-    // runInitialPull's complete handler calls startLiveSync() + setState("ok").
   }
 
   isRunning(): boolean {
