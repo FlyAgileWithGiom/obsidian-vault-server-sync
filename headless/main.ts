@@ -12,6 +12,15 @@ import { reconcile } from "./reconcile";
 import { pathToDocId } from "../src/doc-id";
 import { isBinaryPath } from "../src/binary-ext";
 import { isPathExcluded } from "./exclude";
+import type { SecretStore } from "../src/secret-store";
+import {
+  resolveSecret,
+  SECRET_ID_COUCH_USER,
+  SECRET_ID_COUCH_PASSWORD,
+  ENV_COUCH_USER,
+  ENV_COUCH_PASSWORD,
+} from "../src/secret-store";
+import { KeychainSecretStore } from "./keychain-secret-store";
 
 /**
  * Build a RemoteDbForPhantomCheck that uses node:http or node:https directly.
@@ -166,32 +175,137 @@ const ALWAYS_EXCLUDED = [
   ".trash/",
 ];
 
-function loadConfig(vaultRoot: string): VaultSyncSettings {
+/**
+ * Load the daemon config, resolving credentials by precedence (#78):
+ *   env (VAULT_SYNC_COUCH_USER/PASSWORD) > secret store (Keychain) > legacy in-vault.
+ *
+ * The .vault-sync.json FILE remains the only source of couchDbUrl/couchDbName, so
+ * a missing/unparseable file is still a hard error (process.exit(1)) — UNCHANGED.
+ * Secret resolution happens AFTER a successful parse and NEVER exits/throws on a
+ * missing secret: with no credential anywhere, couchDbUser/couchDbPassword stay
+ * empty, the remote-URL builder produces a credential-less URL, and CouchDB
+ * returns a plain 401 → the existing skip-on-fetch-fail path skips reconcile.
+ * It must never escalate to a destructive tombstone-everything resync (invariant 8).
+ *
+ * Phase A (additive, automatic): if the store lacks a credential the legacy
+ * in-vault value is present for, copy it into the store (write-new). The file is
+ * never mutated here — Phase B (--scrub-secrets) owns deletion.
+ *
+ * store and env are injected for testing; production defaults to the macOS
+ * Keychain store and process.env.
+ */
+export async function loadConfig(
+  vaultRoot: string,
+  opts: { store?: SecretStore; env?: Record<string, string | undefined> } = {},
+): Promise<VaultSyncSettings> {
+  const store = opts.store ?? new KeychainSecretStore();
+  const env = opts.env ?? process.env;
+
   const configPath = path.join(vaultRoot, CONFIG_FILENAME);
+
+  // The file is the only source of couchDbUrl/couchDbName — missing/unparseable
+  // is a hard error. Keep this exit path strictly separate from secret resolution.
+  let merged: VaultSyncSettings;
   try {
     const raw = fs.readFileSync(configPath, "utf-8");
     const userConfig = JSON.parse(raw);
-    const merged = { ...DEFAULT_SETTINGS, ...userConfig };
-    // Ensure ALWAYS_EXCLUDED patterns are in excludePatterns even if user
-    // didn't list them. Avoids the bug where .git/ was silently synced.
-    const userPatterns = merged.excludePatterns ?? [];
-    const combined = [...userPatterns];
-    for (const p of ALWAYS_EXCLUDED) {
-      if (!combined.includes(p)) combined.push(p);
-    }
-    merged.excludePatterns = combined;
-    return merged;
+    merged = { ...DEFAULT_SETTINGS, ...userConfig };
   } catch {
     console.error(`[vault-sync] Config not found at ${configPath}`);
     console.error(`[vault-sync] Create ${CONFIG_FILENAME} in your vault root with:`);
     console.error(JSON.stringify({
       couchDbUrl: "https://your-couch-host.example.com",
       couchDbName: "your-vault-name",
-      couchDbUser: "your-username",
-      couchDbPassword: "your-password",
     }, null, 2));
+    console.error(`[vault-sync] Credentials come from the macOS Keychain, env vars`);
+    console.error(`[vault-sync] (${ENV_COUCH_USER}/${ENV_COUCH_PASSWORD}), or — transitionally — this file.`);
     process.exit(1);
   }
+
+  // Ensure ALWAYS_EXCLUDED patterns are present even if the user didn't list them.
+  const userPatterns = merged.excludePatterns ?? [];
+  const combined = [...userPatterns];
+  for (const p of ALWAYS_EXCLUDED) {
+    if (!combined.includes(p)) combined.push(p);
+  }
+  merged.excludePatterns = combined;
+
+  // --- Credential resolution (outside the exit path; never destructive) ---
+  const legacyUser = merged.couchDbUser ?? "";
+  const legacyPassword = merged.couchDbPassword ?? "";
+
+  merged.couchDbUser = await resolveSecret({
+    envName: ENV_COUCH_USER,
+    env,
+    store,
+    id: SECRET_ID_COUCH_USER,
+    legacy: legacyUser,
+  });
+  merged.couchDbPassword = await resolveSecret({
+    envName: ENV_COUCH_PASSWORD,
+    env,
+    store,
+    id: SECRET_ID_COUCH_PASSWORD,
+    legacy: legacyPassword,
+  });
+
+  // Phase A — additive copy of a legacy in-vault secret into the store.
+  // Write-new only; never overwrite a store secret, never delete from the file.
+  // Best-effort: KeychainSecretStore.set swallows failures (locked keychain →
+  // retry next boot on the legacy value).
+  if (store.isAvailable()) {
+    if (legacyUser && !(await store.get(SECRET_ID_COUCH_USER))) {
+      await store.set(SECRET_ID_COUCH_USER, legacyUser);
+    }
+    if (legacyPassword && !(await store.get(SECRET_ID_COUCH_PASSWORD))) {
+      await store.set(SECRET_ID_COUCH_PASSWORD, legacyPassword);
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * Phase B scrub for the daemon (#78) — operator-gated via --scrub-secrets.
+ *
+ * Strip couchDbUser/couchDbPassword from .vault-sync.json, write-BEFORE-delete:
+ * only remove them after confirming BOTH are present in the store, leaving the
+ * file otherwise intact. Mirrors the plugin's scrubInVaultSecrets().
+ */
+export async function scrubInVaultConfig(
+  configPath: string,
+  store: SecretStore,
+): Promise<{ scrubbed: boolean }> {
+  let onDisk: Record<string, unknown>;
+  try {
+    onDisk = JSON.parse(fs.readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+  } catch {
+    console.error(`[vault-sync] migrate-secrets: cannot read ${configPath} — nothing to scrub.`);
+    return { scrubbed: false };
+  }
+
+  const hasFileSecret =
+    onDisk.couchDbUser !== undefined || onDisk.couchDbPassword !== undefined;
+  if (!hasFileSecret) {
+    console.log(`[vault-sync] migrate-secrets: no in-vault credentials to remove.`);
+    return { scrubbed: false };
+  }
+
+  const storeUser = await store.get(SECRET_ID_COUCH_USER);
+  const storePassword = await store.get(SECRET_ID_COUCH_PASSWORD);
+  if (!storeUser || !storePassword) {
+    console.warn(
+      `[vault-sync] migrate-secrets: store is missing a credential — refusing to scrub ` +
+      `the in-vault secret (write-before-delete).`,
+    );
+    return { scrubbed: false };
+  }
+
+  delete onDisk.couchDbUser;
+  delete onDisk.couchDbPassword;
+  fs.writeFileSync(configPath, JSON.stringify(onDisk, null, 2));
+  console.log(`[vault-sync] migrate-secrets: removed in-vault credentials from ${configPath}.`);
+  return { scrubbed: true };
 }
 
 /**
@@ -575,12 +689,29 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
 }
 
 async function main(): Promise<void> {
-  const vaultRoot = process.argv[2] ?? process.cwd();
+  // Parse argv robustly: flags may precede the vault root
+  // (e.g. `daemon --scrub-secrets /path`). First non-flag arg is the vault root.
+  const args = process.argv.slice(2);
+  const scrubSecrets = args.includes("--scrub-secrets");
+  const positional = args.filter((a) => !a.startsWith("--"));
+  const vaultRoot = positional[0] ?? process.cwd();
   const absVaultRoot = path.resolve(vaultRoot);
+
+  // Phase B (#78): operator-gated scrub. One-shot — never starts the daemon.
+  if (scrubSecrets) {
+    const configPath = path.join(absVaultRoot, CONFIG_FILENAME);
+    const { scrubbed } = await scrubInVaultConfig(configPath, new KeychainSecretStore());
+    console.log(
+      scrubbed
+        ? `[vault-sync] migrate-secrets: done — in-vault credentials removed.`
+        : `[vault-sync] migrate-secrets: nothing removed (see message above).`,
+    );
+    process.exit(0);
+  }
 
   console.log(`[vault-sync] Starting headless daemon for vault: ${absVaultRoot}`);
 
-  const settings = loadConfig(absVaultRoot);
+  const settings = await loadConfig(absVaultRoot);
 
   // PouchDB is the only sync engine since v2.0 (issue #69). The former DAEMON_V2
   // env flag is now a no-op — kept harmless for operators who still set it.

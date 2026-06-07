@@ -1,7 +1,22 @@
 import * as os from "node:os";
 import * as path from "node:path";
+import * as fs from "node:fs";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { resolveStatePath, resolvePouchDir, runDaemonV2Startup, runReconcileOnStartup } from "./main";
+import {
+  resolveStatePath,
+  resolvePouchDir,
+  runDaemonV2Startup,
+  runReconcileOnStartup,
+  loadConfig,
+  scrubInVaultConfig,
+} from "./main";
+import {
+  SECRET_ID_COUCH_USER,
+  SECRET_ID_COUCH_PASSWORD,
+  ENV_COUCH_USER,
+  ENV_COUCH_PASSWORD,
+  type SecretStore,
+} from "../src/secret-store";
 
 // ---------------------------------------------------------------------------
 // State file location (issue #54)
@@ -409,5 +424,208 @@ describe("runReconcileOnStartup — skip-on-fetch-fail (critical safety)", () =>
     });
 
     expect(callOrder).toEqual(["runReconcile", "bridge.start", "engine.start"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadConfig + Phase A/B (#78) — credential precedence and out-of-vault store
+// ---------------------------------------------------------------------------
+
+/** In-memory SecretStore stand-in; never touches the real keychain. */
+function fakeStore(initial: Record<string, string> = {}): SecretStore & {
+  _dump(): Record<string, string>;
+} {
+  const m = new Map(Object.entries(initial));
+  return {
+    async get(id) {
+      return m.has(id) ? (m.get(id) as string) : null;
+    },
+    async set(id, value) {
+      m.set(id, value);
+    },
+    isAvailable() {
+      return true;
+    },
+    _dump() {
+      return Object.fromEntries(m);
+    },
+  };
+}
+
+function tmpVault(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "vault-sync-cfg-"));
+}
+
+function writeConfig(vaultRoot: string, config: Record<string, unknown>): string {
+  const p = path.join(vaultRoot, ".vault-sync.json");
+  fs.writeFileSync(p, JSON.stringify(config, null, 2));
+  return p;
+}
+
+describe("loadConfig — credential precedence (env > store > legacy in-vault) (#78)", () => {
+  it("uses the store secret over the legacy in-vault secret", async () => {
+    const vault = tmpVault();
+    writeConfig(vault, {
+      couchDbUrl: "https://couch.example.com",
+      couchDbName: "vault-x",
+      couchDbUser: "legacy-user",
+      couchDbPassword: "legacy-pass",
+      excludePatterns: [],
+    });
+    const store = fakeStore({
+      [SECRET_ID_COUCH_USER]: "store-user",
+      [SECRET_ID_COUCH_PASSWORD]: "store-pass",
+    });
+
+    const cfg = await loadConfig(vault, { store, env: {} });
+    expect(cfg.couchDbUser).toBe("store-user");
+    expect(cfg.couchDbPassword).toBe("store-pass");
+  });
+
+  it("prefers env over both store and legacy", async () => {
+    const vault = tmpVault();
+    writeConfig(vault, {
+      couchDbUrl: "https://couch.example.com",
+      couchDbName: "vault-x",
+      couchDbUser: "legacy-user",
+      couchDbPassword: "legacy-pass",
+      excludePatterns: [],
+    });
+    const store = fakeStore({
+      [SECRET_ID_COUCH_USER]: "store-user",
+      [SECRET_ID_COUCH_PASSWORD]: "store-pass",
+    });
+    const env = { [ENV_COUCH_USER]: "env-user", [ENV_COUCH_PASSWORD]: "env-pass" };
+
+    const cfg = await loadConfig(vault, { store, env });
+    expect(cfg.couchDbUser).toBe("env-user");
+    expect(cfg.couchDbPassword).toBe("env-pass");
+  });
+
+  it("Phase A: copies a legacy in-vault secret into the store without deleting it from the file", async () => {
+    const vault = tmpVault();
+    const configPath = writeConfig(vault, {
+      couchDbUrl: "https://couch.example.com",
+      couchDbName: "vault-x",
+      couchDbUser: "legacy-user",
+      couchDbPassword: "legacy-pass",
+      excludePatterns: [],
+    });
+    const store = fakeStore();
+
+    const cfg = await loadConfig(vault, { store, env: {} });
+    expect(cfg.couchDbUser).toBe("legacy-user");
+    expect(cfg.couchDbPassword).toBe("legacy-pass");
+
+    // Store now seeded from the file...
+    expect(store._dump()[SECRET_ID_COUCH_USER]).toBe("legacy-user");
+    expect(store._dump()[SECRET_ID_COUCH_PASSWORD]).toBe("legacy-pass");
+
+    // ...and the file STILL carries the secret (never deleted on load — invariant 2).
+    const onDisk = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    expect(onDisk.couchDbUser).toBe("legacy-user");
+    expect(onDisk.couchDbPassword).toBe("legacy-pass");
+  });
+
+  it("FAIL-SAFE: returns empty credentials (does not exit/throw) when no secret is found anywhere", async () => {
+    const vault = tmpVault();
+    // File present (so couchDbUrl/couchDbName exist) but no secret keys.
+    writeConfig(vault, {
+      couchDbUrl: "https://couch.example.com",
+      couchDbName: "vault-x",
+      excludePatterns: [],
+    });
+    const store = fakeStore();
+
+    // Must RETURN a config with empty creds — never process.exit, never throw.
+    // Empty creds -> credential-less URL -> plain 401 -> reconcile skip, not a
+    // destructive tombstone-everything resync (invariant 8).
+    const cfg = await loadConfig(vault, { store, env: {} });
+    expect(cfg.couchDbUser).toBe("");
+    expect(cfg.couchDbPassword).toBe("");
+    // Non-secret config still loaded.
+    expect(cfg.couchDbUrl).toBe("https://couch.example.com");
+    expect(cfg.couchDbName).toBe("vault-x");
+  });
+
+  it("still exits when the config FILE is missing (file is the only source of url/name)", async () => {
+    const vault = tmpVault();
+    // No .vault-sync.json written.
+    const exitSpy = vi
+      .spyOn(process, "exit")
+      .mockImplementation(((_code?: number) => {
+        throw new Error("process.exit called");
+      }) as never);
+    try {
+      await expect(loadConfig(vault, { store: fakeStore(), env: {} })).rejects.toThrow(
+        "process.exit called",
+      );
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    } finally {
+      exitSpy.mockRestore();
+    }
+  });
+});
+
+describe("scrubInVaultConfig — Phase B for the daemon (#78)", () => {
+  it("removes the secret keys only after confirming the store has both, leaving the file otherwise intact", async () => {
+    const vault = tmpVault();
+    const configPath = writeConfig(vault, {
+      couchDbUrl: "https://couch.example.com",
+      couchDbName: "vault-x",
+      couchDbUser: "alice",
+      couchDbPassword: "hunter2",
+      excludePatterns: [".trash/"],
+    });
+    const store = fakeStore({
+      [SECRET_ID_COUCH_USER]: "alice",
+      [SECRET_ID_COUCH_PASSWORD]: "hunter2",
+    });
+
+    const result = await scrubInVaultConfig(configPath, store);
+    expect(result.scrubbed).toBe(true);
+
+    const onDisk = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    expect(onDisk.couchDbUser).toBeUndefined();
+    expect(onDisk.couchDbPassword).toBeUndefined();
+    expect(onDisk.couchDbUrl).toBe("https://couch.example.com");
+    expect(onDisk.couchDbName).toBe("vault-x");
+    expect(onDisk.excludePatterns).toEqual([".trash/"]);
+  });
+
+  it("refuses to scrub when the store is missing a credential (write-before-delete)", async () => {
+    const vault = tmpVault();
+    const configPath = writeConfig(vault, {
+      couchDbUrl: "https://couch.example.com",
+      couchDbName: "vault-x",
+      couchDbUser: "alice",
+      couchDbPassword: "hunter2",
+      excludePatterns: [],
+    });
+    // Store has user but not password.
+    const store = fakeStore({ [SECRET_ID_COUCH_USER]: "alice" });
+
+    const result = await scrubInVaultConfig(configPath, store);
+    expect(result.scrubbed).toBe(false);
+
+    const onDisk = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    expect(onDisk.couchDbUser).toBe("alice");
+    expect(onDisk.couchDbPassword).toBe("hunter2");
+  });
+
+  it("is a no-op when the file has no secret keys", async () => {
+    const vault = tmpVault();
+    const configPath = writeConfig(vault, {
+      couchDbUrl: "https://couch.example.com",
+      couchDbName: "vault-x",
+      excludePatterns: [],
+    });
+    const store = fakeStore({
+      [SECRET_ID_COUCH_USER]: "alice",
+      [SECRET_ID_COUCH_PASSWORD]: "hunter2",
+    });
+
+    const result = await scrubInVaultConfig(configPath, store);
+    expect(result.scrubbed).toBe(false);
   });
 });
