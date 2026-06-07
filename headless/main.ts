@@ -518,77 +518,34 @@ export async function runReconcileOnStartup(opts: {
 /**
  * Exported startup sequence for the PouchDB daemon.
  *
- * Extracted for testability: allows unit tests to assert that runConverter
- * completes (on a cold PouchDB) BEFORE bridge.start() arms the changes-feed
- * and FS watcher. This ordering prevents the init-race where a Dropbox/iCloud
- * FS event during boot triggers writeTextToPouch → db.put → doc_count > 0,
- * making the converter believe migration already happened and silently skipping
- * the seed of 14700+ docs (issue #69).
+ * Extracted for testability: allows unit tests to assert that reconcile
+ * completes BEFORE bridge.start() arms the changes-feed and FS watcher. This
+ * ordering protects the init-race (issue #69): the FS watcher / changes feed
+ * must not arm before the local PouchDB has been reconciled against disk,
+ * otherwise a Dropbox/iCloud FS event during boot races the reconcile pass.
  *
  * @param deps.bridge       Pre-constructed PouchDbFsBridge (not yet started)
- * @param deps.runConverter Async fn that seeds PouchDB from state.json revMap
  * @param deps.runReconcile Async fn that reconciles FS vs PouchDB (non-first-run)
  * @param deps.fsWatcher    Pre-constructed FsWatcher (not yet started)
  * @param deps.engine       Pre-constructed PouchDbSyncEngine (not yet started)
- * @param deps.statePath    Path to state.json passed to runConverter
- * @param deps.pouchDir     PouchDB data dir passed to runConverter
- * @param deps.db           PouchDB instance passed to runConverter
  */
 export async function runDaemonV2Startup(deps: {
   bridge: { start: (watcher: unknown) => void };
-  runConverter: (
-    statePath: string,
-    pouchDir: string,
-    db: unknown,
-    dryRun: boolean,
-    remoteDb: RemoteDbForPhantomCheck,
-  ) => Promise<{
-    noStateFile?: boolean;
-    alreadyMigrated?: boolean;
-    migrated?: number;
-    tombstonedSkipped?: number;
-    orphanSkipped?: number;
-    phantomSkipped?: number;
-  }>;
   runReconcile: () => Promise<unknown>;
   fsWatcher: unknown;
   engine: { start: () => Promise<void> };
-  statePath: string;
-  pouchDir: string;
-  db: unknown;
-  remoteDb: RemoteDbForPhantomCheck;
 }): Promise<void> {
-  const { bridge, runConverter, runReconcile, fsWatcher, engine, statePath, pouchDir, db, remoteDb } = deps;
+  const { bridge, runReconcile, fsWatcher, engine } = deps;
 
-  // CRITICAL: converter MUST run on a cold PouchDB (no other writer active).
-  // Arming the changes-feed or FS watcher before this completes risks a
-  // Dropbox/iCloud FS event triggering writeTextToPouch → db.put → doc_count > 0,
-  // making the converter skip the seed and causing silent partial sync.
-  // remoteDb is required so the phantom filter (C04-bis) actually runs — without
-  // it, phantom entries (.DS_Store, .git/*) would be migrated and pushed to CouchDB.
-  const convResult = await runConverter(statePath, pouchDir, db, false, remoteDb);
-  if (convResult.noStateFile) {
-    console.log("[vault-sync] No state.json found — PouchDB will fresh-pull from CouchDB");
-  } else if (convResult.alreadyMigrated) {
-    console.log("[vault-sync] PouchDB already has docs — skipping migration");
-  } else {
-    console.log(
-      `[vault-sync] Converter: migrated ${convResult.migrated} docs, ` +
-      `${convResult.tombstonedSkipped} tombstoned skipped, ` +
-      `${convResult.orphanSkipped} orphan skipped, ` +
-      `${convResult.phantomSkipped ?? 0} phantom skipped`,
-    );
-  }
-
-  // Reconciliation: runs AFTER converter and BEFORE bridge.start (AC2.6/#69).
+  // Reconciliation: runs BEFORE bridge.start (AC2.6/#69).
   // Writes only to local PouchDB — live db.sync replicates afterward.
   await runReconcile();
 
-  // Now arm the changes-feed and FS watcher — PouchDB is fully seeded + reconciled.
+  // Now arm the changes-feed and FS watcher — PouchDB is reconciled.
   bridge.start(fsWatcher);
 
-  // Engine.start() handles isFirstRun() check: if converter migrated docs,
-  // it skips initial pull and goes straight to live sync.
+  // Engine.start() handles isFirstRun() check; on an existing PouchDB it skips
+  // the initial pull and goes straight to live sync.
   await engine.start();
 }
 
@@ -598,7 +555,6 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   const { PouchDbFsBridge } = await import("../src/PouchDbFsBridge");
   const { PouchDbSyncEngine } = await import("../src/PouchDbSyncEngine");
   const { FsWatcher } = await import("./FsWatcher");
-  const { runConverter } = await import("./converter");
 
   const pouchDir = resolvePouchDir(settings.couchDbName);
   fs.mkdirSync(pouchDir, { recursive: true });
@@ -610,7 +566,7 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   const dbFactory = () => new PouchDB(pouchDir) as unknown as import("../src/pouchdb-browser").default;
   const db = dbFactory();
 
-  // Build vault adapter and bridge (bridge not yet started — converter runs first)
+  // Build vault adapter and bridge (bridge not yet started — reconcile runs first)
   const vaultAdapter = new FilesystemVaultAdapter(absVaultRoot);
   const bridge = new PouchDbFsBridge(vaultAdapter, db);
 
@@ -644,9 +600,6 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   };
   engine.onNotice = (msg) => console.log(`[vault-sync] ${msg}`);
 
-  const statePath = resolveStatePath(absVaultRoot, settings.couchDbName);
-  console.log(`[vault-sync] Running converter (state.json -> PouchDB)...`);
-
   // Build the exclusion list passed to reconcile (same as live watcher — AC2.5).
   const reconcileExcludePatterns = [STATE_FILENAME, CONFIG_FILENAME, ".git", ...settings.excludePatterns];
 
@@ -667,12 +620,12 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
     return counts;
   };
 
-  // Delegate ordering logic to runDaemonV2Startup (converter first, then reconcile, then bridge.start).
-  // Cast bridge/db/runConverter to the narrow interfaces used by runDaemonV2Startup —
-  // the real types are compatible at runtime; the cast avoids needlessly widening the
-  // public dep interfaces (which are kept simple for testability).
+  // Delegate ordering logic to runDaemonV2Startup (reconcile first, then bridge.start, then engine.start).
+  // Cast bridge to the narrow interface used by runDaemonV2Startup — the real type
+  // is compatible at runtime; the cast avoids needlessly widening the public dep
+  // interface (which is kept simple for testability).
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  await runDaemonV2Startup({ bridge: bridge as any, runConverter: runConverter as any, runReconcile, fsWatcher, engine, statePath, pouchDir, db, remoteDb });
+  await runDaemonV2Startup({ bridge: bridge as any, runReconcile, fsWatcher, engine });
 
   // Graceful shutdown
   function shutdown(signal: string): void {

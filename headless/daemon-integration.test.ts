@@ -425,14 +425,9 @@ describe("RC2 — startup reconciliation (AC2.1, AC2.3a, AC2.3b)", () => {
     await runDaemonV2Startup({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       bridge: bridge as any,
-      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
       runReconcile: makeRunReconcile(remoteRevs),
       fsWatcher: new FsWatcher(vaultDir, []),
       engine: { start: vi.fn(async () => {}) },
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db,
-      remoteDb: { async allDocs() { return { rows: [] }; } },
     });
 
     // B must now be in PouchDB
@@ -459,14 +454,9 @@ describe("RC2 — startup reconciliation (AC2.1, AC2.3a, AC2.3b)", () => {
     await runDaemonV2Startup({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       bridge: bridge as any,
-      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
       runReconcile: makeRunReconcile(remoteRevs),
       fsWatcher: new FsWatcher(vaultDir, []),
       engine: { start: vi.fn(async () => {}) },
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db,
-      remoteDb: { async allDocs() { return { rows: [] }; } },
     });
 
     // D must be tombstoned in PouchDB
@@ -488,14 +478,9 @@ describe("RC2 — startup reconciliation (AC2.1, AC2.3a, AC2.3b)", () => {
     await runDaemonV2Startup({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       bridge: bridge as any,
-      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
       runReconcile: makeRunReconcile(remoteRevs),
       fsWatcher: new FsWatcher(vaultDir, []),
       engine: { start: vi.fn(async () => {}) },
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db,
-      remoteDb: { async allDocs() { return { rows: [] }; } },
     });
 
     // At this point bridge.start has been called and the changes feed is armed.
@@ -533,14 +518,9 @@ describe("RC2 — startup reconciliation (AC2.1, AC2.3a, AC2.3b)", () => {
     await runDaemonV2Startup({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       bridge: bridge as any,
-      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
       runReconcile: makeRunReconcile(remoteRevs),
       fsWatcher: new FsWatcher(vaultDir, []),
       engine: { start: vi.fn(async () => {}) },
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db,
-      remoteDb: { async allDocs() { return { rows: [] }; } },
     });
 
     // E must NOT be tombstoned (rev differs → pull path)
@@ -622,14 +602,9 @@ describe("RC2 Cycle 4 — non-destructive conflict handling (AC2.4, control, AC2
     await runDaemonV2Startup({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       bridge: bridge as any,
-      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
       runReconcile: makeRunReconcile(remoteRevs),
       fsWatcher: new FsWatcher(vaultDir, []),
       engine: { start: vi.fn(async () => {}) },
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db,
-      remoteDb: { async allDocs() { return { rows: [] }; } },
     });
 
     // (a) A conflict-copy file must exist (name includes "reconcile-conflict")
@@ -682,14 +657,9 @@ describe("RC2 Cycle 4 — non-destructive conflict handling (AC2.4, control, AC2
     await runDaemonV2Startup({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       bridge: bridge as any,
-      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
       runReconcile: makeRunReconcile(remoteRevs),
       fsWatcher: new FsWatcher(vaultDir, []),
       engine: { start: vi.fn(async () => {}) },
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db,
-      remoteDb: { async allDocs() { return { rows: [] }; } },
     });
 
     // No conflict-copy file must exist
@@ -725,14 +695,9 @@ describe("RC2 Cycle 4 — non-destructive conflict handling (AC2.4, control, AC2
     await runDaemonV2Startup({
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       bridge: bridge as any,
-      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
       runReconcile: makeRunReconcile(remoteRevs),
       fsWatcher: new FsWatcher(vaultDir, []),
       engine: { start: vi.fn(async () => {}) },
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db,
-      remoteDb: { async allDocs() { return { rows: [] }; } },
     });
 
     // Find the conflict-copy doc in PouchDB and capture its _rev immediately after startup

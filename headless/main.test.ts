@@ -112,20 +112,10 @@ describe("resolvePouchDir", () => {
 });
 
 // ---------------------------------------------------------------------------
-// DAEMON_V2 path — engine + converter wiring (C06)
+// DAEMON_V2 path — PouchDB data directory layout (C06)
 // ---------------------------------------------------------------------------
 
-describe("DAEMON_V2 — runConverter called before engine.start()", () => {
-  it("runConverter is called with statePath, pouchDir, and db when DAEMON_V2=1", async () => {
-    // This test validates the calling convention by importing converter and spying on it.
-    // We use a dynamic import + vi.mock pattern to intercept the converter call order.
-    const { runConverter } = await import("./converter");
-    // runConverter is a pure async function — it should have been called with the right
-    // argument shapes when the daemon runs in v2 mode.
-    // Verify the import itself is available (module resolution check).
-    expect(typeof runConverter).toBe("function");
-  });
-
+describe("DAEMON_V2 — PouchDB data directory layout", () => {
   it("resolvePouchDir places PouchDB under the same vault-sync-daemon dir as resolveStatePath", () => {
     const dbName = "vault-obsidiannotes";
     const env = { platform: "darwin" as NodeJS.Platform, home: "/Users/alice" };
@@ -178,27 +168,20 @@ declare module "vitest" {
 // ---------------------------------------------------------------------------
 // BUG #69 — Init-order regression guard
 // ---------------------------------------------------------------------------
-// Verifies that runDaemonV2Startup runs runConverter to completion BEFORE
-// calling bridge.start(). If bridge.start() fires first, a Dropbox/iCloud FS
-// event during boot can trigger writeTextToPouch -> db.put -> doc_count > 0,
-// causing the converter to believe migration already happened and silently
-// skipping the full seed (partial sync with missing files).
+// Verifies that runDaemonV2Startup runs reconcile to completion BEFORE calling
+// bridge.start(). If bridge.start() fires first, a Dropbox/iCloud FS event
+// during boot can arm the watcher/changes feed before the local PouchDB has
+// been reconciled against disk, racing the reconcile pass.
 
-const FAKE_REMOTE_DB = { async allDocs() { return { rows: [] }; } };
 const FAKE_RECONCILE = vi.fn(async () => null);
 
-describe("runDaemonV2Startup — converter runs before bridge.start (init-order guard)", () => {
-  it("calls runConverter to completion before bridge.start is called", async () => {
+describe("runDaemonV2Startup — reconcile runs before bridge.start (init-order guard)", () => {
+  it("calls reconcile to completion before bridge.start is called", async () => {
     const callOrder: string[] = [];
 
     const mockBridge = {
       start: vi.fn(() => { callOrder.push("bridge.start"); }),
     };
-
-    const mockConverter = vi.fn(async () => {
-      callOrder.push("runConverter");
-      return { alreadyMigrated: false, migrated: 3, tombstonedSkipped: 0, orphanSkipped: 0, phantomSkipped: 0 };
-    });
 
     const mockReconcile = vi.fn(async () => {
       callOrder.push("runReconcile");
@@ -213,24 +196,17 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
 
     await runDaemonV2Startup({
       bridge: mockBridge,
-      runConverter: mockConverter,
       runReconcile: mockReconcile,
       fsWatcher: mockFsWatcher,
       engine: mockEngine,
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db: {},
-      remoteDb: FAKE_REMOTE_DB,
     });
 
-    // All four must have been called
-    expect(mockConverter).toHaveBeenCalledOnce();
+    // All three must have been called
     expect(mockReconcile).toHaveBeenCalledOnce();
     expect(mockBridge.start).toHaveBeenCalledOnce();
     expect(mockEngine.start).toHaveBeenCalledOnce();
 
-    // Critical ordering: converter → reconcile → bridge.start → engine.start
-    expect(callOrder.indexOf("runConverter")).toBeLessThan(callOrder.indexOf("runReconcile"));
+    // Critical ordering: reconcile → bridge.start → engine.start
     expect(callOrder.indexOf("runReconcile")).toBeLessThan(callOrder.indexOf("bridge.start"));
     expect(callOrder.indexOf("bridge.start")).toBeLessThan(callOrder.indexOf("engine.start"));
   });
@@ -242,49 +218,12 @@ describe("runDaemonV2Startup — converter runs before bridge.start (init-order 
 
     await runDaemonV2Startup({
       bridge: mockBridge,
-      runConverter: vi.fn(async () => ({ noStateFile: true })),
       runReconcile: FAKE_RECONCILE,
       fsWatcher: mockFsWatcher,
       engine: mockEngine,
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db: {},
-      remoteDb: FAKE_REMOTE_DB,
     });
 
     expect(mockBridge.start).toHaveBeenCalledWith(mockFsWatcher);
-  });
-
-  it("passes remoteDb as the 5th argument to runConverter (phantom filter wiring)", async () => {
-    // BUG FIX REGRESSION GUARD: Before this fix, runConverter was called with
-    // only 3 args (statePath, pouchDir, db) — remoteDb was never passed.
-    // The phantom filter (C04-bis) is a no-op when remoteDb is undefined, so
-    // phantom entries (.DS_Store, .git/*) were migrated and pushed to CouchDB.
-    // This test pins that runConverter always receives a defined remoteDb as arg 5.
-    const capturedArgs: unknown[] = [];
-
-    const mockConverter = vi.fn(async (...args: unknown[]) => {
-      capturedArgs.push(...args);
-      return { migrated: 0, tombstonedSkipped: 0, orphanSkipped: 0, phantomSkipped: 0 };
-    });
-
-    const fakeRemoteDb = { async allDocs() { return { rows: [] }; } };
-
-    await runDaemonV2Startup({
-      bridge: { start: vi.fn() },
-      runConverter: mockConverter as never,
-      runReconcile: FAKE_RECONCILE,
-      fsWatcher: {},
-      engine: { start: vi.fn(async () => {}) },
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db: {},
-      remoteDb: fakeRemoteDb,
-    });
-
-    // arg[0]=statePath, [1]=pouchDir, [2]=db, [3]=dryRun=false, [4]=remoteDb
-    expect(capturedArgs[4]).toBe(fakeRemoteDb);
-    expect(capturedArgs[3]).toBe(false); // dryRun must be false in daemon mode
   });
 });
 
@@ -394,13 +333,6 @@ describe("runReconcileOnStartup — skip-on-fetch-fail (critical safety)", () =>
   it("bridge.start and engine.start still called after skip-on-fetch-fail", async () => {
     const callOrder: string[] = [];
 
-    // A db with docs so the gate passes
-    const db = {
-      info: vi.fn(async () => ({ doc_count: 5 })),
-      allDocs: vi.fn(async () => ({ rows: [] })),
-      get: vi.fn(async () => { throw { status: 404 }; }),
-    };
-
     const failingReconcile = async () => {
       // Simulate fetchRemoteRevs throwing inside runReconcileOnStartup;
       // the result is null (skip-on-fail) — bridge.start must still be called.
@@ -413,14 +345,9 @@ describe("runReconcileOnStartup — skip-on-fetch-fail (critical safety)", () =>
 
     await runDaemonV2Startup({
       bridge: mockBridge,
-      runConverter: vi.fn(async () => ({ alreadyMigrated: true })),
       runReconcile: failingReconcile,
       fsWatcher: {},
       engine: mockEngine,
-      statePath: "/fake/state.json",
-      pouchDir: "/fake/pouch",
-      db,
-      remoteDb: FAKE_REMOTE_DB,
     });
 
     expect(callOrder).toEqual(["runReconcile", "bridge.start", "engine.start"]);
