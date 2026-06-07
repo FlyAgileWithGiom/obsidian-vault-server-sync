@@ -382,6 +382,9 @@ export default class VaultSyncPlugin extends Plugin {
     const store = this.getSecretStore();
     await store.set(SECRET_ID_COUCH_USER, this.settings.couchDbUser ?? "");
     await store.set(SECRET_ID_COUCH_PASSWORD, this.settings.couchDbPassword ?? "");
+    // Propagate to the live engine so a credential change takes effect without
+    // a restart (settings already hold the new value in memory).
+    this.strategy?.updateSettings(this.settings);
   }
 
   /**

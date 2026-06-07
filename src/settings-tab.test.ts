@@ -87,6 +87,25 @@ class MockHTMLElement {
 
 let settingConstructorCount = 0;
 
+// Captured onChange handlers keyed by the setting's display name, so tests can
+// drive a specific field's onChange (e.g. "Username") and assert where it routes.
+const capturedOnChange = new Map<string, (value: string) => unknown>();
+
+/** Text-builder stub passed to addText() callbacks; chainable, records onChange. */
+class MockTextBuilder {
+  inputEl = { type: "text" };
+  private name: string;
+  constructor(name: string) {
+    this.name = name;
+  }
+  setPlaceholder(): this { return this; }
+  setValue(): this { return this; }
+  onChange(cb: (value: string) => unknown): this {
+    capturedOnChange.set(this.name, cb);
+    return this;
+  }
+}
+
 vi.mock("obsidian", async () => {
   const actual = await vi.importActual<typeof import("./__mocks__/obsidian")>(
     "./__mocks__/obsidian"
@@ -94,13 +113,23 @@ vi.mock("obsidian", async () => {
   return {
     ...actual,
     Setting: class MockSetting {
+      private name = "";
       constructor(_el: unknown) {
         settingConstructorCount++;
       }
-      setName(): this { return this; }
+      setName(name: string): this {
+        this.name = name;
+        return this;
+      }
       setDesc(): this { return this; }
-      addText(): this { return this; }
-      addTextArea(): this { return this; }
+      addText(cb?: (text: MockTextBuilder) => unknown): this {
+        if (cb) cb(new MockTextBuilder(this.name));
+        return this;
+      }
+      addTextArea(cb?: (text: MockTextBuilder) => unknown): this {
+        if (cb) cb(new MockTextBuilder(this.name));
+        return this;
+      }
       addButton(): this { return this; }
       addDropdown(): this { return this; }
     },
@@ -143,6 +172,8 @@ function makePluginMock(diagnosticsOverrides: Partial<SyncDiagnostics> = {}): Va
     subscribeDiagnostics: vi.fn((listener: () => void) => listeners.add(listener)),
     unsubscribeDiagnostics: vi.fn((listener: () => void) => listeners.delete(listener)),
     saveSettings: vi.fn().mockResolvedValue(undefined),
+    saveSecrets: vi.fn().mockResolvedValue(undefined),
+    refreshIfVaultChanged: vi.fn().mockResolvedValue(false),
     testConnection: vi.fn().mockResolvedValue(true),
     forceFullSync: vi.fn().mockResolvedValue(undefined),
     resumeFullSync: vi.fn().mockResolvedValue(undefined),
@@ -443,5 +474,55 @@ describe("VaultSyncSettingTab — manifest version in Diagnostics panel", () => 
     const output = formatDiagnostics(makeDiagnosticsSnapshot());
     expect(output).toContain("Version: ");
     expect(output.split("\n")[0]).toMatch(/^Version: /);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Credential onChange routes to the secret store, not the in-vault file (#78)
+// ---------------------------------------------------------------------------
+
+describe("VaultSyncSettingTab — credential onChange routes to saveSecrets (#78)", () => {
+  let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+  let tab: VaultSyncSettingTab;
+
+  beforeEach(() => {
+    capturedOnChange.clear();
+    plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
+    tab = makeTab(plugin);
+    tab.display();
+  });
+
+  it("Username onChange updates settings, calls saveSecrets, and does NOT call saveSettings", async () => {
+    const handler = capturedOnChange.get("Username");
+    expect(handler).toBeTypeOf("function");
+
+    await handler!("alice");
+
+    expect(plugin.settings.couchDbUser).toBe("alice");
+    expect(plugin.saveSecrets).toHaveBeenCalledTimes(1);
+    // Must NOT write the secret to the in-vault config file path.
+    expect(plugin.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("Password onChange updates settings, calls saveSecrets, and does NOT call saveSettings", async () => {
+    const handler = capturedOnChange.get("Password");
+    expect(handler).toBeTypeOf("function");
+
+    await handler!("hunter2");
+
+    expect(plugin.settings.couchDbPassword).toBe("hunter2");
+    expect(plugin.saveSecrets).toHaveBeenCalledTimes(1);
+    expect(plugin.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it("Server URL onChange still routes to saveSettings (non-secret config path unchanged)", async () => {
+    const handler = capturedOnChange.get("Server URL");
+    expect(handler).toBeTypeOf("function");
+
+    await handler!("https://new.example.com");
+
+    expect(plugin.settings.couchDbUrl).toBe("https://new.example.com");
+    expect(plugin.saveSettings).toHaveBeenCalledTimes(1);
+    expect(plugin.saveSecrets).not.toHaveBeenCalled();
   });
 });

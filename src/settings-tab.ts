@@ -72,8 +72,10 @@ export class VaultSyncSettingTab extends PluginSettingTab {
         text
           .setValue(this.plugin.settings.couchDbUser)
           .onChange(async (value) => {
+            // Credentials persist to the out-of-vault secret store (#78), never
+            // to .vault-sync.json. saveSecrets also propagates to the live engine.
             this.plugin.settings.couchDbUser = value.trim();
-            await this.plugin.saveSettings();
+            await this.plugin.saveSecrets();
           })
       );
 
@@ -86,7 +88,7 @@ export class VaultSyncSettingTab extends PluginSettingTab {
           .setValue(this.plugin.settings.couchDbPassword)
           .onChange(async (value) => {
             this.plugin.settings.couchDbPassword = value;
-            await this.plugin.saveSettings();
+            await this.plugin.saveSecrets();
           });
       });
 
