@@ -184,8 +184,28 @@ export class Vault {
   }
 }
 
+/**
+ * In-memory mock of Obsidian's synchronous SecretStorage API (>= 1.11.4).
+ * Mirrors the real surface: setSecret/getSecret/listSecrets, all synchronous.
+ */
+export class SecretStorage {
+  private store: Map<string, string> = new Map();
+
+  setSecret(id: string, secret: string): void {
+    this.store.set(id, secret);
+  }
+
+  getSecret(id: string): string | null {
+    return this.store.has(id) ? (this.store.get(id) as string) : null;
+  }
+
+  listSecrets(): string[] {
+    return Array.from(this.store.keys());
+  }
+}
+
 export class Plugin {
-  app = { vault: new Vault() };
+  app = { vault: new Vault(), secretStorage: new SecretStorage() };
   manifest = {};
   async loadData(): Promise<unknown> { return {}; }
   async saveData(_data: unknown): Promise<void> {}
@@ -229,6 +249,7 @@ export class Modal {
 
 export class App {
   vault = new Vault();
+  secretStorage = new SecretStorage();
 }
 
 /**
