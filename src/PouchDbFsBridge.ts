@@ -233,8 +233,14 @@ export class PouchDbFsBridge {
     const metaResult = await this.db.put(meta as Parameters<typeof this.db.put>[0]);
     const newRev = metaResult.rev;
 
-    // Read the binary data and store as attachment
-    const data = await this.vault.readBinary(file);
+    // Read the binary data and store as attachment.
+    //
+    // readBinary returns an ArrayBuffer. pouchdb-browser (plugin) tolerates a raw
+    // ArrayBuffer, but pouchdb-node (daemon) routes it to crypto.Hash.update(),
+    // which rejects ArrayBuffer (ERR_INVALID_ARG_TYPE) and crash-looped the daemon —
+    // see BUG #79. A Uint8Array is a TypedArray that Node's crypto accepts and
+    // pouchdb-browser also accepts, so normalising here keeps both adapters correct.
+    const data = new Uint8Array(await this.vault.readBinary(file));
     const contentType = contentTypeForPath(file.path);
     await this.db.putAttachment(docId, ATTACHMENT_NAME, newRev, data, contentType);
   }

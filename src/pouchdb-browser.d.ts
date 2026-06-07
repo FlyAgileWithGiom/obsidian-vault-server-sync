@@ -103,7 +103,7 @@ declare module "pouchdb-browser" {
       docId: string,
       attachmentId: string,
       rev: string,
-      attachment: Blob | ArrayBuffer,
+      attachment: Blob | ArrayBuffer | Uint8Array,
       type: string,
     ): Promise<PouchDbPutResult>;
 

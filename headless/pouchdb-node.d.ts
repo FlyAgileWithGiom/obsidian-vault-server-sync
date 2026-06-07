@@ -113,7 +113,7 @@ declare module "pouchdb-node" {
       docId: string,
       attachmentId: string,
       rev: string,
-      attachment: Buffer | ArrayBuffer,
+      attachment: Buffer | ArrayBuffer | Uint8Array,
       type: string,
     ): Promise<PouchDbPutResult>;
 
