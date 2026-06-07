@@ -498,6 +498,87 @@ describe("VaultSyncPlugin.saveSecrets — writes to the store, not the vault fil
   });
 });
 
+// ---- Phase B scrub: migrate-secrets command (#78) ----
+
+describe("VaultSyncPlugin.scrubInVaultSecrets — Phase B (#78)", () => {
+  let plugin: VaultSyncPlugin;
+
+  beforeEach(() => {
+    plugin = makePlugin();
+  });
+
+  function secretStorage(plugin: VaultSyncPlugin): SecretStorage {
+    return (plugin as unknown as { app: { secretStorage: SecretStorage } }).app.secretStorage;
+  }
+
+  it("removes couchDbUser/couchDbPassword from the file only after confirming the store has them, leaving the file otherwise intact", async () => {
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://couch.example.com",
+        couchDbName: "vault-x",
+        couchDbUser: "alice",
+        couchDbPassword: "hunter2",
+        excludePatterns: [".trash/"],
+      }),
+    );
+    // Store already holds the secret (write-before-delete precondition satisfied).
+    secretStorage(plugin).setSecret(SECRET_ID_COUCH_USER, "alice");
+    secretStorage(plugin).setSecret(SECRET_ID_COUCH_PASSWORD, "hunter2");
+
+    const result = await plugin.scrubInVaultSecrets();
+    expect(result.scrubbed).toBe(true);
+
+    const onDisk = JSON.parse(plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!);
+    // Secret keys gone...
+    expect(onDisk.couchDbUser).toBeUndefined();
+    expect(onDisk.couchDbPassword).toBeUndefined();
+    // ...non-secret keys untouched.
+    expect(onDisk.couchDbUrl).toBe("https://couch.example.com");
+    expect(onDisk.couchDbName).toBe("vault-x");
+    expect(onDisk.excludePatterns).toEqual([".trash/"]);
+  });
+
+  it("does NOT scrub when the store is missing the secret (write-before-delete guard)", async () => {
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://couch.example.com",
+        couchDbName: "vault-x",
+        couchDbUser: "alice",
+        couchDbPassword: "hunter2",
+        excludePatterns: [],
+      }),
+    );
+    // Store has user but NOT password — incomplete, must not delete from file.
+    secretStorage(plugin).setSecret(SECRET_ID_COUCH_USER, "alice");
+
+    const result = await plugin.scrubInVaultSecrets();
+    expect(result.scrubbed).toBe(false);
+
+    const onDisk = JSON.parse(plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!);
+    // File secret preserved — never delete what the store can't yet serve.
+    expect(onDisk.couchDbUser).toBe("alice");
+    expect(onDisk.couchDbPassword).toBe("hunter2");
+  });
+
+  it("is a no-op (scrubbed=false) when the file already has no secret keys", async () => {
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://couch.example.com",
+        couchDbName: "vault-x",
+        excludePatterns: [],
+      }),
+    );
+    secretStorage(plugin).setSecret(SECRET_ID_COUCH_USER, "alice");
+    secretStorage(plugin).setSecret(SECRET_ID_COUCH_PASSWORD, "hunter2");
+
+    const result = await plugin.scrubInVaultSecrets();
+    expect(result.scrubbed).toBe(false);
+  });
+});
+
 // ---- onload DB name auto-derive tests ----
 
 /** Helper DOM element stub used in onload tests */

@@ -117,6 +117,21 @@ export default class VaultSyncPlugin extends Plugin {
       callback: () => this.replaceLocalFromServer(),
     });
 
+    // Phase B scrub (#78): operator-gated removal of the legacy in-vault secret
+    // once it is confirmed safe in the store. Never runs automatically.
+    this.addCommand({
+      id: "migrate-secrets",
+      name: "Migrate secrets out of vault file (remove legacy credentials)",
+      callback: async () => {
+        const { scrubbed } = await this.scrubInVaultSecrets();
+        new Notice(
+          scrubbed
+            ? "Vault Sync: legacy credentials removed from .vault-sync.json (now in the secret store)."
+            : "Vault Sync: nothing to migrate — credentials not yet in the secret store, or already removed.",
+        );
+      },
+    });
+
     // Auto-start if configured
     if (this.settings.couchDbUrl && this.settings.couchDbName) {
       // Delay start slightly to let Obsidian finish loading on mobile
@@ -367,6 +382,53 @@ export default class VaultSyncPlugin extends Plugin {
     const store = this.getSecretStore();
     await store.set(SECRET_ID_COUCH_USER, this.settings.couchDbUser ?? "");
     await store.set(SECRET_ID_COUCH_PASSWORD, this.settings.couchDbPassword ?? "");
+  }
+
+  /**
+   * Phase B scrub (#78) — operator-gated, NEVER automatic.
+   *
+   * Strip couchDbUser/couchDbPassword from .vault-sync.json, write-BEFORE-delete:
+   * only remove the in-vault secret after confirming BOTH credentials are present
+   * in the store, so a device that lost its store value is never left unable to
+   * authenticate. The file is otherwise left intact (non-secret keys untouched).
+   *
+   * Returns { scrubbed } so the command/UI can report the outcome. Extracted as a
+   * standalone method (not buried in the command callback) for direct testing.
+   */
+  async scrubInVaultSecrets(): Promise<{ scrubbed: boolean }> {
+    // Read the current file. No file → nothing to scrub.
+    let onDisk: Record<string, unknown>;
+    try {
+      const raw = await this.app.vault.adapter.read(VAULT_SYNC_CONFIG_FILE);
+      onDisk = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return { scrubbed: false };
+    }
+
+    const hasFileSecret =
+      onDisk.couchDbUser !== undefined || onDisk.couchDbPassword !== undefined;
+    if (!hasFileSecret) {
+      return { scrubbed: false };
+    }
+
+    // Write-before-delete: confirm the store can serve BOTH credentials first.
+    const store = this.getSecretStore();
+    const storeUser = await store.get(SECRET_ID_COUCH_USER);
+    const storePassword = await store.get(SECRET_ID_COUCH_PASSWORD);
+    if (!storeUser || !storePassword) {
+      console.warn(
+        "[vault-sync] migrate-secrets: store is missing a credential — refusing to scrub the in-vault secret (write-before-delete).",
+      );
+      return { scrubbed: false };
+    }
+
+    delete onDisk.couchDbUser;
+    delete onDisk.couchDbPassword;
+    await this.app.vault.adapter.write(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify(onDisk, null, 2),
+    );
+    return { scrubbed: true };
   }
 
   // --- Sync control ---
