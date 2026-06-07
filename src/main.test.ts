@@ -1,7 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { Plugin, Vault, TFile } from "./__mocks__/obsidian";
+import { Plugin, Vault, TFile, SecretStorage } from "./__mocks__/obsidian";
 import * as obsidianMock from "./__mocks__/obsidian";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
+import { SECRET_ID_COUCH_USER, SECRET_ID_COUCH_PASSWORD } from "./secret-store";
 // Since v2.0 (issue #69) the plugin constructs PouchDbSyncEngine on every platform.
 // The `SyncEngine` alias keeps the engine-agnostic test bodies below unchanged.
 import { PouchDbSyncEngine as SyncEngine } from "./PouchDbSyncEngine";
@@ -66,9 +67,13 @@ function makePlugin(): VaultSyncPlugin {
   // VaultSyncPlugin extends Plugin; the mock Plugin constructor is safe to call
   // but TypeScript requires manifest.  We bypass via Object.create + manual init.
   const vault = new Vault();
+  const secretStorage = new SecretStorage();
   const plugin = Object.create(VaultSyncPlugin.prototype) as VaultSyncPlugin;
-  // Wire up app the same way the Plugin mock does
-  (plugin as unknown as { app: { vault: Vault } }).app = { vault };
+  // Wire up app the same way the Plugin mock does — incl. secretStorage (#78)
+  (plugin as unknown as { app: { vault: Vault; secretStorage: SecretStorage } }).app = {
+    vault,
+    secretStorage,
+  };
   // loadData / saveData come from Plugin base; mock them directly
   plugin.loadData = vi.fn().mockResolvedValue({});
   plugin.saveData = vi.fn().mockResolvedValue(undefined);
@@ -263,6 +268,233 @@ describe("VaultSyncPlugin.saveSettings", () => {
     const written = plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!;
     // Pretty-printed JSON contains newlines
     expect(written).toContain("\n");
+  });
+});
+
+// ---- Secret store: loadSettings precedence + Phase-A dual-read (#78) ----
+
+describe("VaultSyncPlugin.loadSettings — secret store precedence (#78)", () => {
+  let plugin: VaultSyncPlugin;
+
+  beforeEach(() => {
+    plugin = makePlugin();
+  });
+
+  function secretStorage(plugin: VaultSyncPlugin): SecretStorage {
+    return (plugin as unknown as { app: { secretStorage: SecretStorage } }).app.secretStorage;
+  }
+
+  it("uses the secret-store secret over the legacy in-vault secret when both present", async () => {
+    // In-vault file still carries a legacy secret...
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://couch.example.com",
+        couchDbName: "vault-x",
+        couchDbUser: "legacy-user",
+        couchDbPassword: "legacy-pass",
+        excludePatterns: [],
+      }),
+    );
+    // ...but the store holds the authoritative secret.
+    secretStorage(plugin).setSecret(SECRET_ID_COUCH_USER, "store-user");
+    secretStorage(plugin).setSecret(SECRET_ID_COUCH_PASSWORD, "store-pass");
+
+    await plugin.loadSettings();
+
+    expect(plugin.settings.couchDbUser).toBe("store-user");
+    expect(plugin.settings.couchDbPassword).toBe("store-pass");
+  });
+
+  it("Phase A: copies a legacy in-vault secret INTO the store without deleting it from the file", async () => {
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://couch.example.com",
+        couchDbName: "vault-x",
+        couchDbUser: "legacy-user",
+        couchDbPassword: "legacy-pass",
+        excludePatterns: [],
+      }),
+    );
+    // Store starts empty — Phase A should populate it from the file.
+    expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_USER)).toBeNull();
+
+    await plugin.loadSettings();
+
+    // Settings resolve from the legacy value (the only source available).
+    expect(plugin.settings.couchDbUser).toBe("legacy-user");
+    expect(plugin.settings.couchDbPassword).toBe("legacy-pass");
+
+    // Phase A additive copy: store now has the secret...
+    expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_USER)).toBe("legacy-user");
+    expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_PASSWORD)).toBe("legacy-pass");
+
+    // ...and the in-vault file STILL carries it (never deleted on load — invariant 2).
+    const onDisk = JSON.parse(plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!);
+    expect(onDisk.couchDbUser).toBe("legacy-user");
+    expect(onDisk.couchDbPassword).toBe("legacy-pass");
+  });
+
+  it("Phase A does NOT overwrite an existing store secret with the legacy in-vault value", async () => {
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://couch.example.com",
+        couchDbName: "vault-x",
+        couchDbUser: "legacy-user",
+        couchDbPassword: "legacy-pass",
+        excludePatterns: [],
+      }),
+    );
+    secretStorage(plugin).setSecret(SECRET_ID_COUCH_USER, "store-user");
+    secretStorage(plugin).setSecret(SECRET_ID_COUCH_PASSWORD, "store-pass");
+
+    await plugin.loadSettings();
+
+    // Store value preserved (write-new only).
+    expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_USER)).toBe("store-user");
+    expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_PASSWORD)).toBe("store-pass");
+  });
+});
+
+// ---- Secret store: split saveSettings (non-secret) vs saveSecrets (store) (#78) ----
+
+describe("VaultSyncPlugin.saveSettings — preserves on-disk legacy secret (#78)", () => {
+  let plugin: VaultSyncPlugin;
+
+  beforeEach(() => {
+    plugin = makePlugin();
+  });
+
+  it("overwrites only non-secret keys and preserves the on-disk legacy secret verbatim", async () => {
+    // Pre-existing file carries a legacy secret the daemon/old plugin still reads.
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://old.example.com",
+        couchDbName: "vault-old",
+        couchDbUser: "ondisk-user",
+        couchDbPassword: "ondisk-pass",
+        excludePatterns: [".trash/"],
+      }),
+    );
+
+    // In-memory settings have DIFFERENT (or empty) secret values — these must NOT
+    // be written to the file. Only the non-secret keys change.
+    plugin.settings = {
+      couchDbUrl: "https://new.example.com",
+      couchDbName: "vault-new",
+      couchDbUser: "in-memory-user",
+      couchDbPassword: "in-memory-pass",
+      excludePatterns: [".trash/", ".obsidian/"],
+    };
+
+    await plugin.saveSettings();
+
+    const onDisk = JSON.parse(plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!);
+    // Non-secret keys updated from in-memory settings.
+    expect(onDisk.couchDbUrl).toBe("https://new.example.com");
+    expect(onDisk.couchDbName).toBe("vault-new");
+    expect(onDisk.excludePatterns).toEqual([".trash/", ".obsidian/"]);
+    // Secret keys preserved verbatim from disk — NOT taken from in-memory settings.
+    // This is the single most error-prone invariant: the naive "stringify minus
+    // secrets" would have written in-memory values or stripped the on-disk secret.
+    expect(onDisk.couchDbUser).toBe("ondisk-user");
+    expect(onDisk.couchDbPassword).toBe("ondisk-pass");
+  });
+
+  it("does not introduce secret keys when the on-disk file has none (already scrubbed / Phase B done)", async () => {
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://couch.example.com",
+        couchDbName: "vault-x",
+        excludePatterns: [],
+      }),
+    );
+    plugin.settings = {
+      couchDbUrl: "https://couch.example.com",
+      couchDbName: "vault-x",
+      couchDbUser: "in-memory-user",
+      couchDbPassword: "in-memory-pass",
+      excludePatterns: [],
+    };
+
+    await plugin.saveSettings();
+
+    const onDisk = JSON.parse(plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!);
+    // The scrubbed file must stay scrubbed — saveSettings must not re-introduce
+    // the in-memory secret onto disk.
+    expect(onDisk.couchDbUser).toBeUndefined();
+    expect(onDisk.couchDbPassword).toBeUndefined();
+  });
+
+  it("writes non-secret keys even when no file exists yet (fresh install)", async () => {
+    plugin.settings = {
+      couchDbUrl: "https://couch.example.com",
+      couchDbName: "vault-fresh",
+      couchDbUser: "u",
+      couchDbPassword: "p",
+      excludePatterns: [".trash/"],
+    };
+
+    await plugin.saveSettings();
+
+    const onDisk = JSON.parse(plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!);
+    expect(onDisk.couchDbUrl).toBe("https://couch.example.com");
+    expect(onDisk.couchDbName).toBe("vault-fresh");
+    // No on-disk secret existed, so none is written.
+    expect(onDisk.couchDbUser).toBeUndefined();
+    expect(onDisk.couchDbPassword).toBeUndefined();
+  });
+});
+
+describe("VaultSyncPlugin.saveSecrets — writes to the store, not the vault file (#78)", () => {
+  let plugin: VaultSyncPlugin;
+
+  beforeEach(() => {
+    plugin = makePlugin();
+  });
+
+  function secretStorage(plugin: VaultSyncPlugin): SecretStorage {
+    return (plugin as unknown as { app: { secretStorage: SecretStorage } }).app.secretStorage;
+  }
+
+  it("persists couchDbUser/couchDbPassword to the secret store", async () => {
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      couchDbUser: "alice",
+      couchDbPassword: "hunter2",
+    };
+
+    await plugin.saveSecrets();
+
+    expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_USER)).toBe("alice");
+    expect(secretStorage(plugin).getSecret(SECRET_ID_COUCH_PASSWORD)).toBe("hunter2");
+  });
+
+  it("does NOT write the secret into .vault-sync.json", async () => {
+    plugin.app.vault.adapter._setStored(
+      VAULT_SYNC_CONFIG_FILE,
+      JSON.stringify({
+        couchDbUrl: "https://couch.example.com",
+        couchDbName: "vault-x",
+        excludePatterns: [],
+      }),
+    );
+    plugin.settings = {
+      ...DEFAULT_SETTINGS,
+      couchDbName: "vault-x",
+      couchDbUser: "alice",
+      couchDbPassword: "hunter2",
+    };
+
+    await plugin.saveSecrets();
+
+    const onDisk = JSON.parse(plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!);
+    expect(onDisk.couchDbUser).toBeUndefined();
+    expect(onDisk.couchDbPassword).toBeUndefined();
   });
 });
 

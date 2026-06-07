@@ -5,6 +5,15 @@ import { VaultSyncSettingTab } from "./settings-tab";
 import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics } from "./types";
 import { DEFAULT_SETTINGS, VAULT_SYNC_CONFIG_FILE } from "./types";
 import { slugify } from "./slugify";
+import type { SecretStore } from "./secret-store";
+import {
+  SecretStorageSecretStore,
+  resolveSecret,
+  SECRET_ID_COUCH_USER,
+  SECRET_ID_COUCH_PASSWORD,
+  ENV_COUCH_USER,
+  ENV_COUCH_PASSWORD,
+} from "./secret-store";
 
 /**
  * Vault Sync - CouchDB replication for Obsidian.
@@ -28,6 +37,12 @@ export default class VaultSyncPlugin extends Plugin {
    * to the live vault name and rebuilds the engine when they diverge (issue #56).
    */
   private engineVaultName: string = "";
+  /**
+   * Out-of-vault credential store (#78). Lazily built from `app.secretStorage`
+   * on first use so tests can pre-inject a fake. Defaults to the real
+   * SecretStorageSecretStore in production.
+   */
+  private secretStore: SecretStore | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -184,6 +199,26 @@ export default class VaultSyncPlugin extends Plugin {
 
   // --- Settings persistence ---
 
+  /**
+   * Lazily resolve the secret store, defaulting to the runtime-backed
+   * SecretStorageSecretStore. Tests inject a fake by pre-setting this.secretStore.
+   */
+  private getSecretStore(): SecretStore {
+    if (!this.secretStore) {
+      this.secretStore = new SecretStorageSecretStore(this.app);
+    }
+    return this.secretStore;
+  }
+
+  /**
+   * iOS-safe process.env accessor. `process` is undefined on mobile Obsidian,
+   * so guard the global before touching it (an unguarded read throws on the
+   * exact platform the AC names).
+   */
+  private getProcessEnv(): Record<string, string | undefined> | undefined {
+    return typeof process !== "undefined" ? process.env : undefined;
+  }
+
   async loadSettings(): Promise<void> {
     // Primary: read from .vault-sync.json at vault root
     try {
@@ -191,6 +226,7 @@ export default class VaultSyncPlugin extends Plugin {
       try {
         const parsed = JSON.parse(raw);
         this.settings = Object.assign({}, DEFAULT_SETTINGS, parsed);
+        await this.applySecretStore();
         return;
       } catch {
         console.warn("[vault-sync] Failed to parse .vault-sync.json, falling back to data.json");
@@ -232,14 +268,105 @@ export default class VaultSyncPlugin extends Plugin {
       );
       await this.saveData({});
     }
+
+    await this.applySecretStore();
   }
 
+  /**
+   * Resolve couchDbUser/couchDbPassword by precedence (env > store > legacy
+   * in-vault) and assemble them into the in-memory settings, then run the Phase-A
+   * additive migration (#78).
+   *
+   * Phase A is automatic and ADDITIVE ONLY: if the store lacks a secret but the
+   * legacy in-vault value is present, copy it into the store (write-new). The
+   * in-vault file is NEVER mutated here — the operator-gated Phase B scrub
+   * (migrate-secrets) owns deletion. This lets an un-upgraded daemon/device that
+   * still reads the in-vault secret keep working while new code reads the store.
+   */
+  private async applySecretStore(): Promise<void> {
+    const store = this.getSecretStore();
+    const env = this.getProcessEnv();
+
+    // Legacy values currently sitting in the loaded (in-vault) settings.
+    const legacyUser = this.settings.couchDbUser ?? "";
+    const legacyPassword = this.settings.couchDbPassword ?? "";
+
+    const resolvedUser = await resolveSecret({
+      envName: ENV_COUCH_USER,
+      env,
+      store,
+      id: SECRET_ID_COUCH_USER,
+      legacy: legacyUser,
+    });
+    const resolvedPassword = await resolveSecret({
+      envName: ENV_COUCH_PASSWORD,
+      env,
+      store,
+      id: SECRET_ID_COUCH_PASSWORD,
+      legacy: legacyPassword,
+    });
+
+    this.settings.couchDbUser = resolvedUser;
+    this.settings.couchDbPassword = resolvedPassword;
+
+    // Phase A — additive copy of a legacy in-vault secret into the store.
+    // Write-new only: never overwrite an existing store secret, never delete
+    // from the file.
+    if (store.isAvailable()) {
+      if (legacyUser && !(await store.get(SECRET_ID_COUCH_USER))) {
+        await store.set(SECRET_ID_COUCH_USER, legacyUser);
+      }
+      if (legacyPassword && !(await store.get(SECRET_ID_COUCH_PASSWORD))) {
+        await store.set(SECRET_ID_COUCH_PASSWORD, legacyPassword);
+      }
+    }
+  }
+
+  /**
+   * Persist NON-SECRET config to .vault-sync.json (#78).
+   *
+   * Reads the existing file and overwrites only couchDbUrl/couchDbName/
+   * excludePatterns, carrying any on-disk couchDbUser/couchDbPassword through
+   * VERBATIM. The secret value is NEVER sourced from in-memory settings here:
+   * doing so would either re-introduce the secret onto a scrubbed file or
+   * (with the naive "stringify minus secrets") strip an un-upgraded consumer's
+   * legacy credential — an accidental Phase B that breaks sync (invariant 1).
+   * Secrets are written separately via saveSecrets() → the store.
+   */
   async saveSettings(): Promise<void> {
+    // Read whatever is currently on disk so we preserve its secret keys verbatim.
+    let onDisk: Record<string, unknown> = {};
+    try {
+      const raw = await this.app.vault.adapter.read(VAULT_SYNC_CONFIG_FILE);
+      onDisk = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      // No file yet (fresh install) or unparseable — start from an empty object.
+      onDisk = {};
+    }
+
+    // Overwrite only the non-secret keys from in-memory settings.
+    onDisk.couchDbUrl = this.settings.couchDbUrl;
+    onDisk.couchDbName = this.settings.couchDbName;
+    onDisk.excludePatterns = this.settings.excludePatterns;
+    // couchDbUser / couchDbPassword are intentionally left as found on disk —
+    // present → preserved verbatim; absent → stay absent.
+
     await this.app.vault.adapter.write(
       VAULT_SYNC_CONFIG_FILE,
-      JSON.stringify(this.settings, null, 2)
+      JSON.stringify(onDisk, null, 2)
     );
     this.strategy?.updateSettings(this.settings);
+  }
+
+  /**
+   * Persist the SECRET credentials to the out-of-vault store (#78), never to
+   * .vault-sync.json. Called from the settings tab when the user edits the
+   * username/password fields.
+   */
+  async saveSecrets(): Promise<void> {
+    const store = this.getSecretStore();
+    await store.set(SECRET_ID_COUCH_USER, this.settings.couchDbUser ?? "");
+    await store.set(SECRET_ID_COUCH_PASSWORD, this.settings.couchDbPassword ?? "");
   }
 
   // --- Sync control ---
