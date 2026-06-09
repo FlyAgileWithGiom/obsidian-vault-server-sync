@@ -264,9 +264,9 @@ export class PouchDbFsBridge {
     // (only files are stored). Without this sweep the nested file docs survive and
     // are re-materialized onto disk by the live changes feed ("ghost files").
     //
-    // Range: [file/<path>/, file/<path>/￿] — the trailing "/" ensures siblings
+    // Range: [file/<path>/, file/<path>/"\uffff"] — the trailing "/" ensures siblings
     // like "file/MyFolder.md" or "file/MyFolderOther/…" are excluded.
-    // ￿ is the highest BMP code-point, safe as a range upper-bound sentinel.
+    // "\uffff" (U+FFFF) is the highest BMP code-point, safe as a range upper-bound sentinel.
     //
     // allDocs excludes already-deleted docs by default, so this sweep is idempotent:
     // calling it twice (e.g. if the runtime also fires per-file events) is a no-op
@@ -274,7 +274,7 @@ export class PouchDbFsBridge {
     const prefix = docId + "/";
     const result = await this.db.allDocs({
       startkey: prefix,
-      endkey: prefix + "￿",
+      endkey: prefix + "\uffff",
     });
     await Promise.all(
       result.rows.map(row => this.markDeletedInPouch(row.id)),
