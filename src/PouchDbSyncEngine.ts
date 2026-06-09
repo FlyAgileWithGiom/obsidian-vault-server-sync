@@ -91,6 +91,30 @@ export const TEXT_SELECTOR = { _attachments: { $exists: false } } as const;
 const INITIAL_BACKOFF_MS = 2_000;
 const MAX_BACKOFF_MS = 60_000;
 
+/**
+ * Durable marker store injected into the engine to protect the crash window
+ * in replaceLocalFromServer().
+ *
+ * The marker is written BEFORE any destructive operation (DB destroy or FS wipe)
+ * and cleared only AFTER the initial pull completes. If the process crashes in
+ * between, the next startup finds the marker and skips reconcile entirely
+ * (preventing tombstoning of intentionally-absent FS files), then resumes the
+ * replace with a fresh full pull.
+ *
+ * The store must be backed by durable storage that outlives a process crash:
+ *   - Daemon path: a file in ~/Library/Application Support/vault-sync-daemon/<dbName>/
+ *     (outside vault, outside pouchDir — survives both wipeLocalFiles and db.destroy)
+ *   - Plugin path: a file in the vault root (already in DEFAULT_SETTINGS.excludePatterns,
+ *     so it never syncs to CouchDB)
+ *
+ * Callers that do not inject a store get the legacy behaviour (no marker, no protection).
+ */
+export interface ReplaceMarkerStore {
+  write(): void;
+  clear(): void;
+  has(): boolean;
+}
+
 export class PouchDbSyncEngine {
   // --- Callbacks (set by main.ts before register()) ---
   onStateChange: (state: SyncState) => void = () => {};
@@ -147,12 +171,24 @@ export class PouchDbSyncEngine {
   // RC2 — startup reconciliation conflict counter (AC2.4)
   private _reconcileConflicts = 0;
 
+  // Crash-safe replace marker store (optional injection).
+  private replaceMarkerStore: ReplaceMarkerStore | null = null;
+
   constructor(
     private settings: VaultSyncSettings,
     private db: PouchDB,
     private readonly bridge: PouchDbFsBridge,
     private readonly dbFactory?: () => PouchDB,
   ) {}
+
+  /**
+   * Inject a durable replace-marker store. Must be called before any
+   * replaceLocalFromServer() invocation. See ReplaceMarkerStore for the
+   * contract. Optional: callers that omit this get no crash-safe protection.
+   */
+  setReplaceMarkerStore(store: ReplaceMarkerStore): void {
+    this.replaceMarkerStore = store;
+  }
 
   // --- Lifecycle ---
 
@@ -242,6 +278,13 @@ export class PouchDbSyncEngine {
     this.initialPullRunning = false;
     this.setState("syncing");
 
+    // Write durable marker BEFORE touching anything. If the process crashes
+    // anywhere after this point, the next startup finds the marker, skips
+    // reconcile (preventing tombstoning of intentionally-absent FS files),
+    // and resumes with a fresh full pull. Cleared in the runInitialPull
+    // complete handler only after the pull finishes successfully.
+    this.replaceMarkerStore?.write();
+
     // Suspend vault->PouchDB event handling for the WHOLE operation. The bulk wipe
     // fires an FS delete event per file, and the pull fires FS write events; none
     // must propagate back to PouchDB, or the wipe could push deletions UPSTREAM to
@@ -249,7 +292,30 @@ export class PouchDbSyncEngine {
     // authoritative during a replace. Cleared in finally once the pull has settled.
     this.bridge.setSuppressVaultEvents(true);
     try {
-      // Wipe local vault files BEFORE destroying the DB.
+      // Destroy the DB FIRST (crash-safe order).
+      //
+      // Old (buggy) order: wipeLocalFiles → db.destroy → pull
+      // Crash window: after wipe but before destroy → PouchDB has all docs, FS
+      // empty → next reconcile tombstones everything → 319 notes lost.
+      //
+      // New (safe) order: db.destroy → wipeLocalFiles → pull
+      // Any crash after destroy leaves an empty PouchDB; the next startup either
+      // hits doc_count=0 (first-run gate skips reconcile) or finds the durable
+      // marker above and skips reconcile, then resumes a fresh pull.
+      try {
+        await (this.db as unknown as { destroy(): Promise<void> }).destroy();
+      } catch (e) {
+        // Non-fatal: log and continue — we are creating a fresh instance regardless.
+        console.warn("[vault-sync] replaceLocalFromServer: db.destroy() failed:", e);
+      }
+
+      // Recreate the db and propagate the new instance to the bridge BEFORE wiping
+      // the FS, so the bridge's changes listener uses the fresh (empty) db.
+      this.db = this.dbFactory();
+      this.bridge.setDb(this.db);
+
+      // Now wipe local vault files. With an empty PouchDB any crash here is safe:
+      // the next boot sees doc_count=0 → first-run gate skips reconcile → fresh pull.
       // The plugin's DEFAULT_SETTINGS already excludes .trash/, .obsidian/,
       // .vault-sync-state.json, and .vault-sync.json.  Add .git for Git repos.
       const excludePatterns = [".git", ...this.settings.excludePatterns];
@@ -257,19 +323,10 @@ export class PouchDbSyncEngine {
         (relPath) => isPathExcluded(relPath, excludePatterns),
       );
 
-      try {
-        await (this.db as unknown as { destroy(): Promise<void> }).destroy();
-      } catch (e) {
-        // Non-fatal: log and continue — we are creating a fresh instance regardless.
-        console.warn("[vault-sync] replaceLocalFromServer: db.destroy() failed:", e);
-      }
-      // Recreate the db and propagate the new instance to the bridge so its
-      // changes listener and all subsequent db.put/db.get calls use the fresh db.
-      this.db = this.dbFactory();
-      this.bridge.setDb(this.db);
       this.started = true;
       await this.runInitialPull();
       // runInitialPull's complete handler calls startLiveSync() + setState("ok").
+      // The marker is cleared in the complete handler after the pull succeeds.
     } finally {
       // Resume normal vault->PouchDB handling. The pull's own writes are covered by
       // the per-doc echo sentinel set in applyRemoteChange, so steady state is safe.
@@ -414,6 +471,10 @@ export class PouchDbSyncEngine {
         this.initialPullRunning = false;
         this.syncHandle = null;
         this.cleanupLegacyRevMap();
+        // Clear the crash-safe replace marker: the pull completed successfully,
+        // so PouchDB and FS are consistent. The marker no longer needs to suppress
+        // reconcile on the next startup.
+        this.replaceMarkerStore?.clear();
         // Phase-1 done: notes are usable. State stays "syncing" (binaries pending) — the
         // phase, not the state, carries the "ready" signal so the UI never lies "Synced".
         this.setPhase("text-ready");

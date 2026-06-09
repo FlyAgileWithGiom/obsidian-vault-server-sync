@@ -354,6 +354,18 @@ export async function runReconcileOnStartup(opts: {
   };
   remoteDb: RemoteDbForPhantomCheck;
   excludePatterns: string[];
+  /**
+   * Optional crash-safe replace marker check. When present and returning true,
+   * reconcile is skipped entirely regardless of doc_count, because the absence
+   * of FS files is intentional (a replace was interrupted). The caller is
+   * responsible for resuming the replace (running a fresh full pull) and
+   * clearing the marker only after the pull completes successfully.
+   *
+   * Without this guard, a crash during replaceLocalFromServer() after FS wipe
+   * but before/during re-pull would cause reconcile to tombstone all 319 docs
+   * (AC2.3a: local rev === remote rev, FS absent → tombstone).
+   */
+  hasReplaceMarker?: () => boolean;
 }): Promise<{
   push: number;
   pull: number;
@@ -362,6 +374,13 @@ export async function runReconcileOnStartup(opts: {
   skip: number;
 } | null> {
   const { db, bridge, vaultAdapter, remoteDb, excludePatterns } = opts;
+
+  // Crash-safe replace marker gate: a replace was interrupted — skip reconcile
+  // entirely. FS absence is intentional. The caller resumes with a fresh pull.
+  if (opts.hasReplaceMarker?.()) {
+    console.log("[vault-sync] reconcile: replace-in-progress marker found — skipping reconcile (FS-absent files are intentional)");
+    return null;
+  }
 
   // Non-first-run gate (AC2.6): skip reconcile entirely on first run.
   // First run = PouchDB is empty. The two-phase pull (#72) owns first-run population.
