@@ -93,6 +93,8 @@ declare module "pouchdb-browser" {
     allDocs(opts?: {
       include_docs?: boolean;
       attachments?: boolean;
+      startkey?: string;
+      endkey?: string;
     }): Promise<PouchDbAllDocsResult>;
 
     put(doc: PouchDbDoc): Promise<PouchDbPutResult>;

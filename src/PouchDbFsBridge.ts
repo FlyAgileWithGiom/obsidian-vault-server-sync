@@ -246,6 +246,7 @@ export class PouchDbFsBridge {
   }
 
   private async markDeletedInPouch(docId: string): Promise<void> {
+    // Tombstone the exact docId (handles single-file delete; 404 = no-op for folders).
     try {
       const existing = await this.db.get(docId);
       await this.db.put({
@@ -256,6 +257,28 @@ export class PouchDbFsBridge {
     } catch {
       // Doc doesn't exist — no-op
     }
+
+    // Sweep all descendant file docs under this path.
+    //
+    // Folder-level FS events produce docId "file/MyFolder" which has no PouchDB doc
+    // (only files are stored). Without this sweep the nested file docs survive and
+    // are re-materialized onto disk by the live changes feed ("ghost files").
+    //
+    // Range: [file/<path>/, file/<path>/￿] — the trailing "/" ensures siblings
+    // like "file/MyFolder.md" or "file/MyFolderOther/…" are excluded.
+    // ￿ is the highest BMP code-point, safe as a range upper-bound sentinel.
+    //
+    // allDocs excludes already-deleted docs by default, so this sweep is idempotent:
+    // calling it twice (e.g. if the runtime also fires per-file events) is a no-op
+    // on the second pass.
+    const prefix = docId + "/";
+    const result = await this.db.allDocs({
+      startkey: prefix,
+      endkey: prefix + "￿",
+    });
+    await Promise.all(
+      result.rows.map(row => this.markDeletedInPouch(row.id)),
+    );
   }
 
   // --- PouchDB -> Vault ---
