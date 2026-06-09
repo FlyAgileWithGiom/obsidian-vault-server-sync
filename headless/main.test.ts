@@ -355,6 +355,158 @@ describe("runReconcileOnStartup — skip-on-fetch-fail (critical safety)", () =>
 });
 
 // ---------------------------------------------------------------------------
+// Crash-safe replace marker (BUG: wipe-before-destroy crash window)
+//
+// The bug: replaceLocalFromServer() wiped the FS BEFORE destroying PouchDB.
+// If the process died in that window, the next boot saw:
+//   - PouchDB with all 319 docs (not destroyed)
+//   - FS empty (already wiped)
+// runReconcileOnStartup ran, found all docs FS-absent, and tombstoned all of
+// them → propagated to CouchDB → 319 notes deleted across all devices.
+//
+// The fix (three parts):
+//   1. Reverse the order: destroy PouchDB FIRST, then wipe FS.
+//   2. Write a durable marker before touching anything.
+//   3. On startup: if marker is present, skip reconcile entirely (treat as
+//      first-run regardless of doc_count) and resume with a fresh full pull.
+//      Clear the marker only after the pull completes successfully.
+// ---------------------------------------------------------------------------
+
+describe("runReconcileOnStartup — crash-safe replace marker (BUG crash window)", () => {
+  it("skips reconcile and returns null when hasReplaceMarker returns true (even with doc_count > 0)", async () => {
+    // Simulates the crash-during-replace scenario: PouchDB has 319 docs (it was
+    // partially populated during a prior pull that crashed), and the FS may be
+    // empty. Without the marker guard, runReconcileOnStartup would tombstone all
+    // 319 docs. With the marker, it must skip entirely.
+    const db = {
+      info: vi.fn(async () => ({ doc_count: 319 })),
+      allDocs: vi.fn(async () => ({
+        rows: [
+          { id: "file/note-1.md" },
+          { id: "file/note-2.md" },
+          { id: "file/note-3.md" },
+        ],
+      })),
+      get: vi.fn(async (id: string) => ({
+        _id: id, _rev: "1-abc", content: "was here",
+      })),
+    };
+    const bridge = {
+      reconcilePush: vi.fn(),
+      reconcilePull: vi.fn(),
+      reconcileTombstone: vi.fn(),
+      reconcileSuppressEcho: vi.fn(),
+    };
+
+    const result = await runReconcileOnStartup({
+      db,
+      bridge,
+      vaultAdapter: {
+        getFiles: () => [], // FS is empty — exactly the crash-window state
+        async readText() { throw new Error("not called"); },
+        async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); },
+        async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); },
+        async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); },
+        getEntryByPath(): import("../src/types").VaultEntry | null { return null; },
+      },
+      remoteDb: {
+        // Remote has the docs — same revs as local (exactly the AC2.3a tombstone condition).
+        // Shape: { key, value: { rev, deleted? } } as fetchRemoteRevs expects.
+        async allDocs(_opts: { keys: string[]; include_docs: false }) {
+          return {
+            rows: [
+              { key: "file/note-1.md", value: { rev: "1-abc" } },
+              { key: "file/note-2.md", value: { rev: "1-abc" } },
+              { key: "file/note-3.md", value: { rev: "1-abc" } },
+            ],
+          };
+        },
+      },
+      excludePatterns: [],
+      hasReplaceMarker: () => true, // marker present — replace was in progress
+    });
+
+    // Must skip entirely when marker is present
+    expect(result).toBeNull();
+
+    // The critical assertion: tombstone must NEVER be called when marker is present.
+    // Without the fix, reconcile would call reconcileTombstone 3 times (AC2.3a),
+    // deleting all 3 notes and propagating deletions to CouchDB.
+    expect(bridge.reconcileTombstone).not.toHaveBeenCalled();
+    expect(bridge.reconcilePush).not.toHaveBeenCalled();
+    // allDocs must not be called — skipped before reaching that point
+    expect(db.allDocs).not.toHaveBeenCalled();
+  });
+
+  it("still runs reconcile normally when hasReplaceMarker returns false", async () => {
+    // Control: without marker, non-first-run reconcile still runs as before
+    const db = {
+      info: vi.fn(async () => ({ doc_count: 5 })),
+      allDocs: vi.fn(async () => ({ rows: [] })),
+      get: vi.fn(async () => { throw { status: 404 }; }),
+    };
+
+    const result = await runReconcileOnStartup({
+      db,
+      bridge: {
+        reconcilePush: vi.fn(),
+        reconcilePull: vi.fn(),
+        reconcileTombstone: vi.fn(),
+        reconcileSuppressEcho: vi.fn(),
+      },
+      vaultAdapter: {
+        getFiles: () => [],
+        async readText() { throw new Error("not called"); },
+        async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); },
+        async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); },
+        async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); },
+        getEntryByPath(): import("../src/types").VaultEntry | null { return null; },
+      },
+      remoteDb: { async allDocs() { return { rows: [] }; } },
+      excludePatterns: [],
+      hasReplaceMarker: () => false, // no marker — normal reconcile path
+    });
+
+    // Non-first-run with no marker should still run reconcile (non-null result)
+    expect(result).not.toBeNull();
+    expect(db.allDocs).toHaveBeenCalled();
+  });
+
+  it("still runs reconcile normally when hasReplaceMarker is absent (backwards-compatible)", async () => {
+    // Callers that don't pass hasReplaceMarker get the original behavior
+    const db = {
+      info: vi.fn(async () => ({ doc_count: 5 })),
+      allDocs: vi.fn(async () => ({ rows: [] })),
+      get: vi.fn(async () => { throw { status: 404 }; }),
+    };
+
+    const result = await runReconcileOnStartup({
+      db,
+      bridge: {
+        reconcilePush: vi.fn(),
+        reconcilePull: vi.fn(),
+        reconcileTombstone: vi.fn(),
+        reconcileSuppressEcho: vi.fn(),
+      },
+      vaultAdapter: {
+        getFiles: () => [],
+        async readText() { throw new Error("not called"); },
+        async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); },
+        async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); },
+        async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); },
+        getEntryByPath(): import("../src/types").VaultEntry | null { return null; },
+      },
+      remoteDb: { async allDocs() { return { rows: [] }; } },
+      excludePatterns: [],
+      // hasReplaceMarker intentionally absent
+    });
+
+    expect(result).not.toBeNull();
+    expect(db.allDocs).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // loadConfig + Phase A/B (#78) — credential precedence and out-of-vault store
 // ---------------------------------------------------------------------------
 

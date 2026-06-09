@@ -737,16 +737,68 @@ describe("PouchDbSyncEngine — replaceLocalFromServer()", () => {
 
   // ---- Wipe-and-pull (replaces BUG #77 prune approach) ---------------------
 
-  it("calls bridge.wipeLocalFiles BEFORE db.destroy() and before runInitialPull", async () => {
+  // UPDATED: was "wipeLocalFiles BEFORE db.destroy()" — that was the BUG.
+  // The fix reverses the order: destroy DB FIRST, then wipe FS.
+  // Rationale: if the process crashes after FS-wipe but before DB-destroy,
+  // PouchDB still holds all docs; the next boot's reconcile sees FS-absent docs
+  // and tombstones them → 319 notes deleted. Destroying the DB first means any
+  // crash leaves an empty PouchDB (first-run gate skips reconcile). See BUG.
+  it("calls db.destroy() BEFORE bridge.wipeLocalFiles (crash-safe reorder)", async () => {
     const { engine, db, bridge } = makeEngine({ docCount: 5 });
     engine.register(makePlugin());
     await engine.replaceLocalFromServer();
     expect(bridge.wipeLocalFiles).toHaveBeenCalledOnce();
-    const wipeOrder = (bridge.wipeLocalFiles as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
     const destroyOrder = (db.destroy as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const wipeOrder = (bridge.wipeLocalFiles as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
     const pullOrder = (db.replicate.from as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-    expect(wipeOrder).toBeLessThan(destroyOrder);
+    // DB must be destroyed BEFORE FS is wiped (crash-safe order)
+    expect(destroyOrder).toBeLessThan(wipeOrder);
+    // Both must precede the pull
     expect(wipeOrder).toBeLessThan(pullOrder);
+  });
+
+  it("writes the replace marker BEFORE db.destroy() and clears it after pull completes", async () => {
+    // The durable marker protects the crash-during-pull window: if replicate.from
+    // writes 319 docs to PouchDB but only flushes 50 to FS before a crash, the next
+    // boot sees doc_count=319 (not 0) — the first-run gate alone is not enough.
+    // The marker overrides the doc_count check and forces a fresh pull.
+    const markerWrites: string[] = [];
+    const markerClears: string[] = [];
+    const callOrder: string[] = [];
+    const { engine, db, bridge } = makeEngine({ docCount: 5 });
+
+    // Track destroy and wipe order alongside marker writes
+    const origDestroy = (db.destroy as ReturnType<typeof vi.fn>);
+    origDestroy.mockImplementation(async () => { callOrder.push("destroy"); });
+    const origWipe = (bridge.wipeLocalFiles as ReturnType<typeof vi.fn>);
+    origWipe.mockImplementation(async () => { callOrder.push("wipe"); });
+
+    const markerStore = {
+      write: vi.fn(() => { markerWrites.push("write"); callOrder.push("marker-write"); }),
+      clear: vi.fn(() => { markerClears.push("clear"); callOrder.push("marker-clear"); }),
+      has: vi.fn(() => false),
+    };
+
+    engine.setReplaceMarkerStore(markerStore);
+    engine.register(makePlugin());
+    await engine.replaceLocalFromServer();
+
+    // Marker must have been written exactly once
+    expect(markerStore.write).toHaveBeenCalledOnce();
+    // Marker must have been cleared exactly once (after pull)
+    expect(markerStore.clear).toHaveBeenCalledOnce();
+
+    // Marker written BEFORE destroy (and therefore before wipe and pull)
+    const markerWriteIdx = callOrder.indexOf("marker-write");
+    const destroyIdx = callOrder.indexOf("destroy");
+    const wipeIdx = callOrder.indexOf("wipe");
+    const markerClearIdx = callOrder.indexOf("marker-clear");
+
+    expect(markerWriteIdx).toBeGreaterThanOrEqual(0);
+    expect(markerWriteIdx).toBeLessThan(destroyIdx);
+    expect(markerWriteIdx).toBeLessThan(wipeIdx);
+    // Marker cleared AFTER wipe (i.e., after all destructive operations)
+    expect(markerClearIdx).toBeGreaterThan(wipeIdx);
   });
 
   it("calls bridge.wipeLocalFiles with an isExcluded predicate that protects .git/ paths", async () => {
