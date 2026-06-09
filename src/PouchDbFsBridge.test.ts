@@ -36,6 +36,23 @@ function makePouchMock() {
   const attachments = new Map<string, AttachmentShape>();
   let revCounter = 0;
 
+  // allDocs: range-aware (for folder-delete sweep) or full scan.
+  // Mirrors real PouchDB behaviour: only returns live (non-deleted) docs.
+  async function allDocs(opts?: {
+    startkey?: string;
+    endkey?: string;
+    include_docs?: boolean;
+  }): Promise<{ rows: Array<{ id: string; doc?: DocShape }> }> {
+    const rows: Array<{ id: string; doc?: DocShape }> = [];
+    for (const [id, doc] of docs) {
+      if (doc._deleted) continue;
+      if (opts?.startkey !== undefined && id < opts.startkey) continue;
+      if (opts?.endkey !== undefined && id > opts.endkey) continue;
+      rows.push({ id, doc: opts?.include_docs ? { ...doc } : undefined });
+    }
+    return { rows };
+  }
+
   // Change listeners: { cancel(), on(event, handler) }
   type ChangeHandler = (change: { id: string; seq: number; deleted?: boolean; doc?: DocShape }) => void;
   type ErrorHandler = (err: unknown) => void;
@@ -127,6 +144,23 @@ function makePouchMock() {
       const att = attachments.get(key);
       if (!att) throw { status: 404 };
       return att;
+    },
+
+    async allDocs(opts?: {
+      include_docs?: boolean;
+      attachments?: boolean;
+      startkey?: string;
+      endkey?: string;
+    }): Promise<{ rows: Array<{ id: string; key: string; value: { rev: string; deleted?: boolean } }>; total_rows: number; offset: number }> {
+      const rows: Array<{ id: string; key: string; value: { rev: string; deleted?: boolean } }> = [];
+      for (const [id, doc] of docs.entries()) {
+        // Real PouchDB allDocs excludes deleted docs by default
+        if (doc._deleted) continue;
+        if (opts?.startkey !== undefined && id < opts.startkey) continue;
+        if (opts?.endkey !== undefined && id > opts.endkey) continue;
+        rows.push({ id, key: id, value: { rev: doc._rev ?? "" } });
+      }
+      return { rows, total_rows: rows.length, offset: 0 };
     },
 
     changes(_opts: unknown): typeof changesHandle {
@@ -1093,5 +1127,151 @@ describe("PouchDbFsBridge — wipeLocalFiles()", () => {
     expect(fileSpy).toHaveBeenCalled();
     expect(vault._getText("Work/report.md")).toBeUndefined(); // non-excluded removed
     expect(vault._getText("Work/private/secret.md")).toBe("keep"); // nested exclusion preserved
+  });
+});
+
+// ==========================================================================
+// Folder delete → descendant tombstone sweep (production bug fix)
+// ==========================================================================
+// Root cause: a folder-level delete event produces docId "file/MyFolder" which
+// has no corresponding PouchDB doc (only files have docs). The old handler did
+// db.get("file/MyFolder") → 404 → silent no-op. Nested file docs survived and
+// were re-materialized onto disk via the live changes feed ("ghost files").
+//
+// Fix: on any delete event, tombstone the exact docId (single-file path) AND
+// sweep all descendants under docId + "/" via allDocs prefix-range query.
+// ==========================================================================
+
+describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
+  let db: ReturnType<typeof makePouchMock>;
+  let vault: ReturnType<typeof makeVaultMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
+  let bridge: PouchDbFsBridge;
+
+  beforeEach(() => {
+    db = makePouchMock();
+    vault = makeVaultMock();
+    watcher = makeWatcherMock();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    bridge.start(watcher);
+  });
+
+  afterEach(() => {
+    bridge.stop();
+  });
+
+  it("tombstones all nested file docs when a folder delete event fires", async () => {
+    // Seed two files inside MyFolder into PouchDB
+    const paths = ["MyFolder/a.md", "MyFolder/b.md", "MyFolder/sub/c.md"];
+    for (const p of paths) {
+      vault._addText(p, "content");
+      watcher.emit({ type: "change", path: p });
+    }
+    await flushPromises();
+
+    // Confirm they are live
+    for (const p of paths) {
+      expect(db._docs.get(pathToDocId(p))?._deleted).toBeFalsy();
+    }
+
+    // Delete the folder — runtime fires ONE event for the folder path (no per-file events)
+    watcher.emit({ type: "delete", path: "MyFolder" });
+    await flushPromises();
+
+    // All three file docs must be tombstoned
+    for (const p of paths) {
+      const doc = db._docs.get(pathToDocId(p));
+      expect(doc, `expected doc for ${p} to exist`).toBeDefined();
+      expect(doc!._deleted, `expected ${p} to be tombstoned`).toBe(true);
+    }
+  });
+
+  it("does NOT tombstone siblings: MyFolder.md and MyFolderOther/x.md survive a MyFolder delete", async () => {
+    // Sibling note with same prefix (but no trailing slash match)
+    vault._addText("MyFolder.md", "sibling note");
+    watcher.emit({ type: "change", path: "MyFolder.md" });
+
+    // Sibling folder
+    vault._addText("MyFolderOther/x.md", "sibling folder file");
+    watcher.emit({ type: "change", path: "MyFolderOther/x.md" });
+
+    // One file inside the folder being deleted
+    vault._addText("MyFolder/inside.md", "will be deleted");
+    watcher.emit({ type: "change", path: "MyFolder/inside.md" });
+
+    await flushPromises();
+
+    // Delete MyFolder — must only affect docs under "file/MyFolder/"
+    watcher.emit({ type: "delete", path: "MyFolder" });
+    await flushPromises();
+
+    // Descendants tombstoned
+    const insideDoc = db._docs.get(pathToDocId("MyFolder/inside.md"));
+    expect(insideDoc?._deleted).toBe(true);
+
+    // Siblings must survive — the "/" boundary prevents false matches
+    const siblingNoteDoc = db._docs.get(pathToDocId("MyFolder.md"));
+    expect(siblingNoteDoc, "sibling note MyFolder.md should still exist").toBeDefined();
+    expect(siblingNoteDoc!._deleted, "sibling note MyFolder.md must NOT be tombstoned").toBeFalsy();
+
+    const siblingFolderDoc = db._docs.get(pathToDocId("MyFolderOther/x.md"));
+    expect(siblingFolderDoc, "sibling folder file MyFolderOther/x.md should still exist").toBeDefined();
+    expect(siblingFolderDoc!._deleted, "sibling folder file must NOT be tombstoned").toBeFalsy();
+  });
+
+  it("is idempotent: a second delete event for an already-tombstoned folder is a no-op", async () => {
+    vault._addText("Folder/note.md", "content");
+    watcher.emit({ type: "change", path: "Folder/note.md" });
+    await flushPromises();
+
+    // First delete
+    watcher.emit({ type: "delete", path: "Folder" });
+    await flushPromises();
+
+    expect(db._docs.get(pathToDocId("Folder/note.md"))?._deleted).toBe(true);
+
+    // Second delete — already tombstoned, allDocs skips deleted docs, markDeletedInPouch
+    // no-ops on 404. Should not throw or produce an error.
+    const putSpy = vi.spyOn(db, "put");
+    watcher.emit({ type: "delete", path: "Folder" });
+    await flushPromises();
+
+    // No new put() for already-tombstoned doc
+    expect(putSpy).not.toHaveBeenCalled();
+  });
+
+  it("tombstones the exact docId too when the deleted path is a single file (existing behaviour preserved)", async () => {
+    vault._addText("solo.md", "content");
+    watcher.emit({ type: "change", path: "solo.md" });
+    await flushPromises();
+
+    watcher.emit({ type: "delete", path: "solo.md" });
+    await flushPromises();
+
+    const doc = db._docs.get(pathToDocId("solo.md"));
+    expect(doc?._deleted).toBe(true);
+  });
+
+  it("echo-suppression preserved: bridge-applied remote delete is not re-tombstoned", async () => {
+    // Simulate bridge applying a remote delete: sentinel set to "" for docId
+    vault._addText("remote-del/note.md", "content");
+    watcher.emit({ type: "change", path: "remote-del/note.md" });
+    await flushPromises();
+
+    // Mark sentinel for the folder path as "" (as if bridge applied a remote delete)
+    // We test via the exact docId path: if sentinel is set for "file/remote-del",
+    // the folder delete event should be suppressed.
+    // Expose via reconcileSuppressEcho which calls setAppliedRev internally.
+    // Use empty string sentinel (delete sentinel).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (bridge as any).appliedRevs.set(pathToDocId("remote-del"), "");
+
+    const putSpy = vi.spyOn(db, "put");
+    watcher.emit({ type: "delete", path: "remote-del" });
+    await flushPromises();
+
+    // Bridge must not re-tombstone when sentinel is set
+    expect(putSpy).not.toHaveBeenCalled();
   });
 });
