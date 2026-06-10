@@ -1399,3 +1399,74 @@ describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
     errorSpy.mockRestore();
   });
 });
+
+// ==========================================================================
+// Folder RENAME — CHARACTERIZATION of a known data-loss path (fix DEFERRED)
+// ==========================================================================
+// ObsidianVaultWatcher maps a rename to delete(oldPath) + change(newPath).
+// For a FOLDER rename, change(newFolderPath) reaches onVaultEvent's "change"
+// branch, where getEntryByPath returns a folder (kind !== "file") → early
+// return. So the moved files are tombstoned at the OLD path and NEVER
+// recreated in PouchDB at the NEW path: a coarse folder-rename event loses the
+// moved files from the synced set.
+//
+// This test PINS that data-loss observable on purpose. It is NOT a forced pass
+// and the fix is intentionally deferred — it overlaps with a reconcile backstop
+// being designed separately. When the rename handling is fixed, this test should
+// be inverted (assert file/B/x.md IS pushed), turning red here into the spec.
+//
+// Severity caveat: this assumes Obsidian fires ONE coarse event for the folder
+// (the case modelled here). Whether the runtime instead fires one event per
+// child is unverified; per-child events would tombstone+recreate each file and
+// avoid the loss. The coarse case is the dangerous one, so that is what we pin.
+describe("PouchDbFsBridge — folder rename (coarse event) [DEFERRED data-loss characterization]", () => {
+  let db: ReturnType<typeof makePouchMock>;
+  let vault: ReturnType<typeof makeVaultMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
+  let bridge: PouchDbFsBridge;
+
+  beforeEach(() => {
+    db = makePouchMock();
+    vault = makeVaultMock();
+    watcher = makeWatcherMock();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    bridge.start(watcher);
+  });
+
+  afterEach(() => {
+    bridge.stop();
+  });
+
+  it("loses moved files: folder rename tombstones old path but never pushes new path", async () => {
+    // Seed A/x.md and push it to PouchDB (the pre-rename synced state).
+    vault._addText("A/x.md", "moved content");
+    watcher.emit({ type: "change", path: "A/x.md" });
+    await flushPromises();
+    expect(db._docs.get(pathToDocId("A/x.md"))?._deleted).toBeFalsy();
+
+    // The rename moves x.md from A/ to B/ on disk. Reflect that in the vault
+    // adapter: A/x.md gone, B/x.md present (so getEntryByPath("B") is a folder).
+    vault.getEntryByPath("A/x.md") &&
+      (await vault.deleteFile(vault.getEntryByPath("A/x.md") as VaultFile));
+    vault._addText("B/x.md", "moved content");
+
+    // Coarse folder-rename event: delete(A) + change(B).
+    watcher.emit({ type: "delete", path: "A" });
+    watcher.emit({ type: "change", path: "B" });
+    await flushPromises();
+
+    // OLD path is tombstoned (delete branch swept the descendant).
+    expect(
+      db._docs.get(pathToDocId("A/x.md"))?._deleted,
+      "old path A/x.md should be tombstoned",
+    ).toBe(true);
+
+    // NEW path is NEVER pushed: change(B) hit the folder early-return, so the
+    // moved file is absent from PouchDB → lost from the synced set. THIS IS THE BUG.
+    expect(
+      db._docs.has(pathToDocId("B/x.md")),
+      "DATA LOSS (deferred fix): B/x.md never made it into PouchDB after the rename",
+    ).toBe(false);
+  });
+});
