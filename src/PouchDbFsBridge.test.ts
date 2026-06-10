@@ -129,52 +129,6 @@ function makePouchMock() {
       return att;
     },
 
-    async allDocs(opts?: {
-      include_docs?: boolean;
-      attachments?: boolean;
-      startkey?: string;
-      endkey?: string;
-    }): Promise<{ rows: Array<{ id: string; key: string; value: { rev: string; deleted?: boolean }; doc?: DocShape }>; total_rows: number; offset: number }> {
-      const rows: Array<{ id: string; key: string; value: { rev: string; deleted?: boolean }; doc?: DocShape }> = [];
-      for (const [id, doc] of docs.entries()) {
-        // Real PouchDB allDocs excludes deleted docs by default
-        if (doc._deleted) continue;
-        if (opts?.startkey !== undefined && id < opts.startkey) continue;
-        if (opts?.endkey !== undefined && id > opts.endkey) continue;
-        rows.push({
-          id,
-          key: id,
-          value: { rev: doc._rev ?? "" },
-          // include_docs:true returns the full doc (mirrors real PouchDB) so the
-          // folder-delete bulk sweep can build tombstone stubs without a per-doc get.
-          ...(opts?.include_docs ? { doc: { ...doc } } : {}),
-        });
-      }
-      return { rows, total_rows: rows.length, offset: 0 };
-    },
-
-    // bulkDocs: write each doc with a bumped _rev (mirrors real PouchDB). Conflicts
-    // (stale _rev) are reported as per-doc error rows — NOT a thrown rejection — which
-    // is how real PouchDB surfaces a 409 in a bulk write. Tolerates an empty array.
-    async bulkDocs(
-      bulk: DocShape[],
-    ): Promise<Array<{ ok?: boolean; id?: string; rev?: string; error?: boolean; status?: number }>> {
-      const results: Array<{ ok?: boolean; id?: string; rev?: string; error?: boolean; status?: number }> = [];
-      for (const doc of bulk) {
-        const existing = docs.get(doc._id);
-        // Stale-rev conflict: the doc exists with a different _rev than the caller sent.
-        if (existing && doc._rev !== undefined && existing._rev !== doc._rev) {
-          results.push({ id: doc._id, error: true, status: 409 });
-          continue;
-        }
-        revCounter++;
-        const rev = `${revCounter}-abc`;
-        docs.set(doc._id, { ...doc, _rev: rev });
-        results.push({ ok: true, id: doc._id, rev });
-      }
-      return results;
-    },
-
     changes(_opts: unknown): typeof changesHandle {
       cancelled = false;
       return changesHandle;
@@ -1143,18 +1097,24 @@ describe("PouchDbFsBridge — wipeLocalFiles()", () => {
 });
 
 // ==========================================================================
-// Folder delete → descendant tombstone sweep (production bug fix)
+// Folder delete → per-descendant tombstone (no sweep)
 // ==========================================================================
-// Root cause: a folder-level delete event produces docId "file/MyFolder" which
-// has no corresponding PouchDB doc (only files have docs). The old handler did
-// db.get("file/MyFolder") → 404 → silent no-op. Nested file docs survived and
-// were re-materialized onto disk via the live changes feed ("ghost files").
+// Empirically verified (spikes/obsidian-event-semantics CDP spike +
+// scripts/smoke-folder-delete.sh real-artifact run): on desktop, mobile, and
+// the daemon's fs.watch, a folder delete fires a separate delete event PER
+// descendant file. Each child is therefore tombstoned by its own single-doc
+// event — onVaultEvent → markDeletedInPouch(childDocId). No folder-level
+// descendant sweep is needed (an earlier sweep was redundant AND raced the
+// per-file events, 409-conflicting on docs they had already deleted). The
+// daemon's startup reconcile is the backstop for any genuinely missed event.
 //
-// Fix: on any delete event, tombstone the exact docId (single-file path) AND
-// sweep all descendants under docId + "/" via allDocs prefix-range query.
+// These tests pin the single-doc delete behaviour, echo-suppression, and the
+// observability guarantee: a tombstone failure must surface, never be swallowed
+// (a swallowed failure leaves a doc LIVE → it re-materialises on disk as a
+// ghost file via the live changes feed — the exact bug this path guards against).
 // ==========================================================================
 
-describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
+describe("PouchDbFsBridge — single-file delete tombstone (no descendant sweep)", () => {
   let db: ReturnType<typeof makePouchMock>;
   let vault: ReturnType<typeof makeVaultMock>;
   let watcher: ReturnType<typeof makeWatcherMock>;
@@ -1173,105 +1133,12 @@ describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
     bridge.stop();
   });
 
-  it("tombstones all nested file docs when a folder delete event fires", async () => {
-    // Seed two files inside MyFolder into PouchDB
-    const paths = ["MyFolder/a.md", "MyFolder/b.md", "MyFolder/sub/c.md"];
-    for (const p of paths) {
-      vault._addText(p, "content");
-      watcher.emit({ type: "change", path: p });
-    }
-    await flushPromises();
-
-    // Confirm they are live
-    for (const p of paths) {
-      expect(db._docs.get(pathToDocId(p))?._deleted).toBeFalsy();
-    }
-
-    // Delete the folder — runtime fires ONE event for the folder path (no per-file events)
-    watcher.emit({ type: "delete", path: "MyFolder" });
-    await flushPromises();
-
-    // All three file docs must be tombstoned
-    for (const p of paths) {
-      const doc = db._docs.get(pathToDocId(p));
-      expect(doc, `expected doc for ${p} to exist`).toBeDefined();
-      expect(doc!._deleted, `expected ${p} to be tombstoned`).toBe(true);
-    }
-  });
-
-  it("does NOT tombstone siblings: MyFolder.md and MyFolderOther/x.md survive a MyFolder delete", async () => {
-    // Sibling note with same prefix (but no trailing slash match)
-    vault._addText("MyFolder.md", "sibling note");
-    watcher.emit({ type: "change", path: "MyFolder.md" });
-
-    // Sibling folder
-    vault._addText("MyFolderOther/x.md", "sibling folder file");
-    watcher.emit({ type: "change", path: "MyFolderOther/x.md" });
-
-    // One file inside the folder being deleted
-    vault._addText("MyFolder/inside.md", "will be deleted");
-    watcher.emit({ type: "change", path: "MyFolder/inside.md" });
-
-    await flushPromises();
-
-    // Delete MyFolder — must only affect docs under "file/MyFolder/"
-    watcher.emit({ type: "delete", path: "MyFolder" });
-    await flushPromises();
-
-    // Descendants tombstoned
-    const insideDoc = db._docs.get(pathToDocId("MyFolder/inside.md"));
-    expect(insideDoc?._deleted).toBe(true);
-
-    // Siblings must survive — the "/" boundary prevents false matches
-    const siblingNoteDoc = db._docs.get(pathToDocId("MyFolder.md"));
-    expect(siblingNoteDoc, "sibling note MyFolder.md should still exist").toBeDefined();
-    expect(siblingNoteDoc!._deleted, "sibling note MyFolder.md must NOT be tombstoned").toBeFalsy();
-
-    const siblingFolderDoc = db._docs.get(pathToDocId("MyFolderOther/x.md"));
-    expect(siblingFolderDoc, "sibling folder file MyFolderOther/x.md should still exist").toBeDefined();
-    expect(siblingFolderDoc!._deleted, "sibling folder file must NOT be tombstoned").toBeFalsy();
-  });
-
-  it("is idempotent: a second delete event for an already-tombstoned folder is a no-op", async () => {
-    vault._addText("Folder/note.md", "content");
-    watcher.emit({ type: "change", path: "Folder/note.md" });
-    await flushPromises();
-
-    // First delete
-    watcher.emit({ type: "delete", path: "Folder" });
-    await flushPromises();
-
-    expect(db._docs.get(pathToDocId("Folder/note.md"))?._deleted).toBe(true);
-
-    // Second delete — already tombstoned, allDocs skips deleted docs (returns empty rows),
-    // markDeletedInPouch 404s into no-op. Should not throw or produce an error.
-    const putSpy = vi.spyOn(db, "put");
-    watcher.emit({ type: "delete", path: "Folder" });
-    await flushPromises();
-
-    // No new put() for already-tombstoned doc
-    expect(putSpy).not.toHaveBeenCalled();
-  });
-
-  it("tombstones the exact docId too when the deleted path is a single file (existing behaviour preserved)", async () => {
-    vault._addText("solo.md", "content");
-    watcher.emit({ type: "change", path: "solo.md" });
-    await flushPromises();
-
-    watcher.emit({ type: "delete", path: "solo.md" });
-    await flushPromises();
-
-    const doc = db._docs.get(pathToDocId("solo.md"));
-    expect(doc?._deleted).toBe(true);
-  });
-
   it("echo-suppression preserved: bridge-applied remote FILE delete is not re-tombstoned", async () => {
     // Reachable scenario: when the bridge applies a remote tombstone for a FILE,
     // applyRemoteChange sets appliedRevs[fileDocId] = "" then deletes the file from
     // disk. That disk delete fires an FS delete event for the SAME file path, which
     // onVaultEvent must suppress (appliedRevs.get(docId) === "") so it does not push
-    // a phantom tombstone back. Production only ever sets the "" sentinel on a file
-    // docId — never a folder docId — so we exercise the file path here.
+    // a phantom tombstone back.
     vault._addText("remote-del.md", "content");
     watcher.emit({ type: "change", path: "remote-del.md" });
     await flushPromises();
@@ -1289,60 +1156,14 @@ describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
 
     // The disk delete echoes back as an FS delete event for the same path.
     const putSpy = vi.spyOn(db, "put");
-    const bulkSpy = vi.spyOn(db, "bulkDocs");
     watcher.emit({ type: "delete", path: "remote-del.md" });
     await flushPromises();
 
     // Sentinel is "" → onVaultEvent returns early, no re-tombstone.
     expect(putSpy).not.toHaveBeenCalled();
-    expect(bulkSpy).not.toHaveBeenCalled();
-  });
-
-  it("flat sweep is depth-agnostic: deeply nested file is tombstoned by folder delete", async () => {
-    // The allDocs prefix-range [docId+"/", docId+"/￿"] returns ALL descendants
-    // regardless of nesting depth — a single query, not a recursive traversal.
-    const deep = "F/sub/deep.md";
-    vault._addText(deep, "deep content");
-    watcher.emit({ type: "change", path: deep });
-    await flushPromises();
-
-    expect(db._docs.get(pathToDocId(deep))?._deleted).toBeFalsy();
-
-    watcher.emit({ type: "delete", path: "F" });
-    await flushPromises();
-
-    // Deeply nested file must be tombstoned by the single flat sweep
-    expect(db._docs.get(pathToDocId(deep))?._deleted).toBe(true);
-  });
-
-  it("reconcileTombstone tombstones only the exact doc — no descendant sweep", async () => {
-    // White-box guard against an O(N) regression: reconcileTombstone is called
-    // per-file during startup reconcile and must NOT fire the descendant sweep
-    // (that would cause O(N) empty allDocs queries during startup and is
-    // semantically wrong for a per-file operation). Asserts on the allDocs spy.
-    const child = "R/child.md";
-    vault._addText(child, "child content");
-    watcher.emit({ type: "change", path: child });
-    await flushPromises();
-
-    // Stop bridge so watcher events don't interfere
-    bridge.stop();
-
-    const allDocsSpy = vi.spyOn(db, "allDocs");
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    await (bridge as any).reconcileTombstone(pathToDocId(child));
-
-    // reconcileTombstone must NOT call allDocs (that's tombstoneWithDescendants' job)
-    expect(allDocsSpy).not.toHaveBeenCalled();
-    // The exact doc must be tombstoned
-    expect(db._docs.get(pathToDocId(child))?._deleted).toBe(true);
   });
 
   // --- Error-path: tombstone failures must surface, not be swallowed ---------
-  // A swallowed tombstone failure leaves a doc LIVE → it re-materialises on disk
-  // as a ghost file via the live changes feed (the exact bug this branch fixes,
-  // via a back door). These tests pin that the failure is observable.
 
   it("markDeletedInPouch rethrows a non-404 put failure (409 TOCTOU) — not swallowed", async () => {
     // A 409 happens when the live changes feed bumps the doc's rev between
@@ -1362,106 +1183,36 @@ describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
   });
 
   it("markDeletedInPouch keeps a 404 (absent doc) as a silent no-op", async () => {
-    // The exact docId of a folder has no PouchDB doc → db.get 404s. That MUST stay
-    // a no-op (legitimate), distinct from the 409 surfaced above.
+    // A delete event for a path with no PouchDB doc (e.g. a folder path itself, or
+    // an already-deleted file) → db.get 404s. That MUST stay a no-op (legitimate),
+    // distinct from the 409 surfaced above.
     bridge.stop();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     await expect((bridge as any).reconcileTombstone(pathToDocId("never-existed")))
       .resolves.toBeUndefined();
   });
 
-  it("folder-delete logs when a descendant bulkDocs tombstone fails (error row)", async () => {
-    // bulkDocs reports stale-rev conflicts as per-doc error rows (not a rejection).
-    // tombstoneWithDescendants must surface that, and onVaultEvent's delete branch
-    // must log it via console.error rather than swallowing it.
-    vault._addText("Folder/note.md", "content");
-    watcher.emit({ type: "change", path: "Folder/note.md" });
+  it("onVaultEvent logs when a single-file delete tombstone fails (409 surfaced)", async () => {
+    // FIX #1 observability: when a per-file delete's tombstone fails with a non-404
+    // (a 409 TOCTOU against the live changes feed), markDeletedInPouch rethrows and
+    // onVaultEvent's delete branch must log it via console.error rather than
+    // swallowing it. A swallowed failure leaves the doc LIVE → ghost file.
+    vault._addText("note.md", "content");
+    watcher.emit({ type: "change", path: "note.md" });
     await flushPromises();
 
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
-    // Force every descendant write to fail with an error row.
-    vi.spyOn(db, "bulkDocs").mockResolvedValueOnce([
-      { id: pathToDocId("Folder/note.md"), error: true, status: 409 },
-    ] as never);
+    // The change above already resolved its put; this rejection lands on the
+    // delete's markDeletedInPouch put (the live-changes-feed rev-bump TOCTOU).
+    vi.spyOn(db, "put").mockRejectedValueOnce({ status: 409, name: "conflict" });
 
-    watcher.emit({ type: "delete", path: "Folder" });
+    watcher.emit({ type: "delete", path: "note.md" });
     await flushPromises();
 
     expect(errorSpy).toHaveBeenCalledWith(
-      "[vault-sync] folder-delete tombstone failed",
-      expect.any(Error),
+      "[vault-sync] delete tombstone failed",
+      expect.objectContaining({ status: 409 }),
     );
     errorSpy.mockRestore();
-  });
-});
-
-// ==========================================================================
-// Folder RENAME — CHARACTERIZATION of a known data-loss path (fix DEFERRED)
-// ==========================================================================
-// ObsidianVaultWatcher maps a rename to delete(oldPath) + change(newPath).
-// For a FOLDER rename, change(newFolderPath) reaches onVaultEvent's "change"
-// branch, where getEntryByPath returns a folder (kind !== "file") → early
-// return. So the moved files are tombstoned at the OLD path and NEVER
-// recreated in PouchDB at the NEW path: a coarse folder-rename event loses the
-// moved files from the synced set.
-//
-// This test PINS that data-loss observable on purpose. It is NOT a forced pass
-// and the fix is intentionally deferred — it overlaps with a reconcile backstop
-// being designed separately. When the rename handling is fixed, this test should
-// be inverted (assert file/B/x.md IS pushed), turning red here into the spec.
-//
-// Severity caveat: this assumes Obsidian fires ONE coarse event for the folder
-// (the case modelled here). Whether the runtime instead fires one event per
-// child is unverified; per-child events would tombstone+recreate each file and
-// avoid the loss. The coarse case is the dangerous one, so that is what we pin.
-describe("PouchDbFsBridge — folder rename (coarse event) [DEFERRED data-loss characterization]", () => {
-  let db: ReturnType<typeof makePouchMock>;
-  let vault: ReturnType<typeof makeVaultMock>;
-  let watcher: ReturnType<typeof makeWatcherMock>;
-  let bridge: PouchDbFsBridge;
-
-  beforeEach(() => {
-    db = makePouchMock();
-    vault = makeVaultMock();
-    watcher = makeWatcherMock();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    bridge = new PouchDbFsBridge(vault, db as any);
-    bridge.start(watcher);
-  });
-
-  afterEach(() => {
-    bridge.stop();
-  });
-
-  it("loses moved files: folder rename tombstones old path but never pushes new path", async () => {
-    // Seed A/x.md and push it to PouchDB (the pre-rename synced state).
-    vault._addText("A/x.md", "moved content");
-    watcher.emit({ type: "change", path: "A/x.md" });
-    await flushPromises();
-    expect(db._docs.get(pathToDocId("A/x.md"))?._deleted).toBeFalsy();
-
-    // The rename moves x.md from A/ to B/ on disk. Reflect that in the vault
-    // adapter: A/x.md gone, B/x.md present (so getEntryByPath("B") is a folder).
-    vault.getEntryByPath("A/x.md") &&
-      (await vault.deleteFile(vault.getEntryByPath("A/x.md") as VaultFile));
-    vault._addText("B/x.md", "moved content");
-
-    // Coarse folder-rename event: delete(A) + change(B).
-    watcher.emit({ type: "delete", path: "A" });
-    watcher.emit({ type: "change", path: "B" });
-    await flushPromises();
-
-    // OLD path is tombstoned (delete branch swept the descendant).
-    expect(
-      db._docs.get(pathToDocId("A/x.md"))?._deleted,
-      "old path A/x.md should be tombstoned",
-    ).toBe(true);
-
-    // NEW path is NEVER pushed: change(B) hit the folder early-return, so the
-    // moved file is absent from PouchDB → lost from the synced set. THIS IS THE BUG.
-    expect(
-      db._docs.has(pathToDocId("B/x.md")),
-      "DATA LOSS (deferred fix): B/x.md never made it into PouchDB after the rename",
-    ).toBe(false);
   });
 });

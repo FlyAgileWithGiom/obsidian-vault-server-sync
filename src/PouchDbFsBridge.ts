@@ -137,13 +137,20 @@ export class PouchDbFsBridge {
       // For deletes, check the sentinel too: if bridge just applied a remote
       // deletion (rare), avoid re-deleting. Sentinel uses empty string for deletes.
       if (this.appliedRevs.get(docId) === "") return;
-      // A failed tombstone on a delete is NOT non-critical: an un-tombstoned doc
-      // re-materialises on disk via the live changes feed (ghost file — the exact
-      // bug this path guards against). Surface it instead of swallowing. This one
-      // log site covers both failure sources: markDeletedInPouch's non-404 rethrow
-      // (folder-path tombstone) and tombstoneWithDescendants' bulkDocs error throw.
-      this.tombstoneWithDescendants(docId).catch((err) => {
-        console.error("[vault-sync] folder-delete tombstone failed", err);
+      // One delete event tombstones one doc. A folder delete fires a per-descendant
+      // delete event — verified empirically (spikes/obsidian-event-semantics CDP
+      // spike + the scripts/smoke-folder-delete.sh real-artifact run) on desktop,
+      // mobile, and the daemon's fs.watch — so each child is tombstoned by its own
+      // event. No descendant sweep here: it would race the per-file events and
+      // 409-conflict on docs they already deleted. The daemon's startup reconcile
+      // is the backstop for any genuinely missed event.
+      //
+      // A failed tombstone is NOT non-critical: an un-tombstoned doc re-materialises
+      // on disk via the live changes feed (ghost file — the exact bug this path
+      // guards against). Surface it instead of swallowing — markDeletedInPouch
+      // rethrows any non-404 (notably a 409 TOCTOU against the live changes feed).
+      this.markDeletedInPouch(docId).catch((err) => {
+        console.error("[vault-sync] delete tombstone failed", err);
       });
       return;
     }
@@ -268,67 +275,6 @@ export class PouchDbFsBridge {
       // re-materialises as a ghost file. Swallowing only 404 keeps the no-op while
       // making a real tombstone failure observable to the caller.
       if ((err as { status?: number }).status !== 404) throw err;
-    }
-  }
-
-  /**
-   * Tombstone the exact docId AND every descendant file doc under that path.
-   *
-   * Called from onVaultEvent on delete events. Separated from markDeletedInPouch
-   * so that reconcileTombstone (per-file startup reconcile) stays single-doc —
-   * mixing the sweep into the primitive would fire one empty allDocs per file
-   * during startup reconcile (O(N) wasted queries).
-   *
-   * Range: [docId + "/", docId + "/\uffff"]
-   *   - Trailing "/" excludes siblings: "file/MyFolder.md" (.=0x2E < /=0x2F)
-   *     and "file/MyFolderOther/…" (O=0x4F > /) both fall outside the range.
-   *   - "\uffff" (U+FFFF) is the highest BMP code-point, safe as upper-bound sentinel.
-   *   - allDocs naturally excludes already-deleted docs, so the sweep is idempotent.
-   *
-   * Descendants are tombstoned in ONE bulkDocs call rather than N×(get+put). On a
-   * large folder this is a single round-trip instead of thousands of unbounded-
-   * concurrency get+put pairs (IndexedDB pressure on iOS). allDocs with
-   * include_docs:true carries each doc's _id/_rev so the tombstone stubs are
-   * well-formed (no extra get per doc). The exact docId (folder path itself) still
-   * goes through markDeletedInPouch as a single-doc, 404-tolerant tombstone.
-   *
-   * Children tombstoned here bypass the Level-1 echo sentinel — harmless because
-   * a remote-applied per-file delete leaves the child already-deleted, so allDocs
-   * (live-only) skips it on the second pass.
-   *
-   * @throws if any descendant fails to tombstone. bulkDocs reports per-doc error
-   *   rows (e.g. a stale-rev 409 from a concurrent changes-feed bump) rather than
-   *   rejecting, so we inspect the result and throw. Surfaced to the caller so a
-   *   failed folder-delete tombstone is observable, not silently swallowed — an
-   *   un-tombstoned child re-materialises as a ghost file via the live changes feed.
-   */
-  private async tombstoneWithDescendants(docId: string): Promise<void> {
-    await this.markDeletedInPouch(docId);
-
-    const prefix = docId + "/";
-    const result = await this.db.allDocs({
-      startkey: prefix,
-      endkey: prefix + "\uffff",
-      include_docs: true,
-    });
-    // Idempotent: already-deleted descendants are excluded by allDocs (live-only),
-    // so re-deleting an already-tombstoned folder yields zero rows \u2192 no bulkDocs call.
-    if (result.rows.length === 0) return;
-
-    const tombstones = result.rows.map(row => ({
-      ...(row.doc ?? { _id: row.id }),
-      _id: row.id,
-      _deleted: true,
-      deleted: true,
-    }));
-    const results = await this.db.bulkDocs(
-      tombstones as Parameters<typeof this.db.bulkDocs>[0],
-    );
-    const failures = results.filter(r => r.error);
-    if (failures.length > 0) {
-      throw new Error(
-        `tombstoneWithDescendants: ${failures.length}/${tombstones.length} descendant tombstone(s) failed under ${docId}`,
-      );
     }
   }
 
