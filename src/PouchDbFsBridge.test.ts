@@ -1231,8 +1231,8 @@ describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
 
     expect(db._docs.get(pathToDocId("Folder/note.md"))?._deleted).toBe(true);
 
-    // Second delete — already tombstoned, allDocs skips deleted docs, markDeletedInPouch
-    // no-ops on 404. Should not throw or produce an error.
+    // Second delete — already tombstoned, allDocs skips deleted docs (returns empty rows),
+    // markDeletedInPouch 404s into no-op. Should not throw or produce an error.
     const putSpy = vi.spyOn(db, "put");
     watcher.emit({ type: "delete", path: "Folder" });
     await flushPromises();
@@ -1273,5 +1273,45 @@ describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
 
     // Bridge must not re-tombstone when sentinel is set
     expect(putSpy).not.toHaveBeenCalled();
+  });
+
+  it("flat sweep is depth-agnostic: deeply nested file is tombstoned by folder delete", async () => {
+    // The allDocs prefix-range [docId+"/", docId+"/￿"] returns ALL descendants
+    // regardless of nesting depth — a single query, not a recursive traversal.
+    const deep = "F/sub/deep.md";
+    vault._addText(deep, "deep content");
+    watcher.emit({ type: "change", path: deep });
+    await flushPromises();
+
+    expect(db._docs.get(pathToDocId(deep))?._deleted).toBeFalsy();
+
+    watcher.emit({ type: "delete", path: "F" });
+    await flushPromises();
+
+    // Deeply nested file must be tombstoned by the single flat sweep
+    expect(db._docs.get(pathToDocId(deep))?._deleted).toBe(true);
+  });
+
+  it("reconcileTombstone tombstones only the exact doc — no descendant sweep", async () => {
+    // reconcileTombstone is called per-file during startup reconcile.
+    // It must NOT fire the descendant sweep (that would cause O(N) empty allDocs
+    // queries during startup and is semantically wrong for a per-file operation).
+    const child = "R/child.md";
+    vault._addText(child, "child content");
+    watcher.emit({ type: "change", path: child });
+    await flushPromises();
+
+    // Stop bridge so watcher events don't interfere
+    bridge.stop();
+
+    const allDocsSpy = vi.spyOn(db, "allDocs");
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (bridge as any).reconcileTombstone(pathToDocId(child));
+
+    // reconcileTombstone must NOT call allDocs (that's tombstoneWithDescendants' job)
+    expect(allDocsSpy).not.toHaveBeenCalled();
+    // The exact doc must be tombstoned
+    expect(db._docs.get(pathToDocId(child))?._deleted).toBe(true);
   });
 });

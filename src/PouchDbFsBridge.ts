@@ -137,7 +137,7 @@ export class PouchDbFsBridge {
       // For deletes, check the sentinel too: if bridge just applied a remote
       // deletion (rare), avoid re-deleting. Sentinel uses empty string for deletes.
       if (this.appliedRevs.get(docId) === "") return;
-      this.markDeletedInPouch(docId).catch(() => {/* non-critical */});
+      this.tombstoneWithDescendants(docId).catch(() => {/* non-critical */});
       return;
     }
 
@@ -246,7 +246,7 @@ export class PouchDbFsBridge {
   }
 
   private async markDeletedInPouch(docId: string): Promise<void> {
-    // Tombstone the exact docId (handles single-file delete; 404 = no-op for folders).
+    // Tombstone the exact docId. 404 = no-op (folder path, already deleted, etc.).
     try {
       const existing = await this.db.get(docId);
       await this.db.put({
@@ -257,20 +257,29 @@ export class PouchDbFsBridge {
     } catch {
       // Doc doesn't exist — no-op
     }
+  }
 
-    // Sweep all descendant file docs under this path.
-    //
-    // Folder-level FS events produce docId "file/MyFolder" which has no PouchDB doc
-    // (only files are stored). Without this sweep the nested file docs survive and
-    // are re-materialized onto disk by the live changes feed ("ghost files").
-    //
-    // Range: [file/<path>/, file/<path>/"\uffff"] — the trailing "/" ensures siblings
-    // like "file/MyFolder.md" or "file/MyFolderOther/…" are excluded.
-    // "\uffff" (U+FFFF) is the highest BMP code-point, safe as a range upper-bound sentinel.
-    //
-    // allDocs excludes already-deleted docs by default, so this sweep is idempotent:
-    // calling it twice (e.g. if the runtime also fires per-file events) is a no-op
-    // on the second pass.
+  /**
+   * Tombstone the exact docId AND every descendant file doc under that path.
+   *
+   * Called from onVaultEvent on delete events. Separated from markDeletedInPouch
+   * so that reconcileTombstone (per-file startup reconcile) stays single-doc —
+   * mixing the sweep into the primitive would fire one empty allDocs per file
+   * during startup reconcile (O(N) wasted queries).
+   *
+   * Range: [docId + "/", docId + "/\uffff"]
+   *   - Trailing "/" excludes siblings: "file/MyFolder.md" (.=0x2E < /=0x2F)
+   *     and "file/MyFolderOther/…" (O=0x4F > /) both fall outside the range.
+   *   - "\uffff" (U+FFFF) is the highest BMP code-point, safe as upper-bound sentinel.
+   *   - allDocs naturally excludes already-deleted docs, so the sweep is idempotent.
+   *
+   * Children tombstoned here bypass the Level-1 echo sentinel — harmless because
+   * a remote-applied per-file delete leaves the child already-deleted, so db.get
+   * 404s into a no-op on the second call.
+   */
+  private async tombstoneWithDescendants(docId: string): Promise<void> {
+    await this.markDeletedInPouch(docId);
+
     const prefix = docId + "/";
     const result = await this.db.allDocs({
       startkey: prefix,
