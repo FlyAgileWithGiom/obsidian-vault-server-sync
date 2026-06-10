@@ -36,23 +36,6 @@ function makePouchMock() {
   const attachments = new Map<string, AttachmentShape>();
   let revCounter = 0;
 
-  // allDocs: range-aware (for folder-delete sweep) or full scan.
-  // Mirrors real PouchDB behaviour: only returns live (non-deleted) docs.
-  async function allDocs(opts?: {
-    startkey?: string;
-    endkey?: string;
-    include_docs?: boolean;
-  }): Promise<{ rows: Array<{ id: string; doc?: DocShape }> }> {
-    const rows: Array<{ id: string; doc?: DocShape }> = [];
-    for (const [id, doc] of docs) {
-      if (doc._deleted) continue;
-      if (opts?.startkey !== undefined && id < opts.startkey) continue;
-      if (opts?.endkey !== undefined && id > opts.endkey) continue;
-      rows.push({ id, doc: opts?.include_docs ? { ...doc } : undefined });
-    }
-    return { rows };
-  }
-
   // Change listeners: { cancel(), on(event, handler) }
   type ChangeHandler = (change: { id: string; seq: number; deleted?: boolean; doc?: DocShape }) => void;
   type ErrorHandler = (err: unknown) => void;
@@ -1282,26 +1265,37 @@ describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
     expect(doc?._deleted).toBe(true);
   });
 
-  it("echo-suppression preserved: bridge-applied remote delete is not re-tombstoned", async () => {
-    // Simulate bridge applying a remote delete: sentinel set to "" for docId
-    vault._addText("remote-del/note.md", "content");
-    watcher.emit({ type: "change", path: "remote-del/note.md" });
+  it("echo-suppression preserved: bridge-applied remote FILE delete is not re-tombstoned", async () => {
+    // Reachable scenario: when the bridge applies a remote tombstone for a FILE,
+    // applyRemoteChange sets appliedRevs[fileDocId] = "" then deletes the file from
+    // disk. That disk delete fires an FS delete event for the SAME file path, which
+    // onVaultEvent must suppress (appliedRevs.get(docId) === "") so it does not push
+    // a phantom tombstone back. Production only ever sets the "" sentinel on a file
+    // docId — never a folder docId — so we exercise the file path here.
+    vault._addText("remote-del.md", "content");
+    watcher.emit({ type: "change", path: "remote-del.md" });
     await flushPromises();
 
-    // Mark sentinel for the folder path as "" (as if bridge applied a remote delete)
-    // We test via the exact docId path: if sentinel is set for "file/remote-del",
-    // the folder delete event should be suppressed.
-    // Expose via reconcileSuppressEcho which calls setAppliedRev internally.
-    // Use empty string sentinel (delete sentinel).
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (bridge as any).appliedRevs.set(pathToDocId("remote-del"), "");
+    // Bridge applies a remote delete: tombstone arrives via the changes feed.
+    // applyRemoteChange sets the "" sentinel and calls vault.deleteFile.
+    db._emitChange({
+      _id: pathToDocId("remote-del.md"),
+      _rev: "9-abc",
+      _deleted: true,
+      deleted: true,
+      content: null,
+    });
+    await flushPromises();
 
+    // The disk delete echoes back as an FS delete event for the same path.
     const putSpy = vi.spyOn(db, "put");
-    watcher.emit({ type: "delete", path: "remote-del" });
+    const bulkSpy = vi.spyOn(db, "bulkDocs");
+    watcher.emit({ type: "delete", path: "remote-del.md" });
     await flushPromises();
 
-    // Bridge must not re-tombstone when sentinel is set
+    // Sentinel is "" → onVaultEvent returns early, no re-tombstone.
     expect(putSpy).not.toHaveBeenCalled();
+    expect(bulkSpy).not.toHaveBeenCalled();
   });
 
   it("flat sweep is depth-agnostic: deeply nested file is tombstoned by folder delete", async () => {
@@ -1322,9 +1316,10 @@ describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
   });
 
   it("reconcileTombstone tombstones only the exact doc — no descendant sweep", async () => {
-    // reconcileTombstone is called per-file during startup reconcile.
-    // It must NOT fire the descendant sweep (that would cause O(N) empty allDocs
-    // queries during startup and is semantically wrong for a per-file operation).
+    // White-box guard against an O(N) regression: reconcileTombstone is called
+    // per-file during startup reconcile and must NOT fire the descendant sweep
+    // (that would cause O(N) empty allDocs queries during startup and is
+    // semantically wrong for a per-file operation). Asserts on the allDocs spy.
     const child = "R/child.md";
     vault._addText(child, "child content");
     watcher.emit({ type: "change", path: child });
