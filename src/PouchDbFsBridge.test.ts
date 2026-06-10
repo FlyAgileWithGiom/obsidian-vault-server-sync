@@ -1343,4 +1343,59 @@ describe("PouchDbFsBridge — folder delete tombstones all descendants", () => {
     // The exact doc must be tombstoned
     expect(db._docs.get(pathToDocId(child))?._deleted).toBe(true);
   });
+
+  // --- Error-path: tombstone failures must surface, not be swallowed ---------
+  // A swallowed tombstone failure leaves a doc LIVE → it re-materialises on disk
+  // as a ghost file via the live changes feed (the exact bug this branch fixes,
+  // via a back door). These tests pin that the failure is observable.
+
+  it("markDeletedInPouch rethrows a non-404 put failure (409 TOCTOU) — not swallowed", async () => {
+    // A 409 happens when the live changes feed bumps the doc's rev between
+    // markDeletedInPouch's db.get and db.put. reconcileTombstone routes straight
+    // through markDeletedInPouch (single-doc get→put), so it is the cleanest probe.
+    const path = "conflicted.md";
+    vault._addText(path, "content");
+    watcher.emit({ type: "change", path });
+    await flushPromises();
+    bridge.stop(); // isolate from watcher events
+
+    vi.spyOn(db, "put").mockRejectedValueOnce({ status: 409, name: "conflict" });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((bridge as any).reconcileTombstone(pathToDocId(path)))
+      .rejects.toMatchObject({ status: 409 });
+  });
+
+  it("markDeletedInPouch keeps a 404 (absent doc) as a silent no-op", async () => {
+    // The exact docId of a folder has no PouchDB doc → db.get 404s. That MUST stay
+    // a no-op (legitimate), distinct from the 409 surfaced above.
+    bridge.stop();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((bridge as any).reconcileTombstone(pathToDocId("never-existed")))
+      .resolves.toBeUndefined();
+  });
+
+  it("folder-delete logs when a descendant bulkDocs tombstone fails (error row)", async () => {
+    // bulkDocs reports stale-rev conflicts as per-doc error rows (not a rejection).
+    // tombstoneWithDescendants must surface that, and onVaultEvent's delete branch
+    // must log it via console.error rather than swallowing it.
+    vault._addText("Folder/note.md", "content");
+    watcher.emit({ type: "change", path: "Folder/note.md" });
+    await flushPromises();
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // Force every descendant write to fail with an error row.
+    vi.spyOn(db, "bulkDocs").mockResolvedValueOnce([
+      { id: pathToDocId("Folder/note.md"), error: true, status: 409 },
+    ] as never);
+
+    watcher.emit({ type: "delete", path: "Folder" });
+    await flushPromises();
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "[vault-sync] folder-delete tombstone failed",
+      expect.any(Error),
+    );
+    errorSpy.mockRestore();
+  });
 });
