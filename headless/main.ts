@@ -372,6 +372,8 @@ export async function runReconcileOnStartup(opts: {
   tombstone: number;
   conflictCopy: number;
   skip: number;
+  /** Per-action failures caught by the resilient apply-loop (#79 crash-loop class). */
+  failed: number;
 } | null> {
   const { db, bridge, vaultAdapter, remoteDb, excludePatterns } = opts;
 
@@ -441,10 +443,22 @@ export async function runReconcileOnStartup(opts: {
     isExcluded,
   });
 
-  // Apply actions
-  const counts = { push: 0, pull: 0, tombstone: 0, conflictCopy: 0, skip: 0 };
+  // Apply actions.
+  //
+  // Resilient apply-loop (#79 crash-loop class): one failed action must NOT abort
+  // daemon startup. After FIX #1 (markDeletedInPouch rethrows non-404 errors),
+  // reconcileTombstone can throw on a catastrophic non-404 (DB closed / IO error /
+  // one bad doc). Without this guard, that propagates out of the loop → out of
+  // runReconcile → aborts runDaemonV2Startup → the LaunchAgent restarts → crash-loop
+  // on a persistent error. We log-and-continue (NOT silently swallow — that is the
+  // anti-pattern FIX #1 removed): each failure is logged + counted, the loop applies
+  // the remaining actions. A systemic failure (every action fails) still surfaces
+  // downstream at bridge.start / live-sync; this guard only stops one bad apple from
+  // taking the daemon down.
+  const counts = { push: 0, pull: 0, tombstone: 0, conflictCopy: 0, skip: 0, failed: 0 };
   for (const action of actions) {
-    switch (action.kind) {
+    try {
+      switch (action.kind) {
       case "push":
         await bridge.reconcilePush(action.path);
         counts.push++;
@@ -523,13 +537,24 @@ export async function runReconcileOnStartup(opts: {
       case "skip":
         counts.skip++;
         break;
+      }
+    } catch (e) {
+      // Log-and-continue: a single failed action (e.g. a tombstone hitting a
+      // non-404 from markDeletedInPouch) must not abort the loop → daemon startup.
+      // conflict-copy never reaches here (its own inner try/catch above never
+      // rethrows), so this counter reflects push/pull/tombstone failures.
+      const ref = "path" in action ? action.path : action.docId;
+      console.error(
+        `[vault-sync] reconcile: action FAILED (${action.kind} ${ref}) — continuing: ${e}`,
+      );
+      counts.failed++;
     }
   }
 
   console.log(
     `[vault-sync] reconcile: ↑push=${counts.push} ↓pull=${counts.pull} ` +
     `✗tombstone=${counts.tombstone} ⚡conflict-copy=${counts.conflictCopy} ` +
-    `–skip=${counts.skip}`,
+    `–skip=${counts.skip} ⚠failed=${counts.failed}`,
   );
   return counts;
 }

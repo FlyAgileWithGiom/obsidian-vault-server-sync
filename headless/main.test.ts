@@ -507,6 +507,85 @@ describe("runReconcileOnStartup — crash-safe replace marker (BUG crash window)
 });
 
 // ---------------------------------------------------------------------------
+// Resilient apply-loop (#79 crash-loop class): one bad reconcile action must
+// not abort daemon startup. After FIX #1 (markDeletedInPouch rethrows non-404),
+// reconcileTombstone can throw on a catastrophic error (DB closed / IO / bad
+// doc). Without a per-action guard, that propagates out of the loop → out of
+// runReconcile → aborts runDaemonV2Startup → LaunchAgent restart → crash-loop.
+// The fix: log-and-continue per action, count the failure, keep applying the
+// rest. (Distinct from FIX #1's silent swallow — failures are logged + counted.)
+// ---------------------------------------------------------------------------
+
+describe("runReconcileOnStartup — resilient apply-loop (#79 crash-loop class)", () => {
+  it("logs and continues when one tombstone action throws (no crash-loop)", async () => {
+    // Two local docs, both FS-absent and remote not_found → reconcile produces
+    // two tombstone actions (FS-absent + remote===undefined → tombstone).
+    const db = {
+      info: vi.fn(async () => ({ doc_count: 5 })),
+      allDocs: vi.fn(async () => ({ rows: [
+        { id: "file/doomed.md" },
+        { id: "file/survivor.md" },
+      ] })),
+      // localGet must return a doc (FS-absent + local doc present → tombstone branch)
+      get: vi.fn(async (docId: string) => ({ _id: docId, _rev: "1-abc", content: "x" })),
+    };
+
+    // First tombstone throws a catastrophic non-404 (the class FIX #1 now rethrows);
+    // the second resolves. Proves the loop still ATTEMPTS the survivor.
+    const reconcileTombstone = vi.fn()
+      .mockRejectedValueOnce(new Error("PouchDB database is closed"))
+      .mockResolvedValueOnce(undefined);
+
+    const bridge = {
+      reconcilePush: vi.fn(),
+      reconcilePull: vi.fn(),
+      reconcileTombstone,
+      reconcileSuppressEcho: vi.fn(),
+    };
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    let result: Awaited<ReturnType<typeof runReconcileOnStartup>>;
+    let errorCallCount: number;
+    try {
+      // The loop must NOT throw out — this await resolving is the core assertion.
+      result = await runReconcileOnStartup({
+        db,
+        bridge,
+        vaultAdapter: {
+          getFiles: () => [], // both docs FS-absent
+          async readText() { throw new Error("not called"); },
+          async readBinary(): Promise<ArrayBuffer> { throw new Error("not called"); },
+          async createText(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); },
+          async createBinary(): Promise<import("../src/types").VaultFile> { throw new Error("not called"); },
+          getEntryByPath(): import("../src/types").VaultEntry | null { return null; },
+        },
+        // not_found for every key → empty remoteRevs map → FS-absent docs tombstone
+        remoteDb: { async allDocs({ keys }: { keys: string[] }) {
+          return { rows: keys.map((key) => ({ key, error: "not_found" })) };
+        } },
+        excludePatterns: [],
+      });
+    } finally {
+      // Capture call count BEFORE restore — mockRestore() wipes the call record.
+      errorCallCount = errorSpy.mock.calls.length;
+      errorSpy.mockRestore();
+    }
+
+    // The survivor was still attempted (loop did not abort on the first failure).
+    expect(reconcileTombstone).toHaveBeenCalledTimes(2);
+
+    // Failure logged (not silently swallowed — the anti-pattern FIX #1 removed).
+    expect(errorCallCount).toBeGreaterThan(0);
+
+    // Failure counted; the survivor counted as a success, not as the failure.
+    expect(result).not.toBeNull();
+    expect(result!.failed).toBe(1);
+    expect(result!.tombstone).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // loadConfig + Phase A/B (#78) — credential precedence and out-of-vault store
 // ---------------------------------------------------------------------------
 
