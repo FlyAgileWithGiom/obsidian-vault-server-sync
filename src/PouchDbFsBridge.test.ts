@@ -151,16 +151,45 @@ function makePouchMock() {
       attachments?: boolean;
       startkey?: string;
       endkey?: string;
-    }): Promise<{ rows: Array<{ id: string; key: string; value: { rev: string; deleted?: boolean } }>; total_rows: number; offset: number }> {
-      const rows: Array<{ id: string; key: string; value: { rev: string; deleted?: boolean } }> = [];
+    }): Promise<{ rows: Array<{ id: string; key: string; value: { rev: string; deleted?: boolean }; doc?: DocShape }>; total_rows: number; offset: number }> {
+      const rows: Array<{ id: string; key: string; value: { rev: string; deleted?: boolean }; doc?: DocShape }> = [];
       for (const [id, doc] of docs.entries()) {
         // Real PouchDB allDocs excludes deleted docs by default
         if (doc._deleted) continue;
         if (opts?.startkey !== undefined && id < opts.startkey) continue;
         if (opts?.endkey !== undefined && id > opts.endkey) continue;
-        rows.push({ id, key: id, value: { rev: doc._rev ?? "" } });
+        rows.push({
+          id,
+          key: id,
+          value: { rev: doc._rev ?? "" },
+          // include_docs:true returns the full doc (mirrors real PouchDB) so the
+          // folder-delete bulk sweep can build tombstone stubs without a per-doc get.
+          ...(opts?.include_docs ? { doc: { ...doc } } : {}),
+        });
       }
       return { rows, total_rows: rows.length, offset: 0 };
+    },
+
+    // bulkDocs: write each doc with a bumped _rev (mirrors real PouchDB). Conflicts
+    // (stale _rev) are reported as per-doc error rows — NOT a thrown rejection — which
+    // is how real PouchDB surfaces a 409 in a bulk write. Tolerates an empty array.
+    async bulkDocs(
+      bulk: DocShape[],
+    ): Promise<Array<{ ok?: boolean; id?: string; rev?: string; error?: boolean; status?: number }>> {
+      const results: Array<{ ok?: boolean; id?: string; rev?: string; error?: boolean; status?: number }> = [];
+      for (const doc of bulk) {
+        const existing = docs.get(doc._id);
+        // Stale-rev conflict: the doc exists with a different _rev than the caller sent.
+        if (existing && doc._rev !== undefined && existing._rev !== doc._rev) {
+          results.push({ id: doc._id, error: true, status: 409 });
+          continue;
+        }
+        revCounter++;
+        const rev = `${revCounter}-abc`;
+        docs.set(doc._id, { ...doc, _rev: rev });
+        results.push({ ok: true, id: doc._id, rev });
+      }
+      return results;
     },
 
     changes(_opts: unknown): typeof changesHandle {

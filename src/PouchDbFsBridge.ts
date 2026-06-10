@@ -273,9 +273,22 @@ export class PouchDbFsBridge {
    *   - "\uffff" (U+FFFF) is the highest BMP code-point, safe as upper-bound sentinel.
    *   - allDocs naturally excludes already-deleted docs, so the sweep is idempotent.
    *
+   * Descendants are tombstoned in ONE bulkDocs call rather than N×(get+put). On a
+   * large folder this is a single round-trip instead of thousands of unbounded-
+   * concurrency get+put pairs (IndexedDB pressure on iOS). allDocs with
+   * include_docs:true carries each doc's _id/_rev so the tombstone stubs are
+   * well-formed (no extra get per doc). The exact docId (folder path itself) still
+   * goes through markDeletedInPouch as a single-doc, 404-tolerant tombstone.
+   *
    * Children tombstoned here bypass the Level-1 echo sentinel — harmless because
-   * a remote-applied per-file delete leaves the child already-deleted, so db.get
-   * 404s into a no-op on the second call.
+   * a remote-applied per-file delete leaves the child already-deleted, so allDocs
+   * (live-only) skips it on the second pass.
+   *
+   * @throws if any descendant fails to tombstone. bulkDocs reports per-doc error
+   *   rows (e.g. a stale-rev 409 from a concurrent changes-feed bump) rather than
+   *   rejecting, so we inspect the result and throw. Surfaced to the caller so a
+   *   failed folder-delete tombstone is observable, not silently swallowed — an
+   *   un-tombstoned child re-materialises as a ghost file via the live changes feed.
    */
   private async tombstoneWithDescendants(docId: string): Promise<void> {
     await this.markDeletedInPouch(docId);
@@ -284,10 +297,27 @@ export class PouchDbFsBridge {
     const result = await this.db.allDocs({
       startkey: prefix,
       endkey: prefix + "\uffff",
+      include_docs: true,
     });
-    await Promise.all(
-      result.rows.map(row => this.markDeletedInPouch(row.id)),
+    // Idempotent: already-deleted descendants are excluded by allDocs (live-only),
+    // so re-deleting an already-tombstoned folder yields zero rows \u2192 no bulkDocs call.
+    if (result.rows.length === 0) return;
+
+    const tombstones = result.rows.map(row => ({
+      ...(row.doc ?? { _id: row.id }),
+      _id: row.id,
+      _deleted: true,
+      deleted: true,
+    }));
+    const results = await this.db.bulkDocs(
+      tombstones as Parameters<typeof this.db.bulkDocs>[0],
     );
+    const failures = results.filter(r => r.error);
+    if (failures.length > 0) {
+      throw new Error(
+        `tombstoneWithDescendants: ${failures.length}/${tombstones.length} descendant tombstone(s) failed under ${docId}`,
+      );
+    }
   }
 
   // --- PouchDB -> Vault ---
