@@ -1095,3 +1095,124 @@ describe("PouchDbFsBridge — wipeLocalFiles()", () => {
     expect(vault._getText("Work/private/secret.md")).toBe("keep"); // nested exclusion preserved
   });
 });
+
+// ==========================================================================
+// Folder delete → per-descendant tombstone (no sweep)
+// ==========================================================================
+// Empirically verified (spikes/obsidian-event-semantics CDP spike +
+// scripts/smoke-folder-delete.sh real-artifact run): on desktop, mobile, and
+// the daemon's fs.watch, a folder delete fires a separate delete event PER
+// descendant file. Each child is therefore tombstoned by its own single-doc
+// event — onVaultEvent → markDeletedInPouch(childDocId). No folder-level
+// descendant sweep is needed (an earlier sweep was redundant AND raced the
+// per-file events, 409-conflicting on docs they had already deleted). The
+// daemon's startup reconcile is the backstop for any genuinely missed event.
+//
+// These tests pin the single-doc delete behaviour, echo-suppression, and the
+// observability guarantee: a tombstone failure must surface, never be swallowed
+// (a swallowed failure leaves a doc LIVE → it re-materialises on disk as a
+// ghost file via the live changes feed — the exact bug this path guards against).
+// ==========================================================================
+
+describe("PouchDbFsBridge — single-file delete tombstone (no descendant sweep)", () => {
+  let db: ReturnType<typeof makePouchMock>;
+  let vault: ReturnType<typeof makeVaultMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
+  let bridge: PouchDbFsBridge;
+
+  beforeEach(() => {
+    db = makePouchMock();
+    vault = makeVaultMock();
+    watcher = makeWatcherMock();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    bridge.start(watcher);
+  });
+
+  afterEach(() => {
+    bridge.stop();
+  });
+
+  it("echo-suppression preserved: bridge-applied remote FILE delete is not re-tombstoned", async () => {
+    // Reachable scenario: when the bridge applies a remote tombstone for a FILE,
+    // applyRemoteChange sets appliedRevs[fileDocId] = "" then deletes the file from
+    // disk. That disk delete fires an FS delete event for the SAME file path, which
+    // onVaultEvent must suppress (appliedRevs.get(docId) === "") so it does not push
+    // a phantom tombstone back.
+    vault._addText("remote-del.md", "content");
+    watcher.emit({ type: "change", path: "remote-del.md" });
+    await flushPromises();
+
+    // Bridge applies a remote delete: tombstone arrives via the changes feed.
+    // applyRemoteChange sets the "" sentinel and calls vault.deleteFile.
+    db._emitChange({
+      _id: pathToDocId("remote-del.md"),
+      _rev: "9-abc",
+      _deleted: true,
+      deleted: true,
+      content: null,
+    });
+    await flushPromises();
+
+    // The disk delete echoes back as an FS delete event for the same path.
+    const putSpy = vi.spyOn(db, "put");
+    watcher.emit({ type: "delete", path: "remote-del.md" });
+    await flushPromises();
+
+    // Sentinel is "" → onVaultEvent returns early, no re-tombstone.
+    expect(putSpy).not.toHaveBeenCalled();
+  });
+
+  // --- Error-path: tombstone failures must surface, not be swallowed ---------
+
+  it("markDeletedInPouch rethrows a non-404 put failure (409 TOCTOU) — not swallowed", async () => {
+    // A 409 happens when the live changes feed bumps the doc's rev between
+    // markDeletedInPouch's db.get and db.put. reconcileTombstone routes straight
+    // through markDeletedInPouch (single-doc get→put), so it is the cleanest probe.
+    const path = "conflicted.md";
+    vault._addText(path, "content");
+    watcher.emit({ type: "change", path });
+    await flushPromises();
+    bridge.stop(); // isolate from watcher events
+
+    vi.spyOn(db, "put").mockRejectedValueOnce({ status: 409, name: "conflict" });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((bridge as any).reconcileTombstone(pathToDocId(path)))
+      .rejects.toMatchObject({ status: 409 });
+  });
+
+  it("markDeletedInPouch keeps a 404 (absent doc) as a silent no-op", async () => {
+    // A delete event for a path with no PouchDB doc (e.g. a folder path itself, or
+    // an already-deleted file) → db.get 404s. That MUST stay a no-op (legitimate),
+    // distinct from the 409 surfaced above.
+    bridge.stop();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await expect((bridge as any).reconcileTombstone(pathToDocId("never-existed")))
+      .resolves.toBeUndefined();
+  });
+
+  it("onVaultEvent logs when a single-file delete tombstone fails (409 surfaced)", async () => {
+    // FIX #1 observability: when a per-file delete's tombstone fails with a non-404
+    // (a 409 TOCTOU against the live changes feed), markDeletedInPouch rethrows and
+    // onVaultEvent's delete branch must log it via console.error rather than
+    // swallowing it. A swallowed failure leaves the doc LIVE → ghost file.
+    vault._addText("note.md", "content");
+    watcher.emit({ type: "change", path: "note.md" });
+    await flushPromises();
+
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // The change above already resolved its put; this rejection lands on the
+    // delete's markDeletedInPouch put (the live-changes-feed rev-bump TOCTOU).
+    vi.spyOn(db, "put").mockRejectedValueOnce({ status: 409, name: "conflict" });
+
+    watcher.emit({ type: "delete", path: "note.md" });
+    await flushPromises();
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "[vault-sync] delete tombstone failed",
+      expect.objectContaining({ status: 409 }),
+    );
+    errorSpy.mockRestore();
+  });
+});

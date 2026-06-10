@@ -137,7 +137,21 @@ export class PouchDbFsBridge {
       // For deletes, check the sentinel too: if bridge just applied a remote
       // deletion (rare), avoid re-deleting. Sentinel uses empty string for deletes.
       if (this.appliedRevs.get(docId) === "") return;
-      this.markDeletedInPouch(docId).catch(() => {/* non-critical */});
+      // One delete event tombstones one doc. A folder delete fires a per-descendant
+      // delete event — verified empirically (spikes/obsidian-event-semantics CDP
+      // spike + the scripts/smoke-folder-delete.sh real-artifact run) on desktop,
+      // mobile, and the daemon's fs.watch — so each child is tombstoned by its own
+      // event. No descendant sweep here: it would race the per-file events and
+      // 409-conflict on docs they already deleted. The daemon's startup reconcile
+      // is the backstop for any genuinely missed event.
+      //
+      // A failed tombstone is NOT non-critical: an un-tombstoned doc re-materialises
+      // on disk via the live changes feed (ghost file — the exact bug this path
+      // guards against). Surface it instead of swallowing — markDeletedInPouch
+      // rethrows any non-404 (notably a 409 TOCTOU against the live changes feed).
+      this.markDeletedInPouch(docId).catch((err) => {
+        console.error("[vault-sync] delete tombstone failed", err);
+      });
       return;
     }
 
@@ -246,6 +260,7 @@ export class PouchDbFsBridge {
   }
 
   private async markDeletedInPouch(docId: string): Promise<void> {
+    // Tombstone the exact docId. 404 = no-op (folder path, already deleted, etc.).
     try {
       const existing = await this.db.get(docId);
       await this.db.put({
@@ -253,8 +268,13 @@ export class PouchDbFsBridge {
         _deleted: true,
         deleted: true,
       } as Parameters<typeof this.db.put>[0]);
-    } catch {
-      // Doc doesn't exist — no-op
+    } catch (err) {
+      // 404 (doc absent) is the only legitimate no-op. Anything else — notably a
+      // 409 conflict, when the live changes feed bumps the doc's rev between the
+      // get above and the put (TOCTOU) — must surface, or the doc stays LIVE and
+      // re-materialises as a ghost file. Swallowing only 404 keeps the no-op while
+      // making a real tombstone failure observable to the caller.
+      if ((err as { status?: number }).status !== 404) throw err;
     }
   }
 
