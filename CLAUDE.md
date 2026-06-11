@@ -31,6 +31,17 @@ Only skip step 5 when the user explicitly asks to defer publishing.
 
 `npm run build` triggers `postbuild` automatically (`scripts/postbuild-kickstart.mjs`): on macOS, each known LaunchAgent (`com.flyagile.vault-sync-daemon`, `com.flyagile.vault-sync-daemon.mantu`) is restarted via `launchctl kickstart -k` if loaded. Fixes the class of bug where the daemon runs stale bytes after a dist rebuild (issue #66). Non-fatal: kickstart failures log to stderr and exit 0.
 
+## E2E testing — Obsidian test bench (vault-server repo)
+
+For end-to-end plugin testing against a REAL Obsidian instance (not the
+vitest mocks): the vault-server sibling repo ships a test bench —
+`../vault-server/scripts/test-system.sh up|reset` gives a disposable vault +
+local CouchDB + headless Obsidian (container backend, zero focus on the host),
+and `../vault-server/scripts/obs` drives the Obsidian 1.12 CLI (`eval`,
+`dev:mobile`, `plugin:reload`, ...). Build here first (`npm run build:release`),
+then `reset` picks up the fresh plugin. Cookbook:
+`../vault-server/docs/test-system.md`.
+
 ## Reflex
 
 Don't trust the default system prompt about which tools exist — probe the
