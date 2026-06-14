@@ -61,6 +61,8 @@ interface PouchEmitter {
   on(event: "complete", handler: (info?: unknown) => void): this;
   on(event: "error", handler: (err: unknown) => void): this;
   on(event: "active" | "paused", handler: () => void): this;
+  /** Per-document authorization failure (validation or _security). Does not stop the session. */
+  on(event: "denied", handler: (err: unknown) => void): this;
   cancel(): void;
 }
 
@@ -90,6 +92,42 @@ export const TEXT_SELECTOR = { _attachments: { $exists: false } } as const;
 // capped at MAX_BACKOFF_MS, and resets the counter on any successful change.
 const INITIAL_BACKOFF_MS = 2_000;
 const MAX_BACKOFF_MS = 60_000;
+
+/**
+ * Detects an authorization failure (HTTP 401 Unauthorized or 403 Forbidden) in a
+ * PouchDB error event. Per pouchdb-replication source (replicate.js): fatal errors
+ * with errorName "unauthorized" or "forbidden" emit the `error` event directly —
+ * PouchDB does NOT schedule its own backoff retry for auth failures. Without this
+ * guard our scheduleRestart() would compound into an infinite loop on CouchDB
+ * _security enforcement, draining battery on iOS/Capacitor background suspension.
+ */
+function isAuthError(err: unknown): boolean {
+  if (err === null || err === undefined) return false;
+  const e = err as { status?: unknown; name?: unknown };
+  if (e.status === 401 || e.status === 403) return true;
+  if (e.name === "unauthorized" || e.name === "forbidden") return true;
+  return false;
+}
+
+/**
+ * Remove any embedded Basic-auth credentials from a string that may contain a
+ * CouchDB URL (e.g. error messages / stacks that echo the request URL).
+ *
+ * PouchDB error messages routinely include the request URL, which may be of the
+ * form `https://user:password@host/db`. Surfacing that string in diagnostics or
+ * onError callbacks would leak the password into the Obsidian settings panel
+ * <pre> and into console logs (CWE-312).
+ *
+ * The regex replaces the `user:pass@` segment with `***:***@` so the host and
+ * database name remain visible for diagnosis while the secret is scrubbed.
+ *
+ * Exported so callers that catch errors at a higher level (e.g. main.ts's
+ * startSync().catch) can scrub before surfacing to the user.
+ */
+export function scrubCredentials(msg: string): string {
+  // Matches the authority component: proto://user:pass@host → proto://***:***@host
+  return msg.replace(/(:\/\/)[^:@/]+:[^@/]+@/g, "$1***:***@");
+}
 
 /**
  * Durable marker store injected into the engine to protect the crash window
@@ -489,8 +527,18 @@ export class PouchDbSyncEngine {
       emitter.on("error", (err) => {
         this.initialPullRunning = false;
         this.syncHandle = null;
-        const msg = err instanceof Error ? err.message : String(err);
-        this.setError(`Initial sync failed: ${msg}`);
+
+        if (isAuthError(err)) {
+          // Authorization failure (401/403): retrying won't help until credentials change.
+          // Surface a clear actionable message and do NOT schedule backoff restart.
+          const raw = err instanceof Error ? err.message : String(err);
+          this.setError(`Authorization failed — check username and password in Vault Sync settings. (${scrubCredentials(raw)})`);
+          resolve();
+          return;
+        }
+
+        const raw = err instanceof Error ? err.message : String(err);
+        this.setError(`Initial sync failed: ${scrubCredentials(raw)}`);
         // Schedule a resilient retry — the promise resolves immediately so start() is
         // not blocked during a poor-network stall (Refs #74). PouchDB's checkpoint:'target'
         // means the retry resumes from where it left off, not from zero.
@@ -614,12 +662,36 @@ export class PouchDbSyncEngine {
       // A real transient drop: clear contacted so a paused arriving during the backoff window
       // does not falsely latch ok. The next startLiveSync() will reset it again at the top.
       this.liveSyncContacted = false;
-      const msg = err instanceof Error ? err.message : String(err);
-      this.setError(`PouchDB sync error: ${msg}`);
+
+      if (isAuthError(err)) {
+        // Authorization failure (401/403): retrying won't help until credentials change.
+        // Cancel immediately and surface a clear actionable message — do NOT schedule backoff
+        // restart. On iOS/Capacitor background suspension, an infinite retry loop drains
+        // the battery and never surfaces the root cause to the user.
+        this.cancelSync();
+        const raw = err instanceof Error ? err.message : String(err);
+        this.setError(`Authorization failed — check username and password in Vault Sync settings. (${scrubCredentials(raw)})`);
+        return;
+      }
+
+      const raw = err instanceof Error ? err.message : String(err);
+      this.setError(`PouchDB sync error: ${scrubCredentials(raw)}`);
       // Resilient restart: schedule a new db.sync after backoff so a transient network
       // failure (e.g. WebKit "Load failed") does not permanently stall the backfill (Refs #74).
       // cancelSync() in scheduleRestart's timer clears this handle before creating the new one.
       this.scheduleRestart("live");
+    });
+
+    emitter.on("denied", (err: unknown) => {
+      // Per-document authorization failure: a specific document was rejected by CouchDB's
+      // validation or _security rules. This is NOT a session-level failure — the sync
+      // continues. Surface a warning so the user knows a document was skipped.
+      const info = err instanceof Error
+        ? err.message
+        : (typeof err === "object" && err !== null)
+          ? JSON.stringify(err)
+          : String(err);
+      this.onError(`Vault Sync: document access denied — ${scrubCredentials(info)}`);
     });
   }
 
