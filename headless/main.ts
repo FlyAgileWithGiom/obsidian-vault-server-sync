@@ -74,6 +74,14 @@ export function makeHttpRemoteDb(rawUrl: string): RemoteDbForPhantomCheck {
           const chunks: Buffer[] = [];
           res.on("data", (c: Buffer) => chunks.push(c));
           res.on("end", () => {
+            // Reject on HTTP error status codes (401/403/5xx) so callers receive a
+            // proper rejection rather than silently resolving with a CouchDB error body.
+            // Without this guard, a 401 would resolve with {"error":"unauthorized",...}
+            // and reconcile would silently skip with no user-visible signal.
+            if (res.statusCode && res.statusCode >= 400) {
+              reject(new Error(`CouchDB _all_docs failed: HTTP ${res.statusCode}`));
+              return;
+            }
             try {
               const json = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
               resolve(json);
