@@ -1,5 +1,6 @@
 import { Notice, Plugin } from "obsidian";
 import type { PouchDbSyncEngine } from "./PouchDbSyncEngine";
+import { scrubCredentials } from "./PouchDbSyncEngine";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
 import { VaultSyncSettingTab } from "./settings-tab";
 import type { VaultSyncSettings, SyncState, SyncCounts, SyncDiagnostics } from "./types";
@@ -177,7 +178,7 @@ export default class VaultSyncPlugin extends Plugin {
 
     // Auto-restart sync for the new vault if it's configured.
     if (this.settings.couchDbUrl && this.settings.couchDbName) {
-      this.startSync().catch((e) => this.handleSyncError((e as Error).message));
+      this.startSync().catch((e) => this.handleSyncError(scrubCredentials((e as Error).message ?? String(e))));
     }
     return true;
   }

@@ -1135,3 +1135,230 @@ describe("PouchDbSyncEngine — resume guard on visibilitychange (Refs #72)", ()
     engine.stop();
   });
 });
+
+// ---- Auth error handling (401/403) -------------------------------------------
+//
+// Per-user vault ownership: CouchDB enforces _security.members per database.
+// A device with wrong credentials gets a 401; a user accessing the wrong database
+// gets a 403. PouchDB source code (pouchdb-replication/src/replicate.js) shows that
+// fatal errors with errorName "unauthorized"/"forbidden" emit the `error` event
+// (PouchDB does NOT schedule its own backoff retry for auth errors — it fires error
+// and stops). Our scheduleRestart() compounding that into an infinite loop is the bug.
+//
+// The fix: isAuthError() detects 401/403 in the error handler. On auth failure:
+//   - cancel the handle (prevent any pending PouchDB-internal retry)
+//   - surface a clear actionable message (not the raw URL with password)
+//   - set state "error" and DO NOT call scheduleRestart()
+//   - also handle `denied` event for per-document authorization failures
+//   - ensure the password is never visible in error messages or getDiagnostics()
+
+describe("PouchDbSyncEngine — auth error handling 401/403", () => {
+  beforeEach(() => {
+    lastSyncHandle = null;
+    lastReplicateHandle = null;
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.runAllTimers();
+    vi.useRealTimers();
+  });
+
+  // Helper: build a PouchDB-shaped auth error (matches pouchdb-replication error shape)
+  function makeAuthError(status: 401 | 403): Error & { status?: number; name?: string } {
+    const err = new Error(status === 401 ? "Unauthorized" : "Forbidden") as Error & { status?: number; name?: string };
+    err.status = status;
+    err.name = status === 401 ? "unauthorized" : "forbidden";
+    return err;
+  }
+
+  it("live-sync 401 error stops sync without scheduling a backoff restart [RED: scheduleRestart called on unfixed code]", async () => {
+    const { engine, db } = makeEngine({ docCount: 5 }); // doc_count>0 → live sync directly
+    engine.register(makePlugin());
+    await engine.start();
+
+    const firstHandle = lastSyncHandle!;
+    expect(db.sync).toHaveBeenCalledTimes(1);
+
+    firstHandle._emit("error", makeAuthError(401));
+
+    // Advance well past any backoff window — on unfixed code this would create a second handle
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    // On fixed code: auth error does NOT schedule a restart — db.sync stays at 1 call
+    expect(db.sync).toHaveBeenCalledTimes(1);
+    expect(engine.getDiagnostics().state).toBe("error");
+  });
+
+  it("live-sync 403 error stops sync without scheduling a backoff restart", async () => {
+    const { engine, db } = makeEngine({ docCount: 5 });
+    engine.register(makePlugin());
+    await engine.start();
+
+    lastSyncHandle!._emit("error", makeAuthError(403));
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(db.sync).toHaveBeenCalledTimes(1);
+    expect(engine.getDiagnostics().state).toBe("error");
+  });
+
+  it("live-sync 401 error surfaces a clear actionable message via onError", async () => {
+    const { engine } = makeEngine({ docCount: 5 });
+    const errors: string[] = [];
+    engine.onError = (msg) => errors.push(msg);
+    engine.register(makePlugin());
+    await engine.start();
+
+    lastSyncHandle!._emit("error", makeAuthError(401));
+
+    expect(errors).toHaveLength(1);
+    // Message must mention credentials/settings — actionable for the user
+    expect(errors[0].toLowerCase()).toMatch(/authoriz|credenti|settings|password|username/);
+  });
+
+  it("live-sync 403 error surfaces a clear actionable message via onError", async () => {
+    const { engine } = makeEngine({ docCount: 5 });
+    const errors: string[] = [];
+    engine.onError = (msg) => errors.push(msg);
+    engine.register(makePlugin());
+    await engine.start();
+
+    lastSyncHandle!._emit("error", makeAuthError(403));
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].toLowerCase()).toMatch(/authoriz|credenti|settings|password|username/);
+  });
+
+  it("auth error message does NOT contain the password (credential scrub)", async () => {
+    // Realistic scenario: PouchDB may embed the request URL (with embedded credentials)
+    // into the error message/stack. The engine must scrub the password before surfacing.
+    const { engine } = makeEngine({ docCount: 5 }); // settings has user=alice, password=secret
+    const errors: string[] = [];
+    engine.onError = (msg) => errors.push(msg);
+    engine.register(makePlugin());
+    await engine.start();
+
+    // Simulate PouchDB echoing the request URL (which contains the password) in the error
+    const urlLeakingError = makeAuthError(401);
+    urlLeakingError.message = "Request to https://alice:secret@sync.example.com/test-vault failed: 401 Unauthorized";
+    lastSyncHandle!._emit("error", urlLeakingError);
+
+    const combined = errors.join(" ") + JSON.stringify(engine.getDiagnostics());
+    expect(combined).not.toContain("secret"); // password must not appear anywhere
+    expect(combined).not.toContain("alice:secret"); // URL credential form must not appear
+  });
+
+  it("auth error does not expose password in getDiagnostics().lastError", async () => {
+    const { engine } = makeEngine({ docCount: 5 });
+    engine.register(makePlugin());
+    await engine.start();
+
+    const urlLeakingError = makeAuthError(401);
+    urlLeakingError.message = "Request to https://alice:secret@sync.example.com/test-vault failed";
+    lastSyncHandle!._emit("error", urlLeakingError);
+
+    const lastError = engine.getDiagnostics().lastError ?? "";
+    expect(lastError).not.toContain("secret");
+  });
+
+  it("phase-1 (initial pull) 401 error stops without scheduling restart", async () => {
+    const db = makeMockDb(0);
+    (db.replicate.from as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      const handle = makeMockSyncHandle();
+      lastReplicateHandle = handle;
+      // Immediately emit a 401 on the next tick
+      setTimeout(() => handle._emit("error", makeAuthError(401)), 0);
+      return handle;
+    });
+    const bridge = makeMockBridge();
+    const dbFactory = () => db as unknown as Parameters<typeof PouchDbSyncEngine>[1];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any, dbFactory as any);
+    engine.register(makePlugin());
+
+    const startPromise = engine.start();
+    await vi.runAllTimersAsync();
+    await startPromise;
+
+    // Advance way past any potential backoff
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    // Auth error must NOT retry replicate.from
+    expect(db.replicate.from).toHaveBeenCalledTimes(1);
+    expect(engine.getDiagnostics().state).toBe("error");
+  });
+
+  it("phase-1 (initial pull) 401 error surfaces an actionable message", async () => {
+    const db = makeMockDb(0);
+    (db.replicate.from as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      const handle = makeMockSyncHandle();
+      lastReplicateHandle = handle;
+      setTimeout(() => handle._emit("error", makeAuthError(401)), 0);
+      return handle;
+    });
+    const bridge = makeMockBridge();
+    const dbFactory = () => db as unknown as Parameters<typeof PouchDbSyncEngine>[1];
+    const errors: string[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const engine = new PouchDbSyncEngine(makeSettings(), db as any, bridge as any, dbFactory as any);
+    engine.onError = (msg) => errors.push(msg);
+    engine.register(makePlugin());
+
+    const startPromise = engine.start();
+    await vi.runAllTimersAsync();
+    await startPromise;
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].toLowerCase()).toMatch(/authoriz|credenti|settings|password|username/);
+  });
+
+  it("non-auth errors still trigger the normal backoff restart (regression guard)", async () => {
+    const { engine, db } = makeEngine({ docCount: 5 });
+    engine.register(makePlugin());
+    await engine.start();
+
+    // Regular transient network error — must still restart (existing behavior preserved)
+    lastSyncHandle!._emit("error", new Error("Load failed"));
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    expect(db.sync).toHaveBeenCalledTimes(2); // backoff restart fired
+    engine.stop();
+  });
+
+  it("'denied' event on live sync emits a warning via onError but does NOT stop the sync", async () => {
+    // Per-document authorization failure: a doc outside the user's _security scope.
+    // PouchDB emits 'denied' for this case. The engine must warn without killing the
+    // whole sync session — individual doc denial ≠ session failure.
+    //
+    // Phase-1 (docCount:0) auto-completes via a mock setTimeout(0) — we kick off start()
+    // non-awaited and flush timers so the complete fires, putting us in live db.sync
+    // state "syncing". Then we assert denied doesn't kill the session.
+    const { engine } = makeEngine({ docCount: 0 });
+    const errors: string[] = [];
+    engine.onError = (msg) => errors.push(msg);
+    engine.register(makePlugin());
+
+    // Kick start without blocking — phase-1 hangs until the fake setTimeout fires.
+    void engine.start();
+    // Flush microtasks (db.info await) so replicate.from is issued, then flush the
+    // setTimeout(0) that emits "complete" on the replicate handle.
+    await vi.runAllTimersAsync();
+    // Now phase-1 complete fired → startLiveSync() called → live handle created.
+
+    const syncHandle = lastSyncHandle!;
+    expect(engine.getDiagnostics().state).toBe("syncing"); // confirm we're in the right state
+
+    // Simulate a per-document denied event (shape from pouchdb-replication source)
+    const deniedErr = { id: "file/private.md", error: "forbidden", reason: "not an admin" };
+    syncHandle._emit("denied", deniedErr);
+
+    // Warning surfaced to the user
+    expect(errors.length).toBeGreaterThan(0);
+    // The handle was NOT cancelled — sync continues
+    expect(syncHandle.cancel).not.toHaveBeenCalled();
+    // State must NOT be "error" — individual doc denial does not kill the session
+    expect(engine.getDiagnostics().state).not.toBe("error");
+
+    engine.stop();
+  });
+});
