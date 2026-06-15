@@ -13,7 +13,14 @@ import {
   SECRET_ID_COUCH_PASSWORD,
   ENV_COUCH_USER,
   ENV_COUCH_PASSWORD,
+  SECRET_ID_GATEWAY_CLIENT_ID,
+  SECRET_ID_GATEWAY_CLIENT_SECRET,
 } from "./secret-store";
+import { makeTokenManager, makeGatewayFetch } from "./gateway-fetch";
+import {
+  provisionGatewayCredential,
+  type ProvisionResult,
+} from "./provision";
 
 /**
  * Vault Sync - CouchDB replication for Obsidian.
@@ -209,7 +216,29 @@ export default class VaultSyncPlugin extends Plugin {
     const db = dbFactory();
     const bridge = new PouchDbFsBridge(vaultAdapter, db);
 
-    return new PouchDbSyncEngine(this.settings, db, bridge, dbFactory);
+    // RemoteFactory: builds a pouchdb-browser remote handle from a URL + optional
+    // fetch (the gatewayFetch is passed here when in gateway/Bearer mode).
+    const remoteFactory = (url: string, opts: { fetch?: typeof fetch }) =>
+      new PouchDB(url, opts.fetch ? { fetch: opts.fetch } : {});
+
+    // GatewayCredsResolver: reads stored client_id/secret; returns a Bearer-injecting
+    // fetch when both are present and gatewayUrl is set, null otherwise (Phase A fallback).
+    const gatewayCredsResolver = async (): Promise<typeof fetch | null> => {
+      if (!this.settings.gatewayUrl) return null;
+      const store = this.getSecretStore();
+      const clientId = await store.get(SECRET_ID_GATEWAY_CLIENT_ID);
+      const clientSecret = await store.get(SECRET_ID_GATEWAY_CLIENT_SECRET);
+      if (!clientId || !clientSecret) return null;
+      const tokenManager = makeTokenManager({
+        gatewayUrl: this.settings.gatewayUrl,
+        clientId,
+        clientSecret,
+        store,
+      });
+      return makeGatewayFetch({ tokenManager });
+    };
+
+    return new PouchDbSyncEngine(this.settings, db, bridge, dbFactory, remoteFactory, gatewayCredsResolver);
   }
 
   // --- Settings persistence ---
@@ -380,6 +409,12 @@ export default class VaultSyncPlugin extends Plugin {
     onDisk.couchDbUrl = this.settings.couchDbUrl;
     onDisk.couchDbName = this.settings.couchDbName;
     onDisk.excludePatterns = this.settings.excludePatterns;
+    // gatewayUrl is the public gateway endpoint — not a secret, safe to persist.
+    if (this.settings.gatewayUrl !== undefined) {
+      onDisk.gatewayUrl = this.settings.gatewayUrl;
+    } else {
+      delete onDisk.gatewayUrl;
+    }
     // couchDbUser / couchDbPassword are intentionally left as found on disk —
     // present → preserved verbatim; absent → stay absent.
 
@@ -402,6 +437,46 @@ export default class VaultSyncPlugin extends Plugin {
     // Propagate to the live engine so a credential change takes effect without
     // a restart (settings already hold the new value in memory).
     this.strategy?.updateSettings(this.settings);
+  }
+
+  /**
+   * Provision (or detect already-provisioned) gateway credentials for this device,
+   * then rebuild the sync engine so it picks up the new credentials immediately.
+   *
+   * The bootstrap token is consumed in one call and never stored. The engine is
+   * rebuilt so the new gatewayCredsResolver closure reads the freshly-stored
+   * client_id/client_secret on its first call.
+   */
+  async provisionGateway(bootstrapToken: string, userId: string): Promise<ProvisionResult> {
+    if (!this.settings.gatewayUrl) {
+      throw new Error("Gateway URL is not set");
+    }
+    const store = this.getSecretStore();
+    const result = await provisionGatewayCredential({
+      gatewayUrl: this.settings.gatewayUrl,
+      bootstrapToken,
+      userId,
+      store,
+    });
+
+    // Rebuild the strategy so its gatewayCredsResolver closure reads the newly
+    // stored credentials on its first sync start. Mirror refreshIfVaultChanged().
+    const wasRunning = this.strategy?.isRunning();
+    this.strategy?.stop();
+    this.strategy = await this.createStrategy();
+    this.strategy.onStateChange = (state) => this.updateState(state);
+    this.strategy.onCountsChange = (counts) => this.updateCounts(counts);
+    this.strategy.onError = (msg) => this.handleSyncError(msg);
+    this.strategy.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    this.strategy.onNotice = (msg) => new Notice(msg);
+    this.strategy.register(this);
+    this.notifyDiagnosticsListeners();
+
+    if (wasRunning) {
+      this.startSync().catch((e) => this.handleSyncError((e as Error).message));
+    }
+
+    return result;
   }
 
   /**

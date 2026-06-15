@@ -1,4 +1,4 @@
-import { App, Modal, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type VaultSyncPlugin from "./main";
 import type { SyncDiagnostics } from "./types";
 
@@ -105,6 +105,101 @@ export class VaultSyncSettingTab extends PluginSettingTab {
               .filter((s) => s.length > 0);
             await this.plugin.saveSettings();
           })
+      );
+
+    // --- Gateway login section ---
+    // One-time provisioning: the bootstrap token is cleared after use and never
+    // persisted. The gateway URL IS persisted (non-secret public endpoint URL).
+    containerEl.createEl("h3", { text: "Gateway login" });
+    containerEl.createEl("p", {
+      text: "Provision device credentials via the gateway. Enter the URL, your user ID, " +
+            "and the one-time bootstrap token you received, then click \"Provision / Log in\".",
+      cls: "setting-item-description",
+    });
+
+    new Setting(containerEl)
+      .setName("Gateway URL")
+      .setDesc("Base URL of the sync gateway (e.g. https://gateway.example.com)")
+      .addText((text) =>
+        text
+          .setPlaceholder("https://gateway.example.com")
+          .setValue(this.plugin.settings.gatewayUrl ?? "")
+          .onChange(async (value) => {
+            this.plugin.settings.gatewayUrl = value.trim() || undefined;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    // One-shot fields: userId and bootstrapToken are held in local state only.
+    // They are never persisted to settings or the secret store.
+    let gatewayUserId = "";
+    let gatewayBootstrapToken = "";
+    let userIdText: import("obsidian").TextComponent | null = null;
+    let bootstrapText: import("obsidian").TextComponent | null = null;
+
+    new Setting(containerEl)
+      .setName("User ID")
+      .setDesc("Your Clerk user sub (e.g. user_2abc…). One-time: cleared after provisioning.")
+      .addText((text) => {
+        userIdText = text;
+        text
+          .setPlaceholder("user_2abc...")
+          .onChange((value) => { gatewayUserId = value.trim(); });
+      });
+
+    new Setting(containerEl)
+      .setName("Bootstrap token")
+      .setDesc("One-time token to prove identity. Cleared immediately after use.")
+      .addText((text) => {
+        bootstrapText = text;
+        text.inputEl.type = "password";
+        text.onChange((value) => { gatewayBootstrapToken = value; });
+      });
+
+    new Setting(containerEl)
+      .setName("Provision / Log in")
+      .setDesc("Register this device with the gateway and store the credentials.")
+      .addButton((btn) =>
+        btn.setButtonText("Provision / Log in").onClick(async () => {
+          if (!this.plugin.settings.gatewayUrl) {
+            new Notice("Vault Sync: please set the Gateway URL first.");
+            return;
+          }
+          if (!gatewayUserId) {
+            new Notice("Vault Sync: please enter your User ID.");
+            return;
+          }
+          if (!gatewayBootstrapToken) {
+            new Notice("Vault Sync: please enter the bootstrap token.");
+            return;
+          }
+          btn.setButtonText("Provisioning...");
+          btn.setDisabled(true);
+          try {
+            const result = await this.plugin.provisionGateway(
+              gatewayBootstrapToken,
+              gatewayUserId,
+            );
+            // Clear the one-shot fields regardless of outcome — they must not linger.
+            gatewayBootstrapToken = "";
+            gatewayUserId = "";
+            if (bootstrapText) bootstrapText.setValue("");
+            if (userIdText) userIdText.setValue("");
+
+            const msg = result === "created"
+              ? "Gateway credentials provisioned successfully."
+              : "Device already provisioned — credentials are ready.";
+            new Notice(`Vault Sync: ${msg}`);
+            btn.setButtonText("Done");
+          } catch (e) {
+            new Notice(`Vault Sync: provisioning failed — ${(e as Error).message}`);
+            btn.setButtonText("Failed");
+          }
+          setTimeout(() => {
+            btn.setButtonText("Provision / Log in");
+            btn.setDisabled(false);
+          }, 3000);
+        })
       );
 
     containerEl.createEl("h3", { text: "Actions" });
