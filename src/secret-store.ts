@@ -38,6 +38,29 @@ export const ENV_COUCH_USER = "VAULT_SYNC_COUCH_USER";
 export const ENV_COUCH_PASSWORD = "VAULT_SYNC_COUCH_PASSWORD";
 
 /**
+ * Gateway OAuth2 credential ids (feat/sync-gateway-oauth).
+ *
+ * client_id and client_secret are the long-lived machine credentials obtained
+ * from POST /credentials/provision on the gateway. The access token is
+ * short-lived and held in-memory only — it MUST NOT be persisted to the store
+ * because it is derived on demand and rotates every 24 h. The refresh token
+ * rotates on every use (the gateway's oauth-provider.ts uses rotating refresh),
+ * so it IS persisted here so the new value survives a process restart.
+ *
+ * "No in-vault legacy" for these IDs: the `legacy` parameter for resolveSecret()
+ * is always "" (empty string), which degrades to a plain auth failure rather
+ * than a destructive re-pull — consistent with the fail-safe in the ADR.
+ */
+export const SECRET_ID_GATEWAY_CLIENT_ID = "vault-sync-gateway-client-id";
+export const SECRET_ID_GATEWAY_CLIENT_SECRET = "vault-sync-gateway-client-secret";
+export const SECRET_ID_GATEWAY_REFRESH_TOKEN = "vault-sync-gateway-refresh-token";
+
+/** Environment-variable names for gateway OAuth2 credentials. */
+export const ENV_GATEWAY_CLIENT_ID = "VAULT_SYNC_GATEWAY_CLIENT_ID";
+export const ENV_GATEWAY_CLIENT_SECRET = "VAULT_SYNC_GATEWAY_CLIENT_SECRET";
+export const ENV_GATEWAY_REFRESH_TOKEN = "VAULT_SYNC_GATEWAY_REFRESH_TOKEN";
+
+/**
  * Minimal shape of Obsidian's synchronous SecretStorage API (>= 1.11.4).
  * Declared locally so feature-detection works even when the installed typings
  * predate the API.
