@@ -19,8 +19,14 @@ import {
   SECRET_ID_COUCH_PASSWORD,
   ENV_COUCH_USER,
   ENV_COUCH_PASSWORD,
+  SECRET_ID_GATEWAY_CLIENT_ID,
+  SECRET_ID_GATEWAY_CLIENT_SECRET,
+  ENV_GATEWAY_CLIENT_ID,
+  ENV_GATEWAY_CLIENT_SECRET,
 } from "../src/secret-store";
 import { KeychainSecretStore } from "./keychain-secret-store";
+import { makeTokenManager, makeGatewayFetch } from "../src/gateway-fetch";
+import { provisionGatewayCredential } from "../src/provision";
 
 /**
  * Build a RemoteDbForPhantomCheck that uses node:http or node:https directly.
@@ -31,16 +37,23 @@ import { KeychainSecretStore } from "./keychain-secret-store";
  * tests) and https:// (production Fly.io) by selecting the module based on
  * the URL scheme.
  *
- * The rawUrl must include credentials if authentication is required, e.g.:
+ * The rawUrl must include credentials for Basic auth if authentication is required:
  *   http://user:pass@localhost:5986/vault-name
  *   https://user:pass@couchdb.fly.dev/vault-name
+ *
+ * When `bearerToken` is provided, it is used instead of URL-embedded Basic auth.
+ * This is the gateway mode: the URL has no embedded credentials and the token
+ * carries the authentication.
  */
-export function makeHttpRemoteDb(rawUrl: string): RemoteDbForPhantomCheck {
+export function makeHttpRemoteDb(rawUrl: string, bearerToken?: string): RemoteDbForPhantomCheck {
   const parsed = new URL(rawUrl);
   const isHttps = parsed.protocol === "https:";
-  const auth = parsed.username
-    ? `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}`
-    : undefined;
+  // Gateway mode: Bearer token takes precedence over URL-embedded credentials.
+  const auth = bearerToken
+    ? `Bearer ${bearerToken}`
+    : parsed.username
+      ? `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}`
+      : undefined;
 
   // Strip credentials from the URL used for the request path
   const reqUrl = new URL(rawUrl);
@@ -617,6 +630,28 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   const excludePatterns = [STATE_FILENAME, CONFIG_FILENAME, ".git", ...settings.excludePatterns];
   const fsWatcher = new FsWatcher(absVaultRoot, excludePatterns);
 
+  // --- Gateway credential resolution ---
+  // Resolve gateway client_id/secret from env > Keychain, following the same
+  // precedence as couch credentials above.  No in-vault legacy: gateway creds
+  // are never stored in .vault-sync.json.
+  const daemonStore = new KeychainSecretStore();
+  const daemonEnv = process.env;
+  const gatewayClientId = await resolveSecret({
+    envName: ENV_GATEWAY_CLIENT_ID,
+    env: daemonEnv,
+    store: daemonStore,
+    id: SECRET_ID_GATEWAY_CLIENT_ID,
+    legacy: "",
+  });
+  const gatewayClientSecret = await resolveSecret({
+    envName: ENV_GATEWAY_CLIENT_SECRET,
+    env: daemonEnv,
+    store: daemonStore,
+    id: SECRET_ID_GATEWAY_CLIENT_SECRET,
+    legacy: "",
+  });
+  const hasGatewayCreds = !!(settings.gatewayUrl && gatewayClientId && gatewayClientSecret);
+
   // Build the remoteDb adapter for the phantom check (C04-bis).
   // Uses node:http(s) directly instead of pouchdb-node's HTTP adapter, which
   // hangs on _all_docs POST requests under Fly.io CouchDB (keep-alive issue).
@@ -625,15 +660,53 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   const base = couchDbUrl.replace(/\/$/, "");
   const proto = base.startsWith("https://") ? "https://" : "http://";
   const host = base.slice(proto.length);
-  const authPart = (couchDbUser && couchDbPassword)
-    ? `${encodeURIComponent(couchDbUser)}:${encodeURIComponent(couchDbPassword)}@`
-    : "";
-  const remoteDbUrl = `${proto}${authPart}${host}/${couchDbName}`;
-  const remoteDb = makeHttpRemoteDb(remoteDbUrl);
-  console.log(`[vault-sync] Phantom check remote: ${proto}${host}/${couchDbName}`);
+
+  let remoteDb: ReturnType<typeof makeHttpRemoteDb>;
+  if (hasGatewayCreds) {
+    // Gateway mode: phantom check uses Bearer auth via the gateway proxy URL.
+    // Obtain an access token eagerly — the phantom check runs synchronously inside
+    // runReconcileOnStartup, so we resolve it here in the async context.
+    const phantomTokenManager = makeTokenManager({
+      gatewayUrl: settings.gatewayUrl!,
+      clientId: gatewayClientId,
+      clientSecret: gatewayClientSecret,
+      store: daemonStore,
+    });
+    const phantomToken = await phantomTokenManager.getValidToken();
+    const gatewayBase = settings.gatewayUrl!.replace(/\/$/, "");
+    const gatewayRemoteUrl = `${gatewayBase}/couchdb/${couchDbName}`;
+    remoteDb = makeHttpRemoteDb(gatewayRemoteUrl, phantomToken);
+    console.log(`[vault-sync] Phantom check remote (gateway): ${gatewayRemoteUrl}`);
+  } else {
+    const authPart = (couchDbUser && couchDbPassword)
+      ? `${encodeURIComponent(couchDbUser)}:${encodeURIComponent(couchDbPassword)}@`
+      : "";
+    const remoteDbUrl = `${proto}${authPart}${host}/${couchDbName}`;
+    remoteDb = makeHttpRemoteDb(remoteDbUrl);
+    console.log(`[vault-sync] Phantom check remote: ${proto}${host}/${couchDbName}`);
+  }
+
+  // RemoteFactory: builds a pouchdb-node remote handle from a URL + optional fetch.
+  const PouchDB_type = PouchDB;
+  const remoteFactory = (url: string, opts: { fetch?: typeof fetch }) =>
+    new PouchDB_type(url, opts.fetch ? { fetch: opts.fetch } : {}) as unknown as import("../src/pouchdb-browser").default;
+
+  // GatewayCredsResolver: returns a Bearer-injecting fetch when gateway creds are
+  // available, null otherwise (engine falls back to legacy Basic-auth URL).
+  const gatewayCredsResolver = hasGatewayCreds
+    ? async (): Promise<typeof fetch | null> => {
+        const tokenManager = makeTokenManager({
+          gatewayUrl: settings.gatewayUrl!,
+          clientId: gatewayClientId,
+          clientSecret: gatewayClientSecret,
+          store: daemonStore,
+        });
+        return makeGatewayFetch({ tokenManager });
+      }
+    : undefined;
 
   // Build engine with injected db and bridge.
-  const engine = new PouchDbSyncEngine(settings, db, bridge, dbFactory);
+  const engine = new PouchDbSyncEngine(settings, db, bridge, dbFactory, remoteFactory, gatewayCredsResolver);
 
   engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
   engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);
@@ -685,14 +758,68 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   console.log("[vault-sync] Daemon (PouchDB) running. Press Ctrl+C to stop.");
 }
 
+/**
+ * One-shot provisioning helper for the headless daemon.
+ *
+ * Called when the operator runs `daemon --provision /path/to/vault`.
+ * Reads the bootstrap token and user ID from env, calls the gateway provisioning
+ * endpoint, stores the resulting client credentials in the macOS Keychain, then exits.
+ *
+ * Required env vars:
+ *   VAULT_SYNC_GATEWAY_BOOTSTRAP_TOKEN — one-time token issued by the admin
+ *   VAULT_SYNC_GATEWAY_USER_ID         — the Clerk user sub (user_2abc…)
+ *
+ * The gateway URL is read from .vault-sync.json (via loadConfig()).
+ */
+async function provisionAndExit(absVaultRoot: string): Promise<void> {
+  const bootstrapToken = process.env.VAULT_SYNC_GATEWAY_BOOTSTRAP_TOKEN;
+  const userId = process.env.VAULT_SYNC_GATEWAY_USER_ID;
+  if (!bootstrapToken) {
+    console.error("[vault-sync] --provision: VAULT_SYNC_GATEWAY_BOOTSTRAP_TOKEN env var is required.");
+    process.exit(1);
+  }
+  if (!userId) {
+    console.error("[vault-sync] --provision: VAULT_SYNC_GATEWAY_USER_ID env var is required.");
+    process.exit(1);
+  }
+
+  const settings = await loadConfig(absVaultRoot);
+  if (!settings.gatewayUrl) {
+    console.error("[vault-sync] --provision: gatewayUrl is not set in .vault-sync.json.");
+    process.exit(1);
+  }
+
+  const store = new KeychainSecretStore();
+  const result = await provisionGatewayCredential({
+    gatewayUrl: settings.gatewayUrl,
+    bootstrapToken,
+    userId,
+    store,
+  });
+
+  console.log(
+    result === "created"
+      ? "[vault-sync] --provision: gateway credentials provisioned and stored in Keychain."
+      : "[vault-sync] --provision: device already provisioned — credentials already in Keychain.",
+  );
+  process.exit(0);
+}
+
 async function main(): Promise<void> {
   // Parse argv robustly: flags may precede the vault root
   // (e.g. `daemon --scrub-secrets /path`). First non-flag arg is the vault root.
   const args = process.argv.slice(2);
   const scrubSecrets = args.includes("--scrub-secrets");
+  const provision = args.includes("--provision");
   const positional = args.filter((a) => !a.startsWith("--"));
   const vaultRoot = positional[0] ?? process.cwd();
   const absVaultRoot = path.resolve(vaultRoot);
+
+  // One-shot provisioning (#92): register this device with the gateway and exit.
+  if (provision) {
+    await provisionAndExit(absVaultRoot);
+    return;
+  }
 
   // Phase B (#78): operator-gated scrub. One-shot — never starts the daemon.
   if (scrubSecrets) {
