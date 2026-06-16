@@ -20,14 +20,18 @@ import type { GatewayTokenResponse } from "./gateway-fetch";
  */
 
 // PKCE verifier length (RFC 7636 allows 43-128 chars of the unreserved set).
-// 32 random bytes base64url-encode to 43 chars — the minimum that satisfies the
-// spec while keeping the URL compact.
-const PKCE_VERIFIER_BYTES = 32;
+// 48 random bytes base64url-encode to 64 chars — comfortably above the RFC 7636
+// minimum (43) and well within the 128 max, leaving entropy margin.
+const PKCE_VERIFIER_BYTES = 48;
+
+// Entropy for the OAuth `state` CSRF/replay guard. Shared by both clients via the
+// exported generateState() so there is one source of the value.
+const STATE_ENTROPY_BYTES = 32;
 
 // Cap how much of a non-2xx error body we surface in a thrown Error (it reaches
 // logs and user notifications). The token/register bodies can echo submitted
 // material, so never surface them verbatim — only the cap and the status.
-const ERROR_BODY_MAX = 200;
+export const ERROR_BODY_MAX = 200;
 
 /** PKCE pair: the secret verifier and its S256-derived public challenge. */
 export interface PkcePair {
@@ -64,6 +68,19 @@ export async function generatePkce(): Promise<PkcePair> {
   const codeChallenge = base64UrlEncode(new Uint8Array(digest));
 
   return { codeVerifier, codeChallenge };
+}
+
+/**
+ * Generate an opaque `state` value (CSRF/replay guard) for an OAuth login.
+ *
+ * Shared by the plugin (obsidian://) and daemon (loopback) flows so the entropy
+ * and encoding live in exactly one place. Runtime-agnostic: depends only on
+ * crypto.getRandomValues + base64UrlEncode.
+ */
+export function generateState(): string {
+  const bytes = new Uint8Array(STATE_ENTROPY_BYTES);
+  crypto.getRandomValues(bytes);
+  return base64UrlEncode(bytes);
 }
 
 /** Parameters for buildAuthorizeUrl. */

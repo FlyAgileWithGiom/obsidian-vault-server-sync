@@ -1,5 +1,6 @@
 import {
   generatePkce,
+  generateState,
   buildAuthorizeUrl,
   exchangeCode,
   registerClient,
@@ -7,6 +8,10 @@ import {
 } from "../src/clerk-oauth";
 import type { SecretStore } from "../src/secret-store";
 import { SECRET_ID_GATEWAY_CLIENT_ID } from "../src/secret-store";
+
+// Re-export the shared generateState so existing importers (and tests) of this
+// module keep a stable path; the implementation lives in src/clerk-oauth.ts.
+export { generateState };
 
 /**
  * Headless Clerk OAuth login for the vault-sync daemon.
@@ -32,24 +37,6 @@ import { SECRET_ID_GATEWAY_CLIENT_ID } from "../src/secret-store";
  * unattended and must refresh the 1-day access JWT without re-prompting the user.
  */
 export const DAEMON_OAUTH_SCOPE = "offline_access";
-
-// Bytes of entropy for the opaque OAuth `state` CSRF/replay guard. 32 bytes
-// base64url-encodes to a 43-char value, matching the PKCE verifier strength.
-const STATE_ENTROPY_BYTES = 32;
-
-/**
- * Generate an opaque, high-entropy OAuth `state` value.
- *
- * The state is echoed back on the callback and compared (parseLoopbackCallback);
- * a mismatch means the callback did not originate from this login attempt.
- */
-export function generateState(): string {
-  const bytes = new Uint8Array(STATE_ENTROPY_BYTES);
-  crypto.getRandomValues(bytes);
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
 
 /** Result of a successful loopback callback parse. */
 export interface LoopbackCallbackResult {

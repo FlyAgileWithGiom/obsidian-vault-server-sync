@@ -269,7 +269,8 @@ describe("gateway refresh token round-trips through the store", () => {
       id: SECRET_ID_GATEWAY_REFRESH_TOKEN,
       legacy: "",
     });
-    // Empty -> token manager falls through to client_credentials grant; not a crash.
+    // Empty resolves to an empty string (not a crash); the token manager treats a
+    // missing/empty refresh token as "login required" — there is no other grant.
     expect(resolved).toBe("");
   });
 });

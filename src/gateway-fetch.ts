@@ -1,5 +1,7 @@
 import type { SecretStore } from "./secret-store";
 import { SECRET_ID_GATEWAY_REFRESH_TOKEN } from "./secret-store";
+// Single canonical cap for surfaced error bodies, shared with the OAuth module.
+import { ERROR_BODY_MAX } from "./clerk-oauth";
 
 /**
  * Gateway OAuth token response shape.
@@ -71,11 +73,6 @@ export interface TokenManager {
 // so the token is refreshed slightly before the gateway truly expires it.
 const TOKEN_EXPIRY_GRACE_MS = 30_000;
 
-// Cap how much of a non-credential gateway error body we surface in a thrown
-// Error (it reaches logs and user notifications). Credential failures (401/403)
-// surface no body at all.
-const GATEWAY_ERROR_BODY_MAX = 200;
-
 /**
  * Create a stateful token manager that handles the steady-state OAuth token
  * lifecycle for a public PKCE client: refresh_token rotation, in-memory caching,
@@ -140,7 +137,7 @@ export function makeTokenManager(opts: TokenManagerOpts): TokenManager {
       if (resp.status === 401 || resp.status === 403) {
         throw new Error(`Gateway token endpoint returned ${resp.status} (invalid credentials)`);
       }
-      const detail = (await resp.text().catch(() => "")).slice(0, GATEWAY_ERROR_BODY_MAX);
+      const detail = (await resp.text().catch(() => "")).slice(0, ERROR_BODY_MAX);
       throw new Error(`Gateway token endpoint returned ${resp.status}: ${detail}`);
     }
 

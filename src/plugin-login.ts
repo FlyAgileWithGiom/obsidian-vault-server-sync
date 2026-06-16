@@ -1,5 +1,6 @@
 import {
   generatePkce,
+  generateState,
   buildAuthorizeUrl,
   exchangeCode,
   registerClient,
@@ -80,19 +81,6 @@ export interface TransientLoginStore {
   get(): TransientLoginState | null;
   set(value: TransientLoginState): void;
   clear(): void;
-}
-
-// Bytes of entropy for the opaque OAuth `state` CSRF/replay guard. 32 bytes
-// base64url-encodes to a 43-char value, matching the PKCE verifier strength.
-const STATE_ENTROPY_BYTES = 32;
-
-/** Generate an opaque, high-entropy base64url OAuth `state` value. */
-function generateState(): string {
-  const bytes = new Uint8Array(STATE_ENTROPY_BYTES);
-  crypto.getRandomValues(bytes);
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 /** Dependencies for startPluginLogin — side-effects injected for testability. */
