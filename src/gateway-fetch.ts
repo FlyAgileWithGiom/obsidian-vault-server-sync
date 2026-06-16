@@ -69,6 +69,11 @@ export interface TokenManager {
 // so the token is refreshed slightly before the gateway truly expires it.
 const TOKEN_EXPIRY_GRACE_MS = 30_000;
 
+// Cap how much of a non-credential gateway error body we surface in a thrown
+// Error (it reaches logs and user notifications). Credential failures (401/403)
+// surface no body at all.
+const GATEWAY_ERROR_BODY_MAX = 200;
+
 /**
  * Create a stateful token manager that handles the full OAuth2 token lifecycle:
  * initial client_credentials grant, refresh_token rotation, in-memory caching,
@@ -124,9 +129,14 @@ export function makeTokenManager(opts: TokenManagerOpts): TokenManager {
 
     if (!resp.ok) {
       // Propagate gateway errors (e.g. 401 invalid_client) as thrown errors
-      // so the caller knows the refresh failed entirely.
-      const text = await resp.text().catch(() => "");
-      throw new Error(`Gateway token endpoint returned ${resp.status}: ${text}`);
+      // so the caller knows the refresh failed entirely. Do NOT echo the raw
+      // body on credential failures (it can carry submitted token material), and
+      // cap it otherwise — this error surfaces in logs and user notifications.
+      if (resp.status === 401 || resp.status === 403) {
+        throw new Error(`Gateway token endpoint returned ${resp.status} (invalid credentials)`);
+      }
+      const detail = (await resp.text().catch(() => "")).slice(0, GATEWAY_ERROR_BODY_MAX);
+      throw new Error(`Gateway token endpoint returned ${resp.status}: ${detail}`);
     }
 
     const data = (await resp.json()) as GatewayTokenResponse;

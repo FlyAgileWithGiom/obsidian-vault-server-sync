@@ -4,6 +4,9 @@ import {
   SECRET_ID_GATEWAY_CLIENT_SECRET,
 } from "./secret-store";
 
+// Cap how much of a non-credential provision error body we surface (reaches logs/UI).
+const PROVISION_ERROR_BODY_MAX = 200;
+
 /**
  * Provision response shape from POST /credentials/provision (mcp-gateway PR #2).
  *
@@ -78,9 +81,16 @@ export async function provisionGatewayCredential(opts: ProvisionOpts): Promise<P
   });
 
   if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
+    // 401/403 mean a bad/forbidden bootstrap token — surface no body (it may echo
+    // the submitted token). For other errors, cap the body; this reaches logs/UI.
+    if (resp.status === 401 || resp.status === 403) {
+      throw new Error(
+        `Gateway /credentials/provision returned ${resp.status} (bootstrap token rejected)`,
+      );
+    }
+    const detail = (await resp.text().catch(() => "")).slice(0, PROVISION_ERROR_BODY_MAX);
     throw new Error(
-      `Gateway /credentials/provision returned ${resp.status}: ${text}`,
+      `Gateway /credentials/provision returned ${resp.status}: ${detail}`,
     );
   }
 
