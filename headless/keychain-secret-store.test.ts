@@ -140,4 +140,28 @@ describe("KeychainSecretStore.set", () => {
     await store.set(SECRET_ID_COUCH_PASSWORD, "x");
     expect(execFile).not.toHaveBeenCalled();
   });
+
+  it("does NOT add -A by default (item stays ACL-restricted)", async () => {
+    const execFile: ExecFileLike = vi.fn(async () => ({ stdout: "", stderr: "" }));
+    const store = new KeychainSecretStore(darwinOpts(execFile));
+    await store.set(SECRET_ID_COUCH_PASSWORD, "x");
+    const [, args] = (execFile as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(args).not.toContain("-A");
+  });
+
+  it("adds -A when allowAnyApp is set (so the headless daemon reads without a GUI prompt)", async () => {
+    const execFile: ExecFileLike = vi.fn(async () => ({ stdout: "", stderr: "" }));
+    const store = new KeychainSecretStore({ ...darwinOpts(execFile), allowAnyApp: true });
+    await store.set(SECRET_ID_COUCH_PASSWORD, "x");
+    const [, args] = (execFile as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(args).toContain("-A");
+  });
+
+  it("passes a custom timeoutMs through to the runner (interactive login needs a long one)", async () => {
+    const execFile: ExecFileLike = vi.fn(async () => ({ stdout: "", stderr: "" }));
+    const store = new KeychainSecretStore({ ...darwinOpts(execFile), timeoutMs: 120_000 });
+    await store.set(SECRET_ID_COUCH_PASSWORD, "x");
+    const [, , opts] = (execFile as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(opts.timeout).toBe(120_000);
+  });
 });

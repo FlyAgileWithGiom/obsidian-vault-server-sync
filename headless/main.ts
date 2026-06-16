@@ -23,7 +23,7 @@ import {
   ENV_COUCH_PASSWORD,
   SECRET_ID_GATEWAY_REFRESH_TOKEN,
 } from "../src/secret-store";
-import { KeychainSecretStore } from "./keychain-secret-store";
+import { KeychainSecretStore, KEYCHAIN_SERVICE } from "./keychain-secret-store";
 import { makeTokenManager } from "../src/gateway-fetch";
 import {
   buildGatewayCredsResolver,
@@ -274,7 +274,8 @@ export async function loadConfig(
   vaultRoot: string,
   opts: { store?: SecretStore; env?: Record<string, string | undefined> } = {},
 ): Promise<VaultSyncSettings> {
-  const store = opts.store ?? new KeychainSecretStore();
+  // allowAnyApp so token-rotation writes preserve the no-prompt ACL set at login.
+  const store = opts.store ?? new KeychainSecretStore({ allowAnyApp: true });
   const env = opts.env ?? process.env;
 
   const configPath = path.join(vaultRoot, CONFIG_FILENAME);
@@ -700,7 +701,9 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   // engine routes through the proxy with a Bearer fetch, and the phantom check
   // must use the same Bearer JWT against {gatewayUrl}/couchdb/{couchDbName}.
   // Otherwise both fall back to the legacy direct-CouchDB Basic-auth URL.
-  const store = new KeychainSecretStore();
+  // allowAnyApp so the daemon's silent reads + token-rotation writes never block
+  // on a GUI keychain prompt (the daemon is headless under launchd).
+  const store = new KeychainSecretStore({ allowAnyApp: true });
   const gatewayCredsResolver = settings.gatewayUrl
     ? buildGatewayCredsResolver({ gatewayUrl: settings.gatewayUrl, store })
     : undefined;
@@ -903,7 +906,11 @@ async function runLoginOneShot(
     process.exit(1);
   }
 
-  const store = new KeychainSecretStore();
+  // Interactive login store: a long timeout so the one-time macOS "Always Allow"
+  // authorization prompt can be answered before `security` is killed (the daemon's
+  // default 5s timeout is far too short for a human), and allowAnyApp so the
+  // headless daemon can later read the stored token without its own GUI prompt.
+  const store = new KeychainSecretStore({ timeoutMs: 120_000, allowAnyApp: true });
   const redirectUri = await reserveLoopbackRedirect();
 
   if (opts.pasteCode) {
@@ -930,6 +937,21 @@ async function runLoginOneShot(
       },
       waitForCode: waitForLoopbackCode,
     });
+  }
+
+  // Verify the token actually persisted. The Keychain write silently degrades to a
+  // no-op on failure (locked keychain, dismissed/timed-out authorization prompt), so
+  // without this check we would falsely report success while the daemon stays on the
+  // legacy path. Fail loudly with an actionable message instead.
+  const persisted = await store.get(SECRET_ID_GATEWAY_REFRESH_TOKEN);
+  if (!persisted) {
+    console.error(
+      `\n[vault-sync] ERROR: login completed but the refresh token did NOT persist to the Keychain.\n` +
+      `  This almost always means the macOS keychain authorization prompt was dismissed\n` +
+      `  or timed out. Re-run --login and click "Always Allow" when macOS asks for access\n` +
+      `  to "${KEYCHAIN_SERVICE}". (Requires a GUI session — a pure SSH session cannot answer it.)`,
+    );
+    process.exit(1);
   }
 
   console.log(`[vault-sync] Login complete — gateway credentials stored in the Keychain.`);

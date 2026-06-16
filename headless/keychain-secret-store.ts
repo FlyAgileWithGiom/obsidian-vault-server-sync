@@ -41,10 +41,32 @@ const defaultExecFile = promisify(nodeExecFile) as unknown as ExecFileLike;
 export class KeychainSecretStore implements SecretStore {
   private readonly platform: NodeJS.Platform;
   private readonly execFile: ExecFileLike;
+  private readonly timeoutMs: number;
+  private readonly allowAnyApp: boolean;
 
-  constructor(opts: { platform?: NodeJS.Platform; execFile?: ExecFileLike } = {}) {
+  constructor(
+    opts: {
+      platform?: NodeJS.Platform;
+      execFile?: ExecFileLike;
+      /**
+       * Per-call timeout. The default (5s) protects the HEADLESS daemon from
+       * hanging on a GUI prompt. The interactive `--login` MUST pass a long value
+       * so the one-time "Always Allow" authorization prompt can actually be
+       * answered before the `security` process is killed.
+       */
+      timeoutMs?: number;
+      /**
+       * Add `-A` on write so any local app (i.e. the headless daemon's own
+       * `security` invocations) can read the item WITHOUT a GUI prompt. Required
+       * for a daemon that must read the token unattended after the one-time login.
+       */
+      allowAnyApp?: boolean;
+    } = {},
+  ) {
     this.platform = opts.platform ?? process.platform;
     this.execFile = opts.execFile ?? defaultExecFile;
+    this.timeoutMs = opts.timeoutMs ?? SECURITY_TIMEOUT_MS;
+    this.allowAnyApp = opts.allowAnyApp ?? false;
   }
 
   /** The `security` CLI is macOS-only; off darwin the store is inert. */
@@ -58,7 +80,7 @@ export class KeychainSecretStore implements SecretStore {
       const { stdout } = await this.execFile(
         "security",
         ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", id, "-w"],
-        { timeout: SECURITY_TIMEOUT_MS, killSignal: "SIGTERM" },
+        { timeout: this.timeoutMs, killSignal: "SIGTERM" },
       );
       // `-w` prints the bare password with a trailing newline.
       const value = stdout.replace(/\n$/, "");
@@ -72,12 +94,16 @@ export class KeychainSecretStore implements SecretStore {
   async set(id: string, value: string): Promise<void> {
     if (!this.isAvailable()) return;
     try {
-      await this.execFile(
-        "security",
-        // -U updates the item if it already exists (instead of erroring on dup).
-        ["add-generic-password", "-U", "-s", KEYCHAIN_SERVICE, "-a", id, "-w", value],
-        { timeout: SECURITY_TIMEOUT_MS, killSignal: "SIGTERM" },
-      );
+      // -U updates the item if it already exists (instead of erroring on dup).
+      // -A (when allowAnyApp) grants read access to any app so the headless daemon
+      // never has to answer a GUI authorization prompt on its silent reads.
+      const args = ["add-generic-password", "-U"];
+      if (this.allowAnyApp) args.push("-A");
+      args.push("-s", KEYCHAIN_SERVICE, "-a", id, "-w", value);
+      await this.execFile("security", args, {
+        timeout: this.timeoutMs,
+        killSignal: "SIGTERM",
+      });
     } catch {
       // Best-effort: a failed write leaves the legacy in-vault value in place.
     }
