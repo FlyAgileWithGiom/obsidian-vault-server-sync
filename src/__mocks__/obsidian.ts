@@ -214,6 +214,10 @@ export class Plugin {
   addCommand(): void {}
   addSettingTab(): void {}
   registerEvent(): void {}
+  registerObsidianProtocolHandler(
+    _action: string,
+    _handler: (params: Record<string, string>) => unknown,
+  ): void {}
 }
 
 export class PluginSettingTab {
