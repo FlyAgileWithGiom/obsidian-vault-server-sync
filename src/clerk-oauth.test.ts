@@ -4,6 +4,7 @@ import {
   buildAuthorizeUrl,
   exchangeCode,
   registerClient,
+  validateCallbackParams,
 } from "./clerk-oauth";
 import {
   SECRET_ID_GATEWAY_REFRESH_TOKEN,
@@ -233,5 +234,42 @@ describe("registerClient", () => {
         fetch: fetchMock as unknown as typeof fetch,
       }),
     ).rejects.toThrow(/400/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateCallbackParams — shared OAuth callback validation (state/error/code)
+// ---------------------------------------------------------------------------
+
+describe("validateCallbackParams", () => {
+  it("returns the code when state matches and a code is present", () => {
+    const params = new URLSearchParams({ code: "auth-code-1", state: "expected" });
+    expect(validateCallbackParams(params, "expected")).toEqual({ code: "auth-code-1" });
+  });
+
+  it("throws on a state mismatch (CSRF/replay guard)", () => {
+    const params = new URLSearchParams({ code: "auth-code-1", state: "tampered" });
+    expect(() => validateCallbackParams(params, "expected")).toThrow(/state mismatch/i);
+  });
+
+  it("throws when state is absent (cannot prove origin)", () => {
+    const params = new URLSearchParams({ code: "auth-code-1" });
+    expect(() => validateCallbackParams(params, "expected")).toThrow(/state mismatch/i);
+  });
+
+  it("surfaces an explicit OAuth error param rather than a missing-code error", () => {
+    const params = new URLSearchParams({ error: "access_denied", state: "expected" });
+    expect(() => validateCallbackParams(params, "expected")).toThrow(/access_denied/);
+  });
+
+  it("throws when the code is missing on an otherwise-valid callback", () => {
+    const params = new URLSearchParams({ state: "expected" });
+    expect(() => validateCallbackParams(params, "expected")).toThrow(/authorization code/i);
+  });
+
+  it("validates state BEFORE surfacing an error param (untrusted callbacks never read further)", () => {
+    // A mismatched state must abort before the error param is even consulted.
+    const params = new URLSearchParams({ error: "access_denied", state: "tampered" });
+    expect(() => validateCallbackParams(params, "expected")).toThrow(/state mismatch/i);
   });
 });

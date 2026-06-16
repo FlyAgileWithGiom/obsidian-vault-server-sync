@@ -202,6 +202,54 @@ export async function registerClient(opts: RegisterClientOpts): Promise<Register
   return { clientId: data.client_id };
 }
 
+/** Result of a validated OAuth authorization-code callback. */
+export interface CallbackParams {
+  code: string;
+}
+
+/**
+ * Validate the query parameters of an OAuth authorization-code callback and
+ * extract the authorization code.
+ *
+ * This is the security-critical core shared by BOTH clients: the daemon's
+ * loopback HTTP callback and the plugin's obsidian:// protocol-handler callback.
+ * Both parse a `URLSearchParams` (the daemon from the loopback request URL, the
+ * plugin from the Obsidian-supplied protocol params) and submit it here so the
+ * state/error/code invariants are enforced identically — neither client can drift.
+ *
+ * Invariants (all throw on violation; never silently proceed):
+ *   - The `state` MUST be present and equal `expectedState`. This is checked
+ *     FIRST, before any other param is trusted: a tampered/absent state means the
+ *     callback did not originate from this login attempt (CSRF/replay guard).
+ *   - An explicit OAuth `error` (e.g. access_denied) surfaces as a thrown error so
+ *     the failure is visible — never mistaken for a missing code.
+ *   - A `code` MUST be present on success.
+ */
+export function validateCallbackParams(
+  params: URLSearchParams,
+  expectedState: string,
+): CallbackParams {
+  // Validate state BEFORE trusting any other param.
+  const state = params.get("state");
+  if (!state || state !== expectedState) {
+    throw new Error("OAuth callback state mismatch — possible CSRF/replay; login aborted.");
+  }
+
+  // Surface an explicit OAuth error (user denied, invalid request, etc.) rather
+  // than reporting a confusing "missing code".
+  const error = params.get("error");
+  if (error) {
+    throw new Error(`OAuth authorization failed: ${error}`);
+  }
+
+  const code = params.get("code");
+  if (!code) {
+    throw new Error("OAuth callback missing authorization code.");
+  }
+
+  return { code };
+}
+
 /** Remove a single trailing slash so URL concatenation never doubles it. */
 function stripTrailingSlash(url: string): string {
   return url.replace(/\/$/, "");

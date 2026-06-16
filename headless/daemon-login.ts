@@ -3,6 +3,7 @@ import {
   buildAuthorizeUrl,
   exchangeCode,
   registerClient,
+  validateCallbackParams,
 } from "../src/clerk-oauth";
 import type { SecretStore } from "../src/secret-store";
 import { SECRET_ID_GATEWAY_CLIENT_ID } from "../src/secret-store";
@@ -76,28 +77,10 @@ export function parseLoopbackCallback(
   // standard URL parser can read the query string. The base host is irrelevant —
   // only the query is consumed.
   const url = new URL(requestUrl, "http://127.0.0.1");
-  const params = url.searchParams;
-
-  // Validate state BEFORE trusting any other param: a tampered/absent state means
-  // the callback did not originate from this login attempt.
-  const state = params.get("state");
-  if (!state || state !== expectedState) {
-    throw new Error("OAuth callback state mismatch — possible CSRF/replay; login aborted.");
-  }
-
-  // Surface an explicit OAuth error (user denied, invalid request, etc.) rather
-  // than reporting a confusing "missing code".
-  const error = params.get("error");
-  if (error) {
-    throw new Error(`OAuth authorization failed: ${error}`);
-  }
-
-  const code = params.get("code");
-  if (!code) {
-    throw new Error("OAuth callback missing authorization code.");
-  }
-
-  return { code };
+  // The state/error/code validation is shared with the plugin's obsidian://
+  // callback via validateCallbackParams — single source of truth so neither
+  // client drifts on the CSRF/error/code invariants.
+  return validateCallbackParams(url.searchParams, expectedState);
 }
 
 /** Dependencies for runLogin — side-effects injected for testability. */
