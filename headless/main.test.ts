@@ -2,6 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import * as http from "node:http";
 import {
   resolveStatePath,
   resolvePouchDir,
@@ -9,6 +10,7 @@ import {
   runReconcileOnStartup,
   loadConfig,
   scrubInVaultConfig,
+  makeHttpRemoteDb,
 } from "./main";
 import {
   SECRET_ID_COUCH_USER,
@@ -785,5 +787,62 @@ describe("scrubInVaultConfig — Phase B for the daemon (#78)", () => {
 
     const result = await scrubInVaultConfig(configPath, store);
     expect(result.scrubbed).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// makeHttpRemoteDb — phantom-check auth: Basic (legacy) vs Bearer (gateway)
+// ---------------------------------------------------------------------------
+
+describe("makeHttpRemoteDb — auth header on _all_docs phantom check", () => {
+  /** Spin a one-shot local HTTP server that records the Authorization header. */
+  function captureAuthServer(): Promise<{
+    url: string;
+    received: Promise<string | undefined>;
+    close: () => void;
+  }> {
+    return new Promise((resolve) => {
+      let resolveAuth: (v: string | undefined) => void;
+      const received = new Promise<string | undefined>((r) => (resolveAuth = r));
+      const server = http.createServer((req, res) => {
+        resolveAuth(req.headers["authorization"]);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ rows: [] }));
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address() as { port: number };
+        resolve({
+          url: `http://127.0.0.1:${addr.port}/vault-x`,
+          received,
+          close: () => server.close(),
+        });
+      });
+    });
+  }
+
+  it("sends Basic auth when the URL embeds credentials (legacy mode)", async () => {
+    const srv = await captureAuthServer();
+    try {
+      const withCreds = srv.url.replace("http://", "http://alice:secret@");
+      const remote = makeHttpRemoteDb(withCreds);
+      await remote.allDocs({ keys: ["a"], include_docs: false });
+      const auth = await srv.received;
+      const expected = `Basic ${Buffer.from("alice:secret").toString("base64")}`;
+      expect(auth).toBe(expected);
+    } finally {
+      srv.close();
+    }
+  });
+
+  it("sends Bearer auth when an authHeader is supplied (gateway mode)", async () => {
+    const srv = await captureAuthServer();
+    try {
+      const remote = makeHttpRemoteDb(srv.url, { authHeader: "Bearer access_jwt" });
+      await remote.allDocs({ keys: ["a"], include_docs: false });
+      const auth = await srv.received;
+      expect(auth).toBe("Bearer access_jwt");
+    } finally {
+      srv.close();
+    }
   });
 });

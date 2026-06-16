@@ -34,11 +34,21 @@ import { KeychainSecretStore } from "./keychain-secret-store";
  * The rawUrl must include credentials if authentication is required, e.g.:
  *   http://user:pass@localhost:5986/vault-name
  *   https://user:pass@couchdb.fly.dev/vault-name
+ *
+ * Gateway (Clerk OAuth) mode: the CouchDB proxy authenticates with a Bearer JWT,
+ * not embedded Basic credentials. Pass opts.authHeader (e.g. "Bearer <jwt>") to
+ * send that header instead; it takes precedence over any URL-embedded Basic auth.
  */
-export function makeHttpRemoteDb(rawUrl: string): RemoteDbForPhantomCheck {
+export function makeHttpRemoteDb(
+  rawUrl: string,
+  opts: { authHeader?: string } = {},
+): RemoteDbForPhantomCheck {
   const parsed = new URL(rawUrl);
   const isHttps = parsed.protocol === "https:";
-  const auth = parsed.username
+  // An explicit authHeader (gateway Bearer) overrides URL-embedded Basic auth.
+  const auth = opts.authHeader
+    ? opts.authHeader
+    : parsed.username
     ? `Basic ${Buffer.from(`${decodeURIComponent(parsed.username)}:${decodeURIComponent(parsed.password)}`).toString("base64")}`
     : undefined;
 
