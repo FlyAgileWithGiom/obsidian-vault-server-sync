@@ -1,7 +1,7 @@
 {
   "id": "fly-vault-sync",
   "name": "Vault Sync (Fly Agile)",
-  "version": "2.4.2",
+  "version": "2.5.0",
   "minAppVersion": "1.11.4",
   "description": "Sync your vault to CouchDB for access by vault-server (Claude MCP)",
   "author": "Guillaume Duquesnay",
