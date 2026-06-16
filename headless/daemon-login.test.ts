@@ -110,7 +110,9 @@ describe("runLogin", () => {
   it("opens the authorize URL, captures the code, exchanges it, and stores the refresh token", async () => {
     const store = fakeStore();
     const openedUrls: string[] = [];
-    const fetchMock = vi.fn(async () => tokenResponse());
+    const fetchMock = vi.fn(
+      async (_url: string | URL | Request, _init?: RequestInit) => tokenResponse(),
+    );
 
     // The waitForCode side-effect captures whatever authorize URL was opened and
     // returns a code; runLogin must have already validated state inside the loopback
@@ -137,11 +139,11 @@ describe("runLogin", () => {
 
     // Token exchange happened against /token with the authorization_code grant.
     expect(fetchMock).toHaveBeenCalledOnce();
-    const [tokenUrl, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [tokenUrl, init] = fetchMock.mock.calls[0];
     expect(tokenUrl).toBe("https://mcp.fly-agile.com/token");
-    expect(String(init.body)).toContain("grant_type=authorization_code");
-    expect(String(init.body)).toContain("code=captured_code");
-    expect(String(init.body)).toContain("code_verifier=");
+    expect(String(init?.body)).toContain("grant_type=authorization_code");
+    expect(String(init?.body)).toContain("code=captured_code");
+    expect(String(init?.body)).toContain("code_verifier=");
 
     // Refresh token + client_id persisted; access token NOT persisted.
     expect(await store.get(SECRET_ID_GATEWAY_REFRESH_TOKEN)).toBe("refresh_rotated");
@@ -151,8 +153,8 @@ describe("runLogin", () => {
 
   it("registers a client via DCR when no clientId is supplied", async () => {
     const store = fakeStore();
-    const fetchMock = vi.fn(async (url: string) => {
-      if (url.endsWith("/register")) {
+    const fetchMock = vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
+      if (String(url).endsWith("/register")) {
         return {
           ok: true,
           status: 201,
@@ -184,7 +186,9 @@ describe("runLogin", () => {
     const store = fakeStore();
     const openedUrls: string[] = [];
     let redirectSeenByWait = "";
-    const fetchMock = vi.fn(async () => tokenResponse());
+    const fetchMock = vi.fn(
+      async (_url: string | URL | Request, _init?: RequestInit) => tokenResponse(),
+    );
 
     await runLogin({
       gatewayUrl: "https://mcp.fly-agile.com",
@@ -205,8 +209,8 @@ describe("runLogin", () => {
     const authUrl = new URL(openedUrls[0]);
     const redirectInAuth = authUrl.searchParams.get("redirect_uri");
     expect(redirectInAuth).toBe(redirectSeenByWait);
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(decodeURIComponent(String(init.body))).toContain(`redirect_uri=${redirectSeenByWait}`);
+    const [, init] = fetchMock.mock.calls[0];
+    expect(decodeURIComponent(String(init?.body))).toContain(`redirect_uri=${redirectSeenByWait}`);
   });
 
   it("exposes offline_access in the canonical scope constant", () => {

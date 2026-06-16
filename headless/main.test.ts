@@ -11,6 +11,7 @@ import {
   loadConfig,
   scrubInVaultConfig,
   makeHttpRemoteDb,
+  buildPhantomCheckRemote,
 } from "./main";
 import {
   SECRET_ID_COUCH_USER,
@@ -845,4 +846,140 @@ describe("makeHttpRemoteDb — auth header on _all_docs phantom check", () => {
       srv.close();
     }
   });
+});
+
+// ---------------------------------------------------------------------------
+// buildPhantomCheckRemote — gateway Bearer vs legacy Basic selection
+// ---------------------------------------------------------------------------
+
+describe("buildPhantomCheckRemote — auth mode selection", () => {
+  function fakeStore(initial: Record<string, string> = {}): SecretStore {
+    const m = new Map(Object.entries(initial));
+    return {
+      async get(id) {
+        return m.has(id) ? (m.get(id) as string) : null;
+      },
+      async set(id, value) {
+        m.set(id, value);
+      },
+      isAvailable() {
+        return true;
+      },
+    };
+  }
+
+  const SECRET_ID_GATEWAY_CLIENT_ID = "vault-sync-gateway-client-id";
+  const SECRET_ID_GATEWAY_REFRESH_TOKEN = "vault-sync-gateway-refresh-token";
+
+  it("uses Bearer against the proxy when in gateway mode (client_id + refresh token)", async () => {
+    const srv = await captureAuthServerGeneric();
+    try {
+      const store = fakeStore({
+        [SECRET_ID_GATEWAY_CLIENT_ID]: "client_x",
+        [SECRET_ID_GATEWAY_REFRESH_TOKEN]: "rt_seed",
+      });
+      // The token manager derives the access JWT via a /token call against the
+      // gateway. The loopback server above only answers the _all_docs path, so
+      // stub the global fetch for the /token round-trip and delegate everything
+      // else (the actual _all_docs POST) to the real node:http path inside
+      // makeHttpRemoteDb (which does not use global fetch).
+      const realFetch = globalThis.fetch;
+      const fetchSpy = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        if (String(url).endsWith("/token")) {
+          return {
+            ok: true,
+            status: 200,
+            async json() {
+              return {
+                access_token: "access_jwt",
+                refresh_token: "rt_rotated",
+                token_type: "Bearer",
+                expires_in: 86400,
+              };
+            },
+            async text() {
+              return "";
+            },
+          } as unknown as Response;
+        }
+        return realFetch(url as RequestInfo, init);
+      });
+      vi.stubGlobal("fetch", fetchSpy);
+
+      try {
+        const remote = await buildPhantomCheckRemote(
+          {
+            couchDbUrl: "http://unused",
+            couchDbName: "vault-x",
+            couchDbUser: "",
+            couchDbPassword: "",
+            gatewayUrl: srv.baseUrl,
+            excludePatterns: [],
+          },
+          store,
+          { env: {} },
+        );
+        await remote.allDocs({ keys: ["a"], include_docs: false });
+        const { auth, pathName } = await srv.received;
+        expect(auth).toBe("Bearer access_jwt");
+        // Proxy path: {gatewayUrl}/couchdb/{couchDbName}/_all_docs
+        expect(pathName).toBe("/couchdb/vault-x/_all_docs");
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    } finally {
+      srv.close();
+    }
+  });
+
+  it("uses Basic against direct CouchDB when not in gateway mode", async () => {
+    const srv = await captureAuthServerGeneric();
+    try {
+      const remote = await buildPhantomCheckRemote(
+        {
+          couchDbUrl: srv.baseUrl,
+          couchDbName: "vault-x",
+          couchDbUser: "alice",
+          couchDbPassword: "secret",
+          excludePatterns: [],
+        },
+        fakeStore(),
+        { env: {} },
+      );
+      await remote.allDocs({ keys: ["a"], include_docs: false });
+      const { auth, pathName } = await srv.received;
+      expect(auth).toBe(`Basic ${Buffer.from("alice:secret").toString("base64")}`);
+      expect(pathName).toBe("/vault-x/_all_docs");
+    } finally {
+      srv.close();
+    }
+  });
+
+  /** Like captureAuthServer but also records the request path. */
+  function captureAuthServerGeneric(): Promise<{
+    baseUrl: string;
+    received: Promise<{ auth: string | undefined; pathName: string }>;
+    close: () => void;
+  }> {
+    return new Promise((resolve) => {
+      let resolveReq: (v: { auth: string | undefined; pathName: string }) => void;
+      const received = new Promise<{ auth: string | undefined; pathName: string }>(
+        (r) => (resolveReq = r),
+      );
+      const server = http.createServer((req, res) => {
+        const u = new URL(req.url ?? "/", "http://127.0.0.1");
+        resolveReq({ auth: req.headers["authorization"], pathName: u.pathname });
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ rows: [] }));
+      });
+      server.listen(0, "127.0.0.1", () => {
+        const addr = server.address() as { port: number };
+        resolve({
+          baseUrl: `http://127.0.0.1:${addr.port}`,
+          received,
+          close: () => server.close(),
+        });
+      });
+    });
+  }
 });

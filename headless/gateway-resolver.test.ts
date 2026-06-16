@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { buildGatewayCredsResolver } from "./gateway-resolver";
+import { buildGatewayCredsResolver, resolveGatewayClientId } from "./gateway-resolver";
 import {
   SECRET_ID_GATEWAY_CLIENT_ID,
   SECRET_ID_GATEWAY_REFRESH_TOKEN,
@@ -142,5 +142,28 @@ describe("buildGatewayCredsResolver", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe("resolveGatewayClientId", () => {
+  it("returns the env client_id when set", async () => {
+    const id = await resolveGatewayClientId({
+      store: fakeStore({ [SECRET_ID_GATEWAY_CLIENT_ID]: "store_client" }),
+      env: { [ENV_GATEWAY_CLIENT_ID]: "env_client" },
+    });
+    expect(id).toBe("env_client");
+  });
+
+  it("falls back to the stored client_id", async () => {
+    const id = await resolveGatewayClientId({
+      store: fakeStore({ [SECRET_ID_GATEWAY_CLIENT_ID]: "store_client" }),
+      env: {},
+    });
+    expect(id).toBe("store_client");
+  });
+
+  it("returns empty string when no client_id is anywhere", async () => {
+    const id = await resolveGatewayClientId({ store: fakeStore(), env: {} });
+    expect(id).toBe("");
   });
 });

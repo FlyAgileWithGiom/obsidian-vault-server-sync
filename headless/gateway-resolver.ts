@@ -22,6 +22,27 @@ import type { GatewayCredsResolver } from "../src/PouchDbSyncEngine";
  * Building the token manager is cheap and side-effect-free; the actual refresh
  * round-trip happens lazily on the first request through the returned fetch.
  */
+/**
+ * Resolve the public gateway client_id by the locked precedence env > store.
+ *
+ * There is no in-vault legacy for the gateway client_id (it is not a secret and
+ * predates no file), so the `legacy` fallback is "" — an absent client_id yields
+ * "" and the caller treats that as "not in gateway mode". Shared by the resolver
+ * and the phantom-check wiring so the two never diverge on which client_id wins.
+ */
+export async function resolveGatewayClientId(opts: {
+  store: SecretStore;
+  env?: Record<string, string | undefined>;
+}): Promise<string> {
+  return resolveSecret({
+    envName: ENV_GATEWAY_CLIENT_ID,
+    env: opts.env ?? process.env,
+    store: opts.store,
+    id: SECRET_ID_GATEWAY_CLIENT_ID,
+    legacy: "",
+  });
+}
+
 export function buildGatewayCredsResolver(opts: {
   gatewayUrl: string;
   store: SecretStore;
@@ -32,13 +53,7 @@ export function buildGatewayCredsResolver(opts: {
 
   return async (): Promise<typeof fetch | null> => {
     // client_id: env override wins (operator/CI), else the persisted value.
-    const clientId = await resolveSecret({
-      envName: ENV_GATEWAY_CLIENT_ID,
-      env,
-      store,
-      id: SECRET_ID_GATEWAY_CLIENT_ID,
-      legacy: "",
-    });
+    const clientId = await resolveGatewayClientId({ store, env });
     if (!clientId) return null;
 
     // No refresh token means the daemon has not logged in — stay on the legacy

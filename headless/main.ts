@@ -12,6 +12,8 @@ import { reconcile } from "./reconcile";
 import { pathToDocId } from "../src/doc-id";
 import { isBinaryPath } from "../src/binary-ext";
 import { isPathExcluded } from "./exclude";
+import * as readline from "node:readline";
+import { spawn } from "node:child_process";
 import type { SecretStore } from "../src/secret-store";
 import {
   resolveSecret,
@@ -19,8 +21,15 @@ import {
   SECRET_ID_COUCH_PASSWORD,
   ENV_COUCH_USER,
   ENV_COUCH_PASSWORD,
+  SECRET_ID_GATEWAY_REFRESH_TOKEN,
 } from "../src/secret-store";
 import { KeychainSecretStore } from "./keychain-secret-store";
+import { makeTokenManager } from "../src/gateway-fetch";
+import {
+  buildGatewayCredsResolver,
+  resolveGatewayClientId,
+} from "./gateway-resolver";
+import { runLogin, parseLoopbackCallback } from "./daemon-login";
 
 /**
  * Build a RemoteDbForPhantomCheck that uses node:http or node:https directly.
@@ -108,6 +117,55 @@ export function makeHttpRemoteDb(
       });
     },
   };
+}
+
+/**
+ * Build the startup phantom-check remote, choosing auth mode the same way the
+ * engine does so the two never disagree about how to reach CouchDB:
+ *
+ *   - Gateway (Clerk OAuth) mode — gatewayUrl is set AND the daemon has logged in
+ *     (client_id + refresh token present): derive a fresh access JWT via the token
+ *     manager and target {gatewayUrl}/couchdb/{couchDbName} with a Bearer header.
+ *   - Legacy mode — anything else: target the direct-CouchDB URL with embedded
+ *     Basic credentials, exactly as before.
+ *
+ * The access token is acquired once at startup (the phantom check is a one-shot),
+ * so a static Bearer header is correct here; live replication uses the rotating
+ * gatewayCredsResolver instead.
+ *
+ * `env` is injected for tests; production resolves from process.env.
+ */
+export async function buildPhantomCheckRemote(
+  settings: VaultSyncSettings,
+  store: SecretStore,
+  opts: { env?: Record<string, string | undefined> } = {},
+): Promise<RemoteDbForPhantomCheck> {
+  const env = opts.env ?? process.env;
+  const { couchDbUrl, couchDbName, couchDbUser, couchDbPassword, gatewayUrl } = settings;
+
+  // Gateway mode requires a gatewayUrl, a resolvable client_id, and a refresh token.
+  if (gatewayUrl) {
+    const clientId = await resolveGatewayClientId({ store, env });
+    const refreshToken = await store.get(SECRET_ID_GATEWAY_REFRESH_TOKEN);
+    if (clientId && refreshToken) {
+      const tokenManager = makeTokenManager({ gatewayUrl, clientId, store });
+      const accessToken = await tokenManager.getValidToken();
+      const proxyUrl = `${gatewayUrl.replace(/\/$/, "")}/couchdb/${couchDbName}`;
+      console.log(`[vault-sync] Phantom check remote (gateway): ${proxyUrl}`);
+      return makeHttpRemoteDb(proxyUrl, { authHeader: `Bearer ${accessToken}` });
+    }
+  }
+
+  // Legacy direct-CouchDB URL with embedded Basic-auth credentials.
+  const base = couchDbUrl.replace(/\/$/, "");
+  const proto = base.startsWith("https://") ? "https://" : "http://";
+  const host = base.slice(proto.length);
+  const authPart = (couchDbUser && couchDbPassword)
+    ? `${encodeURIComponent(couchDbUser)}:${encodeURIComponent(couchDbPassword)}@`
+    : "";
+  const remoteDbUrl = `${proto}${authPart}${host}/${couchDbName}`;
+  console.log(`[vault-sync] Phantom check remote: ${proto}${host}/${couchDbName}`);
+  return makeHttpRemoteDb(remoteDbUrl);
 }
 
 
@@ -635,23 +693,36 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   const excludePatterns = [STATE_FILENAME, CONFIG_FILENAME, ".git", ...settings.excludePatterns];
   const fsWatcher = new FsWatcher(absVaultRoot, excludePatterns);
 
-  // Build the remoteDb adapter for the phantom check (C04-bis).
-  // Uses node:http(s) directly instead of pouchdb-node's HTTP adapter, which
-  // hangs on _all_docs POST requests under Fly.io CouchDB (keep-alive issue).
-  // This covers localhost:5986 (smoke/http) and production Fly.io (https).
-  const { couchDbUrl, couchDbName, couchDbUser, couchDbPassword } = settings;
-  const base = couchDbUrl.replace(/\/$/, "");
-  const proto = base.startsWith("https://") ? "https://" : "http://";
-  const host = base.slice(proto.length);
-  const authPart = (couchDbUser && couchDbPassword)
-    ? `${encodeURIComponent(couchDbUser)}:${encodeURIComponent(couchDbPassword)}@`
-    : "";
-  const remoteDbUrl = `${proto}${authPart}${host}/${couchDbName}`;
-  const remoteDb = makeHttpRemoteDb(remoteDbUrl);
-  console.log(`[vault-sync] Phantom check remote: ${proto}${host}/${couchDbName}`);
+  // Decide auth mode for replication and the phantom check.
+  //
+  // Gateway (Clerk OAuth) mode is active when a gatewayUrl is configured AND the
+  // daemon has logged in (client_id + refresh token present). In that mode the
+  // engine routes through the proxy with a Bearer fetch, and the phantom check
+  // must use the same Bearer JWT against {gatewayUrl}/couchdb/{couchDbName}.
+  // Otherwise both fall back to the legacy direct-CouchDB Basic-auth URL.
+  const store = new KeychainSecretStore();
+  const gatewayCredsResolver = settings.gatewayUrl
+    ? buildGatewayCredsResolver({ gatewayUrl: settings.gatewayUrl, store })
+    : undefined;
+
+  const remoteDb = await buildPhantomCheckRemote(settings, store);
+
+  // pouchdb-node remoteFactory: builds a remote PouchDB handle from a URL + fetch.
+  // The injected fetch (gateway Bearer) is what carries auth in gateway mode.
+  const remoteFactory = (url: string, opts: { fetch?: typeof fetch }) =>
+    new PouchDB(url, opts) as unknown as import("../src/pouchdb-browser").default;
 
   // Build engine with injected db and bridge.
-  const engine = new PouchDbSyncEngine(settings, db, bridge, dbFactory);
+  // The remoteFactory + gatewayCredsResolver enable gateway mode; both are no-ops
+  // (legacy URL) when gatewayCredsResolver is undefined or resolves to null.
+  const engine = new PouchDbSyncEngine(
+    settings,
+    db,
+    bridge,
+    dbFactory,
+    remoteFactory,
+    gatewayCredsResolver,
+  );
 
   engine.onStateChange = (state) => console.log(`[vault-sync] State: ${state}`);
   engine.onError = (msg) => console.error(`[vault-sync] Error: ${msg}`);
@@ -703,14 +774,184 @@ async function runDaemon(absVaultRoot: string, settings: VaultSyncSettings): Pro
   console.log("[vault-sync] Daemon (PouchDB) running. Press Ctrl+C to stop.");
 }
 
+// Loopback redirect: bind 127.0.0.1 on an OS-assigned free port and serve a single
+// /callback. RFC 8252 §7.3 mandates the loopback IP literal (not "localhost").
+const LOOPBACK_HOST = "127.0.0.1";
+// How long the daemon waits for the user to complete the browser login before the
+// loopback server gives up. Generous: the user may need to sign in to Clerk first.
+const LOOPBACK_TIMEOUT_MS = 5 * 60 * 1000;
+
+/**
+ * Open a URL in the system default browser (macOS `open`, Linux `xdg-open`,
+ * Windows `start`). Thin, fire-and-forget side-effect — failures are non-fatal
+ * (the user can copy the URL from the printed line or use --paste-code).
+ */
+async function openSystemBrowser(url: string): Promise<void> {
+  const opener =
+    process.platform === "darwin"
+      ? "open"
+      : process.platform === "win32"
+      ? "start"
+      : "xdg-open";
+  try {
+    const child = spawn(opener, [url], { detached: true, stdio: "ignore", shell: process.platform === "win32" });
+    child.unref();
+  } catch {
+    // Non-fatal: the authorize URL is also printed so the user can open it manually.
+  }
+}
+
+/**
+ * Run a one-shot loopback HTTP server on `redirectUri`'s port, resolve with the
+ * captured authorization code once the OAuth provider redirects back. Validates
+ * the OAuth `state` (via parseLoopbackCallback) before resolving; an invalid
+ * state, an OAuth error param, or a timeout rejects.
+ *
+ * The server is bound to the exact port encoded in `redirectUri` so it matches the
+ * redirect the gateway/Clerk will hit. The caller (runLogin) supplies that URI.
+ */
+function waitForLoopbackCode(redirectUri: string, expectedState: string): Promise<string> {
+  const port = Number(new URL(redirectUri).port);
+  return new Promise((resolve, reject) => {
+    const server = http.createServer((req, res) => {
+      try {
+        const { code } = parseLoopbackCallback(req.url ?? "/", expectedState);
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("Login complete. You can close this tab and return to the terminal.");
+        cleanup();
+        resolve(code);
+      } catch (e) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Login failed. Check the terminal for details.");
+        cleanup();
+        reject(e);
+      }
+    });
+
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Loopback login timed out after ${LOOPBACK_TIMEOUT_MS / 1000}s.`));
+    }, LOOPBACK_TIMEOUT_MS);
+
+    function cleanup(): void {
+      clearTimeout(timer);
+      server.close();
+    }
+
+    server.on("error", (e) => {
+      cleanup();
+      reject(e);
+    });
+    server.listen(port, LOOPBACK_HOST);
+  });
+}
+
+/**
+ * Manual fallback for headless boxes with no browser: print the authorize URL and
+ * read the pasted authorization code from stdin. The state is still validated —
+ * the user pastes only the `code` value, so we trust the manual channel for state
+ * (the redirect never reaches a server) but keep the parameter for symmetry.
+ */
+function readPastedCode(_redirectUri: string, _expectedState: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise((resolve) => {
+    rl.question(
+      `\n[vault-sync] After authorizing in your browser, paste the "code" value here and press Enter:\n> `,
+      (answer) => {
+        rl.close();
+        resolve(answer.trim());
+      },
+    );
+  });
+}
+
+/**
+ * Resolve a free loopback redirect URI by briefly binding a server on port 0 to
+ * learn the OS-assigned port, then closing it. There is a small TOCTOU window
+ * before waitForLoopbackCode re-binds the same port, but on a single-user box the
+ * race is negligible and the alternative (passing a live server handle through
+ * runLogin) would couple the orchestration to Node's http server.
+ */
+function reserveLoopbackRedirect(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const probe = http.createServer();
+    probe.on("error", reject);
+    probe.listen(0, LOOPBACK_HOST, () => {
+      const addr = probe.address() as { port: number };
+      const port = addr.port;
+      probe.close(() => resolve(`http://${LOOPBACK_HOST}:${port}/callback`));
+    });
+  });
+}
+
+/**
+ * The `--login` one-shot: run the interactive Clerk OAuth login and persist the
+ * refresh token (+ client_id) into the Keychain. Mirrors --scrub-secrets in that
+ * it never starts the daemon. `--login --paste-code` uses the manual stdin flow
+ * for headless boxes; otherwise the system browser + loopback server are used.
+ */
+async function runLoginOneShot(
+  absVaultRoot: string,
+  opts: { pasteCode: boolean },
+): Promise<void> {
+  const settings = await loadConfig(absVaultRoot);
+  if (!settings.gatewayUrl) {
+    console.error(
+      `[vault-sync] --login requires "gatewayUrl" in ${CONFIG_FILENAME} ` +
+      `(the Obsidian connector URL, e.g. https://mcp.fly-agile.com).`,
+    );
+    process.exit(1);
+  }
+
+  const store = new KeychainSecretStore();
+  const redirectUri = await reserveLoopbackRedirect();
+
+  if (opts.pasteCode) {
+    // Manual flow: print the authorize URL, read the pasted code from stdin.
+    console.log(
+      `\n[vault-sync] Manual login (--paste-code). Open this URL in any browser:`,
+    );
+    await runLogin({
+      gatewayUrl: settings.gatewayUrl,
+      store,
+      redirectUri,
+      openBrowser: async (url) => console.log(`\n${url}\n`),
+      waitForCode: readPastedCode,
+    });
+  } else {
+    console.log(`[vault-sync] Opening your browser to sign in...`);
+    await runLogin({
+      gatewayUrl: settings.gatewayUrl,
+      store,
+      redirectUri,
+      openBrowser: async (url) => {
+        console.log(`[vault-sync] If the browser did not open, visit:\n${url}\n`);
+        await openSystemBrowser(url);
+      },
+      waitForCode: waitForLoopbackCode,
+    });
+  }
+
+  console.log(`[vault-sync] Login complete — gateway credentials stored in the Keychain.`);
+}
+
 async function main(): Promise<void> {
   // Parse argv robustly: flags may precede the vault root
   // (e.g. `daemon --scrub-secrets /path`). First non-flag arg is the vault root.
   const args = process.argv.slice(2);
   const scrubSecrets = args.includes("--scrub-secrets");
+  const login = args.includes("--login");
+  const pasteCode = args.includes("--paste-code");
   const positional = args.filter((a) => !a.startsWith("--"));
   const vaultRoot = positional[0] ?? process.cwd();
   const absVaultRoot = path.resolve(vaultRoot);
+
+  // --login one-shot (Clerk OAuth): obtain + store gateway credentials, never
+  // starts the daemon. Mirrors --scrub-secrets.
+  if (login) {
+    await runLoginOneShot(absVaultRoot, { pasteCode });
+    process.exit(0);
+  }
 
   // Phase B (#78): operator-gated scrub. One-shot — never starts the daemon.
   if (scrubSecrets) {
