@@ -274,6 +274,20 @@ describe("VaultSyncPlugin.saveSettings", () => {
     // Pretty-printed JSON contains newlines
     expect(written).toContain("\n");
   });
+
+  it("PERSISTS gatewayUrl so a reload keeps the Clerk path (no silent downgrade to Basic)", async () => {
+    // Regression: if gatewayUrl is dropped on save, a reload reads no gatewayUrl,
+    // the creds resolver returns null, and the plugin silently falls back to the
+    // legacy direct-CouchDB Basic-auth path while the user believes Clerk is active.
+    plugin.settings.gatewayUrl = "https://mcp.fly-agile.com";
+
+    await plugin.saveSettings();
+
+    const parsed = JSON.parse(
+      plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!,
+    );
+    expect(parsed.gatewayUrl).toBe("https://mcp.fly-agile.com");
+  });
 });
 
 // ---- Secret store: loadSettings precedence + Phase-A dual-read (#78) ----

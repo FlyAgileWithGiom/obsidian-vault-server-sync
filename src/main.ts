@@ -579,6 +579,11 @@ export default class VaultSyncPlugin extends Plugin {
     onDisk.couchDbUrl = this.settings.couchDbUrl;
     onDisk.couchDbName = this.settings.couchDbName;
     onDisk.excludePatterns = this.settings.excludePatterns;
+    // gatewayUrl MUST be persisted: it is the sole signal that the Clerk OAuth
+    // path is configured. If it is dropped here, a reload reads no gatewayUrl,
+    // the creds resolver returns null, and the plugin silently downgrades to the
+    // legacy Basic-auth direct-CouchDB path while the user believes Clerk is active.
+    onDisk.gatewayUrl = this.settings.gatewayUrl;
     // couchDbUser / couchDbPassword are intentionally left as found on disk —
     // present → preserved verbatim; absent → stay absent.
 
