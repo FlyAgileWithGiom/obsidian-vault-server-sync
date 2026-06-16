@@ -3,6 +3,17 @@ export interface VaultSyncSettings {
   couchDbName: string;
   couchDbUser: string;
   couchDbPassword: string;
+  /**
+   * Gateway proxy base URL (feat/sync-gateway-oauth).
+   *
+   * When present AND a gateway credential is available (via gatewayCredsResolver),
+   * the engine routes replication through ${gatewayUrl}/couchdb/vault-${slug} with
+   * a Bearer-injecting fetch instead of the legacy direct-CouchDB Basic-auth URL.
+   *
+   * Coexists with couchDbUrl/couchDbUser/couchDbPassword during migration: devices
+   * without gateway credentials fall back to the legacy URL automatically (Phase A).
+   */
+  gatewayUrl?: string;
   excludePatterns: string[];
 }
 

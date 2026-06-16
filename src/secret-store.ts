@@ -38,6 +38,35 @@ export const ENV_COUCH_USER = "VAULT_SYNC_COUCH_USER";
 export const ENV_COUCH_PASSWORD = "VAULT_SYNC_COUCH_PASSWORD";
 
 /**
+ * Gateway Clerk OAuth credential ids (public PKCE client).
+ *
+ * The sync clients authenticate as PUBLIC OAuth clients using authorization-code
+ * + PKCE against Clerk (proxied by the gateway). A public client has NO
+ * client_secret, so only two values are persisted:
+ *
+ *   - client_id: the OAuth client identifier. When the client is registered via
+ *     Dynamic Client Registration it is assigned at registration time and stored
+ *     here; a statically-configured client_id is stored here too. It is not a
+ *     secret, but persisting it avoids re-registering on every start.
+ *   - refresh_token: the long-lived rotating token. Clerk rotates the refresh
+ *     token on every use and never expires it, so the new value MUST be persisted
+ *     immediately after each token exchange to survive a process restart.
+ *
+ * The access token is a short-lived (1-day) Clerk JWT, derived on demand from the
+ * refresh token and held in-memory ONLY — it is never written to the store.
+ *
+ * "No in-vault legacy" for these IDs: the `legacy` parameter for resolveSecret()
+ * is always "" (empty string), which degrades to a plain auth failure rather
+ * than a destructive re-pull — consistent with the fail-safe in the ADR.
+ */
+export const SECRET_ID_GATEWAY_CLIENT_ID = "vault-sync-gateway-client-id";
+export const SECRET_ID_GATEWAY_REFRESH_TOKEN = "vault-sync-gateway-refresh-token";
+
+/** Environment-variable names for gateway Clerk OAuth credentials. */
+export const ENV_GATEWAY_CLIENT_ID = "VAULT_SYNC_GATEWAY_CLIENT_ID";
+export const ENV_GATEWAY_REFRESH_TOKEN = "VAULT_SYNC_GATEWAY_REFRESH_TOKEN";
+
+/**
  * Minimal shape of Obsidian's synchronous SecretStorage API (>= 1.11.4).
  * Declared locally so feature-detection works even when the installed typings
  * predate the API.

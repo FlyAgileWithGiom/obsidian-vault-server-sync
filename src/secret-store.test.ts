@@ -5,6 +5,10 @@ import {
   SECRET_ID_COUCH_PASSWORD,
   ENV_COUCH_USER,
   ENV_COUCH_PASSWORD,
+  SECRET_ID_GATEWAY_CLIENT_ID,
+  SECRET_ID_GATEWAY_REFRESH_TOKEN,
+  ENV_GATEWAY_CLIENT_ID,
+  ENV_GATEWAY_REFRESH_TOKEN,
   SecretStorageSecretStore,
   resolveSecret,
   readEnvSecret,
@@ -183,5 +187,90 @@ describe("resolveSecret precedence (env > store > legacy in-vault)", () => {
       legacy: "from-legacy",
     });
     expect(v).toBe("from-legacy");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gateway Clerk OAuth credential constants (public PKCE client)
+// ---------------------------------------------------------------------------
+// The clients are public PKCE OAuth clients: there is NO client_secret. Only the
+// DCR-registered client_id and the rotating refresh_token are persisted. The
+// access token is short-lived (1-day Clerk JWT) and held in-memory only — never
+// stored.
+
+describe("gateway secret id constants", () => {
+  it("maps gateway client_id to a valid lowercase-dash Obsidian secret id", () => {
+    expect(SECRET_ID_GATEWAY_CLIENT_ID).toBe("vault-sync-gateway-client-id");
+    expect(SECRET_ID_GATEWAY_CLIENT_ID).toMatch(/^[a-z0-9-]+$/);
+  });
+
+  it("does NOT export a client_secret id — public PKCE clients have no secret", async () => {
+    // Guard against regressing to the obsolete client_credentials model. A public
+    // PKCE client stores only client_id + refresh_token, never a client_secret.
+    const mod = (await import("./secret-store")) as Record<string, unknown>;
+    expect(mod.SECRET_ID_GATEWAY_CLIENT_SECRET).toBeUndefined();
+    expect(mod.ENV_GATEWAY_CLIENT_SECRET).toBeUndefined();
+  });
+
+  it("maps gateway refresh_token to a valid lowercase-dash Obsidian secret id", () => {
+    expect(SECRET_ID_GATEWAY_REFRESH_TOKEN).toBe("vault-sync-gateway-refresh-token");
+    expect(SECRET_ID_GATEWAY_REFRESH_TOKEN).toMatch(/^[a-z0-9-]+$/);
+  });
+
+  it("uses VAULT_SYNC_GATEWAY_* env var names following the existing convention", () => {
+    expect(ENV_GATEWAY_CLIENT_ID).toBe("VAULT_SYNC_GATEWAY_CLIENT_ID");
+    expect(ENV_GATEWAY_REFRESH_TOKEN).toBe("VAULT_SYNC_GATEWAY_REFRESH_TOKEN");
+  });
+});
+
+describe("gateway refresh token round-trips through the store", () => {
+  it("stores and retrieves the rotating refresh token via resolveSecret precedence", async () => {
+    const app = new App();
+    const store = new SecretStorageSecretStore(app);
+
+    // Simulate token manager persisting a received refresh token
+    await store.set(SECRET_ID_GATEWAY_REFRESH_TOKEN, "rt-abc123");
+
+    const resolved = await resolveSecret({
+      envName: ENV_GATEWAY_REFRESH_TOKEN,
+      env: {},
+      store,
+      id: SECRET_ID_GATEWAY_REFRESH_TOKEN,
+      // Gateway refresh token has no in-vault legacy value — degrade to empty string
+      // which yields a plain auth failure rather than a destructive operation.
+      legacy: "",
+    });
+    expect(resolved).toBe("rt-abc123");
+  });
+
+  it("env override takes precedence over stored refresh token", async () => {
+    const app = new App();
+    const store = new SecretStorageSecretStore(app);
+    await store.set(SECRET_ID_GATEWAY_REFRESH_TOKEN, "rt-from-store");
+
+    const resolved = await resolveSecret({
+      envName: ENV_GATEWAY_REFRESH_TOKEN,
+      env: { [ENV_GATEWAY_REFRESH_TOKEN]: "rt-from-env" },
+      store,
+      id: SECRET_ID_GATEWAY_REFRESH_TOKEN,
+      legacy: "",
+    });
+    expect(resolved).toBe("rt-from-env");
+  });
+
+  it("returns empty string (fail-safe) when no gateway refresh token is anywhere — no throw", async () => {
+    const app = new App();
+    const store = new SecretStorageSecretStore(app);
+
+    const resolved = await resolveSecret({
+      envName: ENV_GATEWAY_REFRESH_TOKEN,
+      env: {},
+      store,
+      id: SECRET_ID_GATEWAY_REFRESH_TOKEN,
+      legacy: "",
+    });
+    // Empty resolves to an empty string (not a crash); the token manager treats a
+    // missing/empty refresh token as "login required" — there is no other grant.
+    expect(resolved).toBe("");
   });
 });

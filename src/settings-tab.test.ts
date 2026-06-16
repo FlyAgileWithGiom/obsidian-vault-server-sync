@@ -165,6 +165,7 @@ function makePluginMock(diagnosticsOverrides: Partial<SyncDiagnostics> = {}): Va
       couchDbName: "vault-test",
       couchDbUser: "user",
       couchDbPassword: "pass",
+      gatewayUrl: "",
       excludePatterns: [],
     },
     getDiagnostics: vi.fn(() => diagnostics),
@@ -173,6 +174,8 @@ function makePluginMock(diagnosticsOverrides: Partial<SyncDiagnostics> = {}): Va
     unsubscribeDiagnostics: vi.fn((listener: () => void) => listeners.delete(listener)),
     saveSettings: vi.fn().mockResolvedValue(undefined),
     saveSecrets: vi.fn().mockResolvedValue(undefined),
+    startClerkLogin: vi.fn().mockResolvedValue(undefined),
+    isLoggedIntoGateway: vi.fn().mockResolvedValue(false),
     refreshIfVaultChanged: vi.fn().mockResolvedValue(false),
     testConnection: vi.fn().mockResolvedValue(true),
     forceFullSync: vi.fn().mockResolvedValue(undefined),
@@ -478,10 +481,15 @@ describe("VaultSyncSettingTab — manifest version in Diagnostics panel", () => 
 });
 
 // ---------------------------------------------------------------------------
-// Credential onChange routes to the secret store, not the in-vault file (#78)
+// Non-secret config onChange still routes to saveSettings (Server URL)
 // ---------------------------------------------------------------------------
+//
+// The legacy Username/Password fields were removed in #92 (Clerk login replaces
+// Basic auth), so their onChange-routing tests are gone. Server URL still drives
+// the legacy direct-CouchDB URL used as the Phase-A fallback, so it must continue
+// to persist via saveSettings (non-secret config path).
 
-describe("VaultSyncSettingTab — credential onChange routes to saveSecrets (#78)", () => {
+describe("VaultSyncSettingTab — Server URL onChange routes to saveSettings", () => {
   let plugin: ReturnType<typeof makePluginMock> & VaultSyncPlugin;
   let tab: VaultSyncSettingTab;
 
@@ -490,29 +498,6 @@ describe("VaultSyncSettingTab — credential onChange routes to saveSecrets (#78
     plugin = makePluginMock() as ReturnType<typeof makePluginMock> & VaultSyncPlugin;
     tab = makeTab(plugin);
     tab.display();
-  });
-
-  it("Username onChange updates settings, calls saveSecrets, and does NOT call saveSettings", async () => {
-    const handler = capturedOnChange.get("Username");
-    expect(handler).toBeTypeOf("function");
-
-    await handler!("alice");
-
-    expect(plugin.settings.couchDbUser).toBe("alice");
-    expect(plugin.saveSecrets).toHaveBeenCalledTimes(1);
-    // Must NOT write the secret to the in-vault config file path.
-    expect(plugin.saveSettings).not.toHaveBeenCalled();
-  });
-
-  it("Password onChange updates settings, calls saveSecrets, and does NOT call saveSettings", async () => {
-    const handler = capturedOnChange.get("Password");
-    expect(handler).toBeTypeOf("function");
-
-    await handler!("hunter2");
-
-    expect(plugin.settings.couchDbPassword).toBe("hunter2");
-    expect(plugin.saveSecrets).toHaveBeenCalledTimes(1);
-    expect(plugin.saveSettings).not.toHaveBeenCalled();
   });
 
   it("Server URL onChange still routes to saveSettings (non-secret config path unchanged)", async () => {
@@ -524,5 +509,60 @@ describe("VaultSyncSettingTab — credential onChange routes to saveSecrets (#78
     expect(plugin.settings.couchDbUrl).toBe("https://new.example.com");
     expect(plugin.saveSettings).toHaveBeenCalledTimes(1);
     expect(plugin.saveSecrets).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Clerk OAuth UI (#92): Gateway URL field, login button, status, no bootstrap
+// ---------------------------------------------------------------------------
+
+describe("VaultSyncSettingTab — Clerk OAuth UI (#92)", () => {
+  function makeClerkPlugin(): VaultSyncPlugin & {
+    startClerkLogin: ReturnType<typeof vi.fn>;
+    isLoggedIntoGateway: ReturnType<typeof vi.fn>;
+  } {
+    const base = makePluginMock();
+    const plugin = base as unknown as VaultSyncPlugin & {
+      startClerkLogin: ReturnType<typeof vi.fn>;
+      isLoggedIntoGateway: ReturnType<typeof vi.fn>;
+    };
+    (plugin as unknown as { settings: Record<string, unknown> }).settings.gatewayUrl = "";
+    plugin.startClerkLogin = vi.fn().mockResolvedValue(undefined);
+    plugin.isLoggedIntoGateway = vi.fn().mockResolvedValue(false);
+    return plugin;
+  }
+
+  let plugin: ReturnType<typeof makeClerkPlugin>;
+  let tab: VaultSyncSettingTab;
+
+  beforeEach(() => {
+    capturedOnChange.clear();
+    plugin = makeClerkPlugin();
+    tab = makeTab(plugin);
+    tab.display();
+  });
+
+  afterEach(() => {
+    tab.hide();
+  });
+
+  it("renders a Gateway URL field whose onChange persists via saveSettings", async () => {
+    const handler = capturedOnChange.get("Gateway URL");
+    expect(handler).toBeTypeOf("function");
+
+    await handler!("https://mcp.fly-agile.com");
+
+    expect((plugin.settings as unknown as { gatewayUrl: string }).gatewayUrl).toBe(
+      "https://mcp.fly-agile.com",
+    );
+    expect(plugin.saveSettings).toHaveBeenCalled();
+  });
+
+  it("removes the legacy bootstrap / username / password credential fields", () => {
+    // The old Basic-auth credential UI is replaced by Clerk login — those fields
+    // must no longer route any onChange handler.
+    expect(capturedOnChange.get("Username")).toBeUndefined();
+    expect(capturedOnChange.get("Password")).toBeUndefined();
+    expect(capturedOnChange.get("Bootstrap token")).toBeUndefined();
   });
 });

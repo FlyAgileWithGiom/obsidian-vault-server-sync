@@ -1,5 +1,5 @@
 import { Notice, Plugin } from "obsidian";
-import type { PouchDbSyncEngine } from "./PouchDbSyncEngine";
+import type { PouchDbSyncEngine, GatewayCredsResolver } from "./PouchDbSyncEngine";
 import { scrubCredentials } from "./PouchDbSyncEngine";
 import { ObsidianVaultAdapter } from "./ObsidianVaultAdapter";
 import { VaultSyncSettingTab } from "./settings-tab";
@@ -14,7 +14,18 @@ import {
   SECRET_ID_COUCH_PASSWORD,
   ENV_COUCH_USER,
   ENV_COUCH_PASSWORD,
+  SECRET_ID_GATEWAY_CLIENT_ID,
+  SECRET_ID_GATEWAY_REFRESH_TOKEN,
+  ENV_GATEWAY_CLIENT_ID,
 } from "./secret-store";
+import { makeTokenManager, makeGatewayFetch } from "./gateway-fetch";
+import {
+  startPluginLogin,
+  completePluginLogin,
+  OAUTH_PROTOCOL_ACTION,
+  type TransientLoginState,
+  type TransientLoginStore,
+} from "./plugin-login";
 
 /**
  * Vault Sync - CouchDB replication for Obsidian.
@@ -45,7 +56,23 @@ export default class VaultSyncPlugin extends Plugin {
    */
   private secretStore: SecretStore | null = null;
 
+  /**
+   * Transient PKCE/state stash for an in-flight Clerk login (#92). Lives in plugin
+   * instance memory only: it is an ephemeral per-attempt value (not a durable
+   * credential), and the authorize -> obsidian:// callback round-trip happens within
+   * the same plugin process, so no cross-restart persistence is needed.
+   */
+  private transientLogin: TransientLoginState | null = null;
+
   async onload(): Promise<void> {
+    // Register the obsidian:// OAuth callback handler FIRST, synchronously, before
+    // any awaits. The redirect back from the browser can race plugin startup; if we
+    // registered after `await loadSettings()` an early callback would be dropped.
+    // The handler itself defers to handleOAuthCallback (async) once invoked.
+    this.registerObsidianProtocolHandler(OAUTH_PROTOCOL_ACTION, (params) => {
+      void this.handleOAuthCallback(params as Record<string, string>);
+    });
+
     await this.loadSettings();
 
     // Auto-derive database name from vault name only when couchDbName is not set.
@@ -210,7 +237,178 @@ export default class VaultSyncPlugin extends Plugin {
     const db = dbFactory();
     const bridge = new PouchDbFsBridge(vaultAdapter, db);
 
-    return new PouchDbSyncEngine(this.settings, db, bridge, dbFactory);
+    // pouchdb-browser remoteFactory + gateway resolver enable Clerk OAuth (Bearer)
+    // mode. Both are no-ops (engine falls back to the legacy Basic-auth URL) when
+    // there is no gatewayUrl or the device has not logged in (Phase A) — see
+    // buildGatewayCredsResolver, which decides mode per sync start.
+    const remoteFactory = (url: string, opts: { fetch?: typeof fetch }) =>
+      new PouchDB(url, opts);
+    const gatewayCredsResolver = this.buildGatewayCredsResolver();
+
+    return new PouchDbSyncEngine(
+      this.settings,
+      db,
+      bridge,
+      dbFactory,
+      remoteFactory,
+      gatewayCredsResolver,
+    );
+  }
+
+  /**
+   * Build the plugin's GatewayCredsResolver — the seam the engine calls at sync
+   * start to choose gateway (Bearer) vs Phase-A (legacy Basic) mode.
+   *
+   * Mode is decided per-call (not at construction) so a fresh login promotes the
+   * plugin to gateway mode on the next sync without re-wiring:
+   *   - gatewayUrl set AND client_id available (env > store) AND a refresh token
+   *     stored -> returns a Bearer-injecting fetch (token manager + makeGatewayFetch).
+   *   - any of those missing -> returns null, so the engine uses the legacy URL,
+   *     keeping un-migrated devices working unchanged.
+   *
+   * Mirrors headless/gateway-resolver.ts but reads env via the iOS-safe accessor
+   * (process is undefined on iOS Obsidian) and reuses the runtime-agnostic token
+   * manager — never importing the headless module into the plugin bundle.
+   */
+  private buildGatewayCredsResolver(): GatewayCredsResolver {
+    return async (): Promise<typeof fetch | null> => {
+      const gatewayUrl = this.settings.gatewayUrl;
+      if (!gatewayUrl) return null;
+
+      const store = this.getSecretStore();
+      const clientId = await resolveSecret({
+        envName: ENV_GATEWAY_CLIENT_ID,
+        env: this.getProcessEnv(),
+        store,
+        id: SECRET_ID_GATEWAY_CLIENT_ID,
+        legacy: "",
+      });
+      if (!clientId) return null;
+
+      // No refresh token means the user has not logged in — stay on the legacy
+      // path rather than throwing, so an un-migrated device keeps syncing.
+      const refreshToken = await store.get(SECRET_ID_GATEWAY_REFRESH_TOKEN);
+      if (!refreshToken) return null;
+
+      const tokenManager = makeTokenManager({ gatewayUrl, clientId, store });
+      return makeGatewayFetch({ tokenManager });
+    };
+  }
+
+  // --- Clerk OAuth login (#92) ---
+
+  /**
+   * In-memory transient store for the PKCE verifier + CSRF state, backed by the
+   * plugin's `transientLogin` field. The login round-trip stays within one plugin
+   * process, so no durable persistence is needed.
+   */
+  private getTransientLoginStore(): TransientLoginStore {
+    return {
+      get: () => this.transientLogin,
+      set: (value: TransientLoginState) => {
+        this.transientLogin = value;
+      },
+      clear: () => {
+        this.transientLogin = null;
+      },
+    };
+  }
+
+  /**
+   * Begin the unified Clerk login: derive PKCE, register/reuse a client_id, stash
+   * the transient state, then open the system browser at the authorize URL.
+   *
+   * window.open works on both desktop and iOS Obsidian (the OS hands the redirect
+   * back to the obsidian:// protocol handler). Called from the settings tab button.
+   */
+  async startClerkLogin(): Promise<void> {
+    const gatewayUrl = this.settings.gatewayUrl;
+    if (!gatewayUrl) {
+      new Notice("Vault Sync: set the Gateway URL before logging in.");
+      return;
+    }
+    await startPluginLogin({
+      gatewayUrl,
+      store: this.getSecretStore(),
+      transient: this.getTransientLoginStore(),
+      openBrowser: (url: string) => {
+        window.open(url);
+      },
+    });
+  }
+
+  /**
+   * Handle the obsidian:// OAuth callback: validate state, exchange the code,
+   * persist the rotating refresh token, then rebuild the engine so the next sync
+   * authenticates via the gateway. Surfaces success/failure as a Notice.
+   *
+   * Registered synchronously in onload so a redirect that races startup is caught.
+   */
+  async handleOAuthCallback(params: Record<string, string>): Promise<void> {
+    const gatewayUrl = this.settings.gatewayUrl;
+    if (!gatewayUrl) return;
+    try {
+      // Obsidian pre-parses the obsidian:// query into params; rebuild the
+      // URLSearchParams the shared validator expects (code/state/error only).
+      const search = new URLSearchParams();
+      for (const [key, value] of Object.entries(params)) {
+        if (key !== "action") search.set(key, value);
+      }
+      await completePluginLogin(
+        { gatewayUrl, store: this.getSecretStore(), transient: this.getTransientLoginStore() },
+        search,
+      );
+      await this.rebuildEngine();
+      new Notice("Vault Sync: signed in. Sync now uses your Clerk account.");
+    } catch (e) {
+      const msg = scrubCredentials((e as Error).message ?? String(e));
+      console.error(`[vault-sync] OAuth login failed: ${msg}`);
+      new Notice(`Vault Sync: login failed — ${msg}`, 5000);
+    }
+  }
+
+  /**
+   * Whether the device is logged into the gateway (client_id + refresh token both
+   * present). Drives the settings-tab status indicator; does not touch the network.
+   */
+  async isLoggedIntoGateway(): Promise<boolean> {
+    const store = this.getSecretStore();
+    const clientId = await resolveSecret({
+      envName: ENV_GATEWAY_CLIENT_ID,
+      env: this.getProcessEnv(),
+      store,
+      id: SECRET_ID_GATEWAY_CLIENT_ID,
+      legacy: "",
+    });
+    if (!clientId) return false;
+    const refreshToken = await store.get(SECRET_ID_GATEWAY_REFRESH_TOKEN);
+    return Boolean(refreshToken);
+  }
+
+  /**
+   * Rebuild the sync engine after a credential change (e.g. fresh login) so the new
+   * gateway mode takes effect. Stops the current engine, reconstructs it, re-wires
+   * the callbacks + vault events, and restarts sync when configured.
+   *
+   * Mirrors the engine-construction block in onload / refreshIfVaultChanged so the
+   * three paths cannot drift on how the engine is wired.
+   */
+  async rebuildEngine(): Promise<void> {
+    this.strategy?.stop();
+    this.strategy = await this.createStrategy();
+    this.strategy.onStateChange = (state) => this.updateState(state);
+    this.strategy.onCountsChange = (counts) => this.updateCounts(counts);
+    this.strategy.onError = (msg) => this.handleSyncError(msg);
+    this.strategy.onDiagnosticsChange = () => this.notifyDiagnosticsListeners();
+    this.strategy.onNotice = (msg) => new Notice(msg);
+    this.strategy.register(this);
+    this.notifyDiagnosticsListeners();
+
+    if (this.settings.couchDbUrl && this.settings.couchDbName) {
+      this.startSync().catch((e) =>
+        this.handleSyncError(scrubCredentials((e as Error).message ?? String(e))),
+      );
+    }
   }
 
   // --- Settings persistence ---
@@ -381,6 +579,11 @@ export default class VaultSyncPlugin extends Plugin {
     onDisk.couchDbUrl = this.settings.couchDbUrl;
     onDisk.couchDbName = this.settings.couchDbName;
     onDisk.excludePatterns = this.settings.excludePatterns;
+    // gatewayUrl MUST be persisted: it is the sole signal that the Clerk OAuth
+    // path is configured. If it is dropped here, a reload reads no gatewayUrl,
+    // the creds resolver returns null, and the plugin silently downgrades to the
+    // legacy Basic-auth direct-CouchDB path while the user believes Clerk is active.
+    onDisk.gatewayUrl = this.settings.gatewayUrl;
     // couchDbUser / couchDbPassword are intentionally left as found on disk —
     // present → preserved verbatim; absent → stay absent.
 

@@ -153,6 +153,34 @@ export interface ReplaceMarkerStore {
   has(): boolean;
 }
 
+/**
+ * Factory that builds a remote PouchDB handle from a URL and fetch options.
+ *
+ * Mirrors the dbFactory constructor pattern: the plugin injects a pouchdb-browser
+ * backed factory; the daemon injects a pouchdb-node backed factory. Tests inject a
+ * spy that records calls for assertion.
+ *
+ * When omitted, the engine falls back to passing a URL string to replicate/sync
+ * (the pre-gateway behaviour), so all existing callers remain unaffected.
+ */
+export type RemoteFactory = (url: string, opts: { fetch?: typeof fetch }) => PouchDB;
+
+/**
+ * Resolves the gateway Bearer-injecting fetch function when gateway credentials
+ * are available on this device, or returns null when the device has not been
+ * migrated yet (Phase A fallback).
+ *
+ * Injected so the engine has no direct dependency on the secret store — the caller
+ * resolves credentials and wraps them into a ready-made gatewayFetch before handing
+ * it to the engine. In tests, a simple vi.fn() returning a fake fetch (or null)
+ * makes mode-selection trivially unit-testable without touching secret resolution.
+ *
+ * Why injectable rather than constructed internally: the engine is runtime-agnostic
+ * (browser and node); the gatewayFetch function depends on the global fetch and on
+ * the token manager's refresh token, all of which are resolved by the caller.
+ */
+export type GatewayCredsResolver = () => Promise<typeof fetch | null>;
+
 export class PouchDbSyncEngine {
   // --- Callbacks (set by main.ts before register()) ---
   onStateChange: (state: SyncState) => void = () => {};
@@ -217,6 +245,29 @@ export class PouchDbSyncEngine {
     private db: PouchDB,
     private readonly bridge: PouchDbFsBridge,
     private readonly dbFactory?: () => PouchDB,
+    /**
+     * Optional remote PouchDB handle factory (gateway OAuth).
+     *
+     * When provided together with a gatewayCredsResolver that returns a non-null
+     * fetch, buildRemote() uses this factory to build the remote handle with a
+     * gateway-authenticated fetch rather than a plain URL string.
+     *
+     * When omitted (all existing plugin/daemon callers), buildRemote() returns the
+     * legacy Basic-auth URL string exactly as before — zero behaviour change.
+     */
+    private readonly remoteFactory?: RemoteFactory,
+    /**
+     * Optional gateway credential resolver (gateway OAuth).
+     *
+     * Called at sync start to decide mode:
+     *   - Returns a gatewayFetch function → gateway/Bearer mode (proxy base URL
+     *     + Bearer-injecting fetch passed to remoteFactory).
+     *   - Returns null → Phase A fallback: legacy Basic-auth URL used instead,
+     *     keeping un-migrated devices working unchanged.
+     *
+     * When omitted, the engine always uses the legacy URL (safe default).
+     */
+    private readonly gatewayCredsResolver?: GatewayCredsResolver,
   ) {}
 
   /**
@@ -257,7 +308,7 @@ export class PouchDbSyncEngine {
     if (await this.isFirstRun()) {
       await this.runInitialPull();
     } else {
-      this.startLiveSync();
+      await this.startLiveSync();
       this.setState("ok");
     }
   }
@@ -277,7 +328,7 @@ export class PouchDbSyncEngine {
     // For a manual resume, restart the sync handle.
     if (!this.started) return;
     this.cancelSync();
-    this.startLiveSync();
+    await this.startLiveSync();
   }
 
   /**
@@ -378,10 +429,13 @@ export class PouchDbSyncEngine {
 
   updateSettings(settings: VaultSyncSettings): void {
     this.settings = settings;
-    // Restart sync with updated remote URL if already running
+    // Restart sync with updated remote URL if already running.
+    // Fire-and-forget: the async startLiveSync resolves very quickly (one await on
+    // gatewayCredsResolver) and any error it surfaces will propagate via the sync
+    // handle's error event, which is already handled by scheduleRestart().
     if (this.started) {
       this.cancelSync();
-      this.startLiveSync();
+      void this.startLiveSync();
     }
   }
 
@@ -428,10 +482,11 @@ export class PouchDbSyncEngine {
 
   async testConnection(): Promise<boolean> {
     try {
-      const remoteUrl = this.buildRemoteUrl();
+      const remote = await this.buildRemote();
       // Attempt a lightweight replication probe: replicate a minimal batch from remote
       await new Promise<void>((resolve, reject) => {
-        const handle = this.db.replicate.from(remoteUrl, { live: false });
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const handle = this.db.replicate.from(remote as any, { live: false });
         const emitter = handle as unknown as PouchEmitter;
         emitter.on("complete", () => resolve());
         emitter.on("error", (e) => reject(e));
@@ -483,11 +538,14 @@ export class PouchDbSyncEngine {
 
     this.onNotice?.("Vault Sync: Downloading notes...");
 
+    // Resolve the remote (gateway handle or legacy URL) before entering the promise
+    // constructor so async/await works cleanly — Promise constructors cannot be async.
+    const remote = await this.buildRemote();
     return new Promise<void>((resolve) => {
-      const remoteUrl = this.buildRemoteUrl();
       // checkpoint:'target' keeps the replication checkpoint on the local DB (resumable
       // phase, simplest correct choice). selector is the server-side text filter.
-      const replication = this.db.replicate.from(remoteUrl, {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const replication = this.db.replicate.from(remote as any, {
         live: false,
         retry: false,
         selector: TEXT_SELECTOR,
@@ -519,7 +577,10 @@ export class PouchDbSyncEngine {
         this.onNotice?.("Vault Sync: Notes ready, attachments downloading in background");
         if (this.started) {
           // Live db.sync backfills the binaries (Pattern B) while push is live throughout.
-          this.startLiveSync();
+          // Fire-and-forget: startLiveSync is now async (needs to resolve gateway creds),
+          // but we must not await it here — we are inside a Promise constructor callback,
+          // and the resolve() call below must fire regardless of gateway setup.
+          void this.startLiveSync();
         }
         resolve();
       });
@@ -563,7 +624,14 @@ export class PouchDbSyncEngine {
 
   // --- Private helpers ---
 
-  private buildRemoteUrl(): string {
+  /**
+   * Legacy direct-CouchDB URL with embedded Basic-auth credentials.
+   *
+   * Used by buildRemote() as the Phase A fallback when no gateway credentials
+   * are available, and as the sole URL when remoteFactory is not injected.
+   * The body is identical to the pre-gateway buildRemoteUrl() — behaviour unchanged.
+   */
+  private buildLegacyUrl(): string {
     const { couchDbUrl, couchDbName, couchDbUser, couchDbPassword } = this.settings;
     if (couchDbUser && couchDbPassword) {
       const base = couchDbUrl.replace(/\/$/, "");
@@ -572,6 +640,45 @@ export class PouchDbSyncEngine {
       return `${proto}${encodeURIComponent(couchDbUser)}:${encodeURIComponent(couchDbPassword)}@${host}/${couchDbName}`;
     }
     return `${couchDbUrl.replace(/\/$/, "")}/${couchDbName}`;
+  }
+
+  /**
+   * Resolve the remote for the current replication call: gateway handle or legacy URL.
+   *
+   * Mode decision at call time (not at construction) so updateSettings() and
+   * restart-after-error naturally pick up a credential change without recreating the engine.
+   *
+   * Gateway mode:
+   *   Requires BOTH remoteFactory AND gatewayCredsResolver AND settings.gatewayUrl to be set,
+   *   AND the resolver must return a non-null gatewayFetch. When all conditions hold, returns
+   *   remoteFactory("${gatewayUrl}/couchdb/${couchDbName}", { fetch: gatewayFetch }) — a
+   *   PouchDB handle whose every request carries a Bearer token. No embedded credentials.
+   *
+   * Phase A/B fallback:
+   *   If any condition is absent (not migrated, no gateway URL, resolver returns null),
+   *   returns the legacy Basic-auth URL string. The caller passes it directly to
+   *   replicate.from / db.sync, identical to pre-gateway behaviour.
+   *
+   * Why return PouchDB | string: PouchDB v9 accepts both a URL string and a remote
+   * PouchDB handle as the first argument to replicate.from / db.sync. Returning the
+   * union keeps the existing call sites unchanged (the string path is the pre-gateway
+   * behaviour; the handle path is the new one). TypeScript is satisfied via the `as any`
+   * cast at the call sites — the cast is warranted because our local PouchDB type
+   * declares the arg as `string` (the typings predate the handle form).
+   */
+  private async buildRemote(): Promise<PouchDB | string> {
+    if (this.remoteFactory && this.gatewayCredsResolver && this.settings.gatewayUrl) {
+      const gatewayFetch = await this.gatewayCredsResolver();
+      if (gatewayFetch !== null) {
+        // Gateway mode: proxy base URL + Bearer-injecting fetch → no embedded creds.
+        // couchDbName is used as-is (e.g. "vault-notes") so the proxy path matches
+        // the database name the gateway expects: /couchdb/vault-notes.
+        const proxyBase = `${this.settings.gatewayUrl}/couchdb/${this.settings.couchDbName}`;
+        return this.remoteFactory(proxyBase, { fetch: gatewayFetch });
+      }
+    }
+    // Phase A fallback: legacy Basic-auth URL, or no remoteFactory injected at all.
+    return this.buildLegacyUrl();
   }
 
   /**
@@ -588,9 +695,10 @@ export class PouchDbSyncEngine {
    * Why not just set "ok" eagerly: doing so renders "Synced" while binaries are still
    * pending, which is the lie this feature removes.
    */
-  private startLiveSync(): void {
-    const remoteUrl = this.buildRemoteUrl();
-    const handle = this.db.sync(remoteUrl, { live: true, retry: true });
+  private async startLiveSync(): Promise<void> {
+    const remote = await this.buildRemote();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handle = this.db.sync(remote as any, { live: true, retry: true });
     const emitter = handle as unknown as PouchEmitter;
     this.syncHandle = emitter;
     // Sentinel: no change observed yet. A paused before the first change must NOT latch ok.
@@ -747,7 +855,8 @@ export class PouchDbSyncEngine {
         this.initialPullRunning = false;
         void this.runInitialPull();
       } else {
-        this.startLiveSync();
+        // Fire-and-forget: errors surface through the sync handle's error event.
+        void this.startLiveSync();
       }
     }, delay);
   }
@@ -779,6 +888,7 @@ export class PouchDbSyncEngine {
     if (!this.started) return;
     if (this.initialPullRunning) return;
     this.cancelSync();
-    this.startLiveSync();
+    // Fire-and-forget: errors surface through the sync handle's error event.
+    void this.startLiveSync();
   }
 }

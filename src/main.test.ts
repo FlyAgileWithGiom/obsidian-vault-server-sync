@@ -274,6 +274,20 @@ describe("VaultSyncPlugin.saveSettings", () => {
     // Pretty-printed JSON contains newlines
     expect(written).toContain("\n");
   });
+
+  it("PERSISTS gatewayUrl so a reload keeps the Clerk path (no silent downgrade to Basic)", async () => {
+    // Regression: if gatewayUrl is dropped on save, a reload reads no gatewayUrl,
+    // the creds resolver returns null, and the plugin silently falls back to the
+    // legacy direct-CouchDB Basic-auth path while the user believes Clerk is active.
+    plugin.settings.gatewayUrl = "https://mcp.fly-agile.com";
+
+    await plugin.saveSettings();
+
+    const parsed = JSON.parse(
+      plugin.app.vault.adapter._getStored(VAULT_SYNC_CONFIG_FILE)!,
+    );
+    expect(parsed.gatewayUrl).toBe("https://mcp.fly-agile.com");
+  });
 });
 
 // ---- Secret store: loadSettings precedence + Phase-A dual-read (#78) ----
@@ -971,3 +985,124 @@ describe("VaultSyncPlugin.replaceLocalFromServer", () => {
   });
 });
 
+
+// ---------------------------------------------------------------------------
+// Clerk OAuth wiring (Stage 3): protocol handler, login, gateway resolver
+// ---------------------------------------------------------------------------
+
+import {
+  SECRET_ID_GATEWAY_CLIENT_ID,
+  SECRET_ID_GATEWAY_REFRESH_TOKEN,
+} from "./secret-store";
+import { OAUTH_PROTOCOL_ACTION } from "./plugin-login";
+
+describe("VaultSyncPlugin — Clerk OAuth protocol handler registration", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("registers the obsidian:// oauth-callback handler synchronously during onload", async () => {
+    const plugin = makePlugin();
+    (plugin.app.vault as unknown as { getName(): string }).getName = () => "v";
+    (plugin as unknown as { addRibbonIcon: unknown }).addRibbonIcon = vi.fn().mockReturnValue(makeEl());
+    (plugin as unknown as { addStatusBarItem: unknown }).addStatusBarItem = vi.fn().mockReturnValue(makeEl());
+    plugin.app.vault.on = vi.fn().mockReturnValue({ unload: () => {} }) as unknown as typeof plugin.app.vault.on;
+    const register = vi.fn();
+    (plugin as unknown as { registerObsidianProtocolHandler: unknown }).registerObsidianProtocolHandler = register;
+
+    await plugin.onload();
+
+    expect(register).toHaveBeenCalledWith(OAUTH_PROTOCOL_ACTION, expect.any(Function));
+  });
+});
+
+describe("VaultSyncPlugin — gateway creds resolver (plugin)", () => {
+  function secretStorage(plugin: VaultSyncPlugin): SecretStorage {
+    return (plugin as unknown as { app: { secretStorage: SecretStorage } }).app.secretStorage;
+  }
+
+  it("returns a fetch when gatewayUrl + client_id + refresh token are all present", async () => {
+    const plugin = makePlugin();
+    plugin.settings = { ...DEFAULT_SETTINGS, gatewayUrl: "https://mcp.fly-agile.com" };
+    secretStorage(plugin).setSecret(SECRET_ID_GATEWAY_CLIENT_ID, "client_x");
+    secretStorage(plugin).setSecret(SECRET_ID_GATEWAY_REFRESH_TOKEN, "rt-1");
+
+    const resolver = (plugin as unknown as {
+      buildGatewayCredsResolver(): () => Promise<typeof fetch | null>;
+    }).buildGatewayCredsResolver();
+    const fetchFn = await resolver();
+
+    expect(typeof fetchFn).toBe("function");
+  });
+
+  it("returns null (Phase A legacy fallback) when no refresh token is stored", async () => {
+    const plugin = makePlugin();
+    plugin.settings = { ...DEFAULT_SETTINGS, gatewayUrl: "https://mcp.fly-agile.com" };
+    secretStorage(plugin).setSecret(SECRET_ID_GATEWAY_CLIENT_ID, "client_x");
+    // No refresh token stored.
+
+    const resolver = (plugin as unknown as {
+      buildGatewayCredsResolver(): () => Promise<typeof fetch | null>;
+    }).buildGatewayCredsResolver();
+
+    expect(await resolver()).toBeNull();
+  });
+
+  it("returns null when no client_id is available", async () => {
+    const plugin = makePlugin();
+    plugin.settings = { ...DEFAULT_SETTINGS, gatewayUrl: "https://mcp.fly-agile.com" };
+    secretStorage(plugin).setSecret(SECRET_ID_GATEWAY_REFRESH_TOKEN, "rt-1");
+
+    const resolver = (plugin as unknown as {
+      buildGatewayCredsResolver(): () => Promise<typeof fetch | null>;
+    }).buildGatewayCredsResolver();
+
+    expect(await resolver()).toBeNull();
+  });
+});
+
+describe("VaultSyncPlugin — handleOAuthCallback completes login", () => {
+  function secretStorage(plugin: VaultSyncPlugin): SecretStorage {
+    return (plugin as unknown as { app: { secretStorage: SecretStorage } }).app.secretStorage;
+  }
+
+  it("validates state, exchanges the code, persists the refresh token, then rebuilds the engine", async () => {
+    const plugin = makePlugin();
+    plugin.settings = { ...DEFAULT_SETTINGS, gatewayUrl: "https://mcp.fly-agile.com" };
+    secretStorage(plugin).setSecret(SECRET_ID_GATEWAY_CLIENT_ID, "client_x");
+
+    // Seed a pending login transient (as startClerkLogin would).
+    (plugin as unknown as {
+      transientLogin: { codeVerifier: string; state: string } | null;
+    }).transientLogin = { codeVerifier: "verifier-1", state: "state-1" };
+
+    // Stub the token exchange network call.
+    const fetchMock = vi.fn(async () =>
+      new Response(
+        JSON.stringify({ access_token: "at", refresh_token: "rt-new", token_type: "Bearer", expires_in: 86400 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    // Spy on engine rebuild.
+    const rebuildSpy = vi.fn().mockResolvedValue(undefined);
+    (plugin as unknown as { rebuildEngine: unknown }).rebuildEngine = rebuildSpy;
+    (plugin as unknown as { onNoticeShown: unknown }).getDiagnostics = vi.fn();
+
+    try {
+      await (plugin as unknown as {
+        handleOAuthCallback(params: Record<string, string>): Promise<void>;
+      }).handleOAuthCallback({ action: OAUTH_PROTOCOL_ACTION, code: "auth-code", state: "state-1" });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    expect(secretStorage(plugin).getSecret(SECRET_ID_GATEWAY_REFRESH_TOKEN)).toBe("rt-new");
+    expect(rebuildSpy).toHaveBeenCalled();
+  });
+});

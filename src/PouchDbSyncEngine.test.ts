@@ -220,6 +220,10 @@ describe("PouchDbSyncEngine — visibilitychange handler", () => {
     const firstHandle = lastSyncHandle!;
     Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
     plugin._triggerDom("visibilitychange");
+    // startLiveSync is now async (awaits buildRemote). Flush the microtask queue so
+    // the new handle is assigned before asserting. One tick suffices for the no-gateway
+    // path (buildRemote resolves immediately via buildLegacyUrl).
+    await new Promise((r) => setTimeout(r, 0));
     expect(firstHandle.cancel).toHaveBeenCalled();
     expect(lastSyncHandle).not.toBe(firstHandle);
     engine.stop();
@@ -1113,6 +1117,8 @@ describe("PouchDbSyncEngine — resume guard on visibilitychange (Refs #72)", ()
 
     Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
     plugin._triggerDom("visibilitychange");
+    // startLiveSync is now async (awaits buildRemote). Flush so the new handle is assigned.
+    await new Promise((r) => setTimeout(r, 0));
 
     // Old live handle cancelled, a NEW one created (resume from checkpoint via retry).
     expect(firstLive.cancel).toHaveBeenCalled();
@@ -1358,6 +1364,290 @@ describe("PouchDbSyncEngine — auth error handling 401/403", () => {
     expect(syncHandle.cancel).not.toHaveBeenCalled();
     // State must NOT be "error" — individual doc denial does not kill the session
     expect(engine.getDiagnostics().state).not.toBe("error");
+
+    engine.stop();
+  });
+});
+
+// ---- Gateway mode: remoteFactory + gatewayCredsResolver injection -----------
+//
+// These tests verify Workstream C criteria 2 + 6 (plan piped-cuddling-micali.md):
+//
+//   Criterion 2: remoteFactory receives the proxy base URL + gatewayFetch and
+//                the built HANDLE is passed to replicate.from / db.sync (not a URL
+//                string). Event handling, two-phase pull, and checkpoint:'target'
+//                are all unchanged — only the remote argument changes shape.
+//
+//   Criterion 6 (Phase A/B fallback): if gatewayCredsResolver returns null (no
+//                gateway creds on this device), the engine falls back to the legacy
+//                Basic-auth URL, keeping un-migrated devices working unchanged.
+
+type FakePouchRemote = { _url: string; _fetchInjected: boolean };
+
+/**
+ * A fake remoteFactory: records what URL + fetch it was called with and returns
+ * a typed object the test can assert on. The `db.sync` / `db.replicate.from` mocks
+ * accept any value as the first argument (they are typed as `_remote: unknown`).
+ */
+function makeFakeRemoteFactory() {
+  const calls: Array<{ url: string; opts: { fetch?: typeof fetch } }> = [];
+  const factory = vi.fn((url: string, opts: { fetch?: typeof fetch }): FakePouchRemote => {
+    calls.push({ url, opts });
+    return { _url: url, _fetchInjected: typeof opts.fetch === "function" };
+  });
+  return { factory, calls };
+}
+
+/**
+ * Builds an engine with:
+ *   - `gatewayUrl` set on settings
+ *   - an injected `remoteFactory` (fake, for inspection)
+ *   - an injected `gatewayCredsResolver` that resolves to a fake fetch (gateway
+ *     mode) or null (legacy mode)
+ */
+function makeGatewayEngine(opts: {
+  docCount?: number;
+  gatewayCredsResolverResult: typeof fetch | null;
+  gatewayUrl?: string;
+}) {
+  const settings = {
+    ...makeSettings(),
+    // In production, couchDbName matches the CouchDB database name: "vault-<slug>".
+    // The proxy URL becomes ${gatewayUrl}/couchdb/${couchDbName}, e.g.
+    // https://gateway.test/couchdb/vault-test. This fixture uses the production
+    // naming convention so assertions on "/couchdb/vault-" succeed.
+    couchDbName: "vault-test",
+    gatewayUrl: opts.gatewayUrl ?? "https://gateway.test",
+    // Keep legacy creds present (coexistence during migration)
+    couchDbUser: "alice",
+    couchDbPassword: "secret",
+  };
+  const db = makeMockDb(opts.docCount ?? 5); // >0 → goes straight to live sync by default
+  const bridge = makeMockBridge();
+  const dbFactory = () => db as any; // eslint-disable-line @typescript-eslint/no-explicit-any
+  const { factory: remoteFactory, calls: remoteFactoryCalls } = makeFakeRemoteFactory();
+  // The resolver is the seam for mode selection: gateway fetch or null.
+  const gatewayCredsResolver = vi.fn(
+    (): Promise<typeof fetch | null> => Promise.resolve(opts.gatewayCredsResolverResult),
+  );
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const engine = new PouchDbSyncEngine(
+    settings,
+    db as any,
+    bridge as any,
+    dbFactory as any,
+    remoteFactory as any,
+    gatewayCredsResolver,
+  );
+  return { engine, db, bridge, remoteFactory, remoteFactoryCalls, gatewayCredsResolver };
+}
+
+/** A fake gatewayFetch — simply a function with the right signature. */
+function fakeFetch(): typeof fetch {
+  return vi.fn() as unknown as typeof fetch;
+}
+
+describe("PouchDbSyncEngine — gateway mode (remoteFactory + gatewayCredsResolver)", () => {
+  beforeEach(() => { lastSyncHandle = null; lastReplicateHandle = null; });
+
+  it("live sync (db.sync) receives a remote HANDLE (not a URL string) in gateway mode", async () => {
+    const gf = fakeFetch();
+    const { engine, db } = makeGatewayEngine({ docCount: 5, gatewayCredsResolverResult: gf });
+    engine.register(makePlugin());
+    await engine.start();
+
+    // The remote argument passed to db.sync must be the object returned by
+    // remoteFactory, not a URL string.
+    const syncArg = (db.sync as ReturnType<typeof vi.fn>).mock.calls[0][0] as FakePouchRemote;
+    expect(typeof syncArg).toBe("object");
+    expect(syncArg._url).toContain("/couchdb/vault-");
+    expect(syncArg._fetchInjected).toBe(true);
+
+    engine.stop();
+  });
+
+  it("remoteFactory is called with the proxy base URL: ${gatewayUrl}/couchdb/vault-${slug}", async () => {
+    const gf = fakeFetch();
+    // couchDbName is 'vault-test-vault' → slug is 'test-vault'
+    const settings = { ...makeSettings(), gatewayUrl: "https://gw.example.com", couchDbName: "vault-notes" };
+    const db = makeMockDb(5);
+    const bridge = makeMockBridge();
+    const { factory: remoteFactory, calls } = makeFakeRemoteFactory();
+    const gatewayCredsResolver = vi.fn(() => Promise.resolve(gf as unknown as typeof fetch));
+    const engine = new PouchDbSyncEngine(
+      settings,
+      db as any, bridge as any,
+      () => db as any,
+      remoteFactory as any,
+      gatewayCredsResolver,
+    );
+    engine.register(makePlugin());
+    await engine.start();
+
+    // remoteFactory must receive the proxy base (no user:pass, no trailing /dbName on URL)
+    expect(calls.length).toBeGreaterThan(0);
+    const firstCall = calls[0];
+    expect(firstCall.url).toBe("https://gw.example.com/couchdb/vault-notes");
+    // The gateway fetch function must be forwarded as-is
+    expect(firstCall.opts.fetch).toBe(gf);
+
+    engine.stop();
+  });
+
+  it("slug derivation: couchDbName='vault-my-notes' → proxy path contains 'vault-my-notes'", async () => {
+    const gf = fakeFetch();
+    const settings = {
+      ...makeSettings(),
+      gatewayUrl: "https://gw.example.com",
+      couchDbName: "vault-my-notes",
+    };
+    const db = makeMockDb(5);
+    const bridge = makeMockBridge();
+    const { factory: remoteFactory, calls } = makeFakeRemoteFactory();
+    const gatewayCredsResolver = vi.fn(() => Promise.resolve(gf as unknown as typeof fetch));
+    const engine = new PouchDbSyncEngine(
+      settings, db as any, bridge as any, () => db as any, remoteFactory as any, gatewayCredsResolver,
+    );
+    engine.register(makePlugin());
+    await engine.start();
+
+    expect(calls[0].url).toBe("https://gw.example.com/couchdb/vault-my-notes");
+    engine.stop();
+  });
+
+  it("phase-1 replicate.from also receives the remote HANDLE (not a URL) in gateway mode", async () => {
+    const gf = fakeFetch();
+    const { engine, db } = makeGatewayEngine({ docCount: 0, gatewayCredsResolverResult: gf });
+    engine.register(makePlugin());
+    await engine.start();
+
+    // First argument to replicate.from must be the handle, not a string.
+    const replicateArg = (db.replicate.from as ReturnType<typeof vi.fn>).mock.calls[0][0] as FakePouchRemote;
+    expect(typeof replicateArg).toBe("object");
+    expect(replicateArg._url).toContain("/couchdb/vault-");
+    expect(replicateArg._fetchInjected).toBe(true);
+
+    engine.stop();
+  });
+
+  it("testConnection replicate.from receives the remote HANDLE in gateway mode", async () => {
+    const gf = fakeFetch();
+    const { engine, db } = makeGatewayEngine({ docCount: 5, gatewayCredsResolverResult: gf });
+    await engine.testConnection();
+
+    const replicateArg = (db.replicate.from as ReturnType<typeof vi.fn>).mock.calls[0][0] as FakePouchRemote;
+    expect(typeof replicateArg).toBe("object");
+    expect(replicateArg._fetchInjected).toBe(true);
+  });
+
+  it("gateway mode does not embed credentials in the URL (no user:pass@)", async () => {
+    const gf = fakeFetch();
+    const { engine, remoteFactoryCalls } = makeGatewayEngine({ docCount: 5, gatewayCredsResolverResult: gf });
+    engine.register(makePlugin());
+    await engine.start();
+
+    // The proxy base URL must not contain embedded Basic-auth credentials.
+    const url = remoteFactoryCalls[0]?.url ?? "";
+    expect(url).not.toContain("@");
+    expect(url).not.toContain("alice");
+    expect(url).not.toContain("secret");
+
+    engine.stop();
+  });
+});
+
+describe("PouchDbSyncEngine — Phase A/B fallback (no gateway creds → legacy URL)", () => {
+  beforeEach(() => { lastSyncHandle = null; lastReplicateHandle = null; });
+
+  it("falls back to legacy Basic-auth URL when gatewayCredsResolver returns null", async () => {
+    // A device without gateway creds: the resolver returns null.
+    // Engine must use the old https://user:pass@couchDbUrl/dbName URL so the
+    // device keeps syncing without any gateway migration.
+    const { engine, db } = makeGatewayEngine({ docCount: 5, gatewayCredsResolverResult: null });
+    engine.register(makePlugin());
+    await engine.start();
+
+    // db.sync must have been called with the legacy URL string (not an object).
+    const syncArg = (db.sync as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(typeof syncArg).toBe("string");
+    expect(syncArg as string).toContain("alice");
+    expect(syncArg as string).toContain("secret");
+    expect(syncArg as string).not.toContain("gateway.test");
+
+    engine.stop();
+  });
+
+  it("legacy URL is also used when gatewayUrl is absent, even if resolver returns a fetch", async () => {
+    // Guard: no gatewayUrl on settings → cannot build a proxy base → fall back.
+    const gf = fakeFetch();
+    const settings = {
+      ...makeSettings(),
+      // explicitly no gatewayUrl
+      couchDbUser: "alice",
+      couchDbPassword: "secret",
+    };
+    const db = makeMockDb(5);
+    const bridge = makeMockBridge();
+    const { factory: remoteFactory } = makeFakeRemoteFactory();
+    const gatewayCredsResolver = vi.fn(() => Promise.resolve(gf as unknown as typeof fetch));
+    const engine = new PouchDbSyncEngine(
+      settings, db as any, bridge as any, () => db as any, remoteFactory as any, gatewayCredsResolver,
+    );
+    engine.register(makePlugin());
+    await engine.start();
+
+    const syncArg = (db.sync as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    expect(typeof syncArg).toBe("string");
+
+    engine.stop();
+  });
+
+  it("mode switching: same engine, resolver returning null uses legacy; resolver returning fetch uses gateway", async () => {
+    // This test validates that the mode decision is made per-call to startLiveSync,
+    // not at construction time. Two separate engines with different resolvers demonstrate
+    // the mode selection driven solely by the resolver's return value.
+    const legacyDb = makeMockDb(5);
+    const legacyBridge = makeMockBridge();
+    const { factory: legacyFactory } = makeFakeRemoteFactory();
+    const legacyEngine = new PouchDbSyncEngine(
+      { ...makeSettings(), gatewayUrl: "https://gateway.test" },
+      legacyDb as any, legacyBridge as any, () => legacyDb as any, legacyFactory as any,
+      vi.fn(() => Promise.resolve(null)),
+    );
+    legacyEngine.register(makePlugin());
+    await legacyEngine.start();
+
+    const gwDb = makeMockDb(5);
+    const gwBridge = makeMockBridge();
+    const gf = fakeFetch();
+    const { factory: gwFactory, calls: gwCalls } = makeFakeRemoteFactory();
+    const gwEngine = new PouchDbSyncEngine(
+      { ...makeSettings(), gatewayUrl: "https://gateway.test" },
+      gwDb as any, gwBridge as any, () => gwDb as any, gwFactory as any,
+      vi.fn(() => Promise.resolve(gf as unknown as typeof fetch)),
+    );
+    gwEngine.register(makePlugin());
+    await gwEngine.start();
+
+    // Legacy engine: db.sync received a string URL
+    expect(typeof (legacyDb.sync as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe("string");
+
+    // Gateway engine: db.sync received a handle object from remoteFactory
+    expect(typeof (gwDb.sync as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe("object");
+    expect(gwCalls[0].opts.fetch).toBe(gf);
+
+    legacyEngine.stop();
+    gwEngine.stop();
+  });
+
+  it("legacy fallback: no remoteFactory at all → URL string still used (existing callers unaffected)", async () => {
+    // Engines constructed without remoteFactory (all existing plugin/daemon callers) must
+    // keep working identically — the new params are all optional.
+    const { engine, db } = makeEngine({ docCount: 5 });
+    engine.register(makePlugin());
+    await engine.start();
+
+    expect(typeof (db.sync as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe("string");
 
     engine.stop();
   });
