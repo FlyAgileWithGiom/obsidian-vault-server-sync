@@ -65,32 +65,52 @@ export class VaultSyncSettingTab extends PluginSettingTab {
           })
       );
 
+    // --- Clerk OAuth account (#92) ---
+    // Replaces the legacy Basic-auth username/password. The sync clients now
+    // authenticate as a Clerk account via a PKCE login; only the Gateway URL is
+    // configured here, and the rotating refresh token lives in the secret store.
+    containerEl.createEl("h3", { text: "Account" });
+
     new Setting(containerEl)
-      .setName("Username")
-      .setDesc("Vault Sync username")
+      .setName("Gateway URL")
+      .setDesc("OAuth gateway (Obsidian connector) URL, e.g. https://mcp.fly-agile.com")
       .addText((text) =>
         text
-          .setValue(this.plugin.settings.couchDbUser)
+          .setPlaceholder("https://mcp.fly-agile.com")
+          .setValue(this.plugin.settings.gatewayUrl ?? "")
           .onChange(async (value) => {
-            // Credentials persist to the out-of-vault secret store (#78), never
-            // to .vault-sync.json. saveSecrets also propagates to the live engine.
-            this.plugin.settings.couchDbUser = value.trim();
-            await this.plugin.saveSecrets();
+            this.plugin.settings.gatewayUrl = value.trim();
+            await this.plugin.saveSettings();
           })
       );
 
-    new Setting(containerEl)
-      .setName("Password")
-      .setDesc("Vault Sync password")
-      .addText((text) => {
-        text.inputEl.type = "password";
-        text
-          .setValue(this.plugin.settings.couchDbPassword)
-          .onChange(async (value) => {
-            this.plugin.settings.couchDbPassword = value;
-            await this.plugin.saveSecrets();
-          });
-      });
+    const loginSetting = new Setting(containerEl)
+      .setName("Clerk account")
+      .setDesc("Checking sign-in status…")
+      .addButton((btn) =>
+        btn.setButtonText("Log in with Clerk").onClick(async () => {
+          btn.setButtonText("Opening browser…");
+          btn.setDisabled(true);
+          try {
+            await this.plugin.startClerkLogin();
+            btn.setButtonText("Continue in browser");
+          } catch {
+            btn.setButtonText("Error");
+          }
+          setTimeout(() => {
+            btn.setButtonText("Log in with Clerk");
+            btn.setDisabled(false);
+          }, 2000);
+        })
+      );
+    // Resolve the logged-in status asynchronously so the description reflects the
+    // real state without blocking the settings render.
+    this.plugin
+      .isLoggedIntoGateway()
+      .then((loggedIn) =>
+        loginSetting.setDesc(loggedIn ? "Signed in" : "Not signed in"),
+      )
+      .catch(() => loginSetting.setDesc("Sign-in status unavailable"));
 
     new Setting(containerEl)
       .setName("Exclude patterns")
