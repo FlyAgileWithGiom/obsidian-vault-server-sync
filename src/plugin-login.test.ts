@@ -69,12 +69,12 @@ function jsonResponse(body: unknown, status = 200): Response {
 
 describe("plugin-login constants", () => {
   it("uses the unified obsidian:// redirect URI for desktop + iOS", () => {
-    expect(OAUTH_REDIRECT_URI).toBe("obsidian://vault-sync/oauth-callback");
+    expect(OAUTH_REDIRECT_URI).toBe("obsidian://fly-vault-sync-oauth");
   });
 
-  it("derives the protocol action from the redirect URI host+path", () => {
-    // The action Obsidian extracts from obsidian://vault-sync/oauth-callback.
-    expect(OAUTH_PROTOCOL_ACTION).toBe("vault-sync/oauth-callback");
+  it("uses a SINGLE-SEGMENT action (no slash) so Obsidian's host-based dispatch routes it", () => {
+    // A path-style action ("a/b") registers a handler the dispatcher never matches.
+    expect(OAUTH_PROTOCOL_ACTION).not.toContain("/");
     expect(OAUTH_REDIRECT_URI).toBe(`obsidian://${OAUTH_PROTOCOL_ACTION}`);
   });
 

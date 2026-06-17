@@ -30,24 +30,21 @@ import { SECRET_ID_GATEWAY_CLIENT_ID } from "./secret-store";
  */
 
 /**
- * The unified redirect URI for the plugin on BOTH desktop and iOS.
- *
- * registerObsidianProtocolHandler dispatches obsidian:// URLs to the plugin on
- * every platform, so this single custom-scheme URI replaces the daemon's
- * per-platform loopback. It is the value that MUST be registered as an allowed
- * redirect URI in Clerk.
- */
-export const OAUTH_REDIRECT_URI = "obsidian://vault-sync/oauth-callback";
-
-/**
  * The protocol action passed to registerObsidianProtocolHandler.
  *
- * Obsidian parses obsidian://<action>?<params> and matches <action> against the
- * full path between the scheme and the query. For OAUTH_REDIRECT_URI that path is
- * "vault-sync/oauth-callback". Deriving it from the URI keeps the registered
- * handler and the redirect URI provably in sync.
+ * Obsidian dispatches obsidian://<action>?<params> by the HOST segment only — a
+ * path-style action like "vault-sync/oauth-callback" registers a handler keyed on
+ * a string the dispatcher never produces, so the callback is silently dropped.
+ * Use a SINGLE-SEGMENT action (no slash), unified across desktop + iOS.
  */
-export const OAUTH_PROTOCOL_ACTION = OAUTH_REDIRECT_URI.replace("obsidian://", "");
+export const OAUTH_PROTOCOL_ACTION = "fly-vault-sync-oauth";
+
+/**
+ * The unified redirect URI for the plugin on BOTH desktop and iOS, derived from
+ * the action so the registered handler and the Clerk-registered redirect URI stay
+ * provably equal. MUST be registered as an allowed redirect URI in Clerk.
+ */
+export const OAUTH_REDIRECT_URI = `obsidian://${OAUTH_PROTOCOL_ACTION}`;
 
 /**
  * Canonical OAuth scope for the plugin login.

@@ -69,9 +69,21 @@ export default class VaultSyncPlugin extends Plugin {
     // any awaits. The redirect back from the browser can race plugin startup; if we
     // registered after `await loadSettings()` an early callback would be dropped.
     // The handler itself defers to handleOAuthCallback (async) once invoked.
-    this.registerObsidianProtocolHandler(OAUTH_PROTOCOL_ACTION, (params) => {
-      void this.handleOAuthCallback(params as Record<string, string>);
-    });
+    //
+    // Defensive: never let a protocol-registration failure abort onload — that would
+    // half-initialise the plugin (no settings tab, no sync) and present as a frozen
+    // config screen. Clerk login is optional; sync still works on the legacy path.
+    try {
+      this.registerObsidianProtocolHandler(OAUTH_PROTOCOL_ACTION, (params) => {
+        void this.handleOAuthCallback(params as Record<string, string>);
+      });
+    } catch (e) {
+      console.error(
+        `[vault-sync] Failed to register OAuth protocol handler (Clerk login disabled): ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      );
+    }
 
     await this.loadSettings();
 
