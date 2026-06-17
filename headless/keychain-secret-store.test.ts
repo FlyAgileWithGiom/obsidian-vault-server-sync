@@ -165,3 +165,71 @@ describe("KeychainSecretStore.set", () => {
     expect(opts.timeout).toBe(120_000);
   });
 });
+
+describe("KeychainSecretStore.delete", () => {
+  it("invokes `security delete-generic-password` with the shared service and the account id", async () => {
+    const execFile: ExecFileLike = vi.fn(async () => ({ stdout: "", stderr: "" }));
+    const store = new KeychainSecretStore(darwinOpts(execFile));
+
+    await expect(store.delete(SECRET_ID_COUCH_PASSWORD)).resolves.toBeUndefined();
+
+    expect(execFile).toHaveBeenCalledTimes(1);
+    const [file, args] = (execFile as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(file).toBe("security");
+    expect(args).toContain("delete-generic-password");
+    expect(args).toContain("-s");
+    expect(args).toContain(KEYCHAIN_SERVICE);
+    expect(args).toContain("-a");
+    expect(args).toContain(SECRET_ID_COUCH_PASSWORD);
+  });
+
+  it("swallows the not-found error (item absent — delete is idempotent)", async () => {
+    const execFile: ExecFileLike = vi.fn(async () => {
+      const err = new Error("The specified item could not be found in the keychain.") as Error & {
+        code?: number;
+      };
+      err.code = 44; // errSecItemNotFound
+      throw err;
+    });
+    const store = new KeychainSecretStore(darwinOpts(execFile));
+    await expect(store.delete(SECRET_ID_COUCH_PASSWORD)).resolves.toBeUndefined();
+  });
+
+  it("swallows the locked / access-denied error (never prompts or hangs)", async () => {
+    const execFile: ExecFileLike = vi.fn(async () => {
+      const err = new Error("User interaction is not allowed.") as Error & { code?: number };
+      err.code = 36; // errSecInteractionNotAllowed
+      throw err;
+    });
+    const store = new KeychainSecretStore(darwinOpts(execFile));
+    await expect(store.delete(SECRET_ID_COUCH_PASSWORD)).resolves.toBeUndefined();
+  });
+
+  it("swallows a timeout (bounded — security must never hang the daemon on delete)", async () => {
+    const execFile: ExecFileLike = vi.fn(async () => {
+      const err = new Error("spawn ETIMEDOUT") as Error & { killed?: boolean; signal?: string };
+      err.killed = true;
+      err.signal = "SIGTERM";
+      throw err;
+    });
+    const store = new KeychainSecretStore(darwinOpts(execFile));
+    await expect(store.delete(SECRET_ID_COUCH_PASSWORD)).resolves.toBeUndefined();
+  });
+
+  it("is a no-op off darwin (security CLI is macOS-only)", async () => {
+    const execFile = vi.fn();
+    const store = new KeychainSecretStore({ platform: "linux", execFile });
+    await store.delete(SECRET_ID_COUCH_PASSWORD);
+    expect(execFile).not.toHaveBeenCalled();
+  });
+
+  it("passes a bounded timeout to the runner so a blocking security call cannot hang the daemon", async () => {
+    const execFile: ExecFileLike = vi.fn(async () => ({ stdout: "", stderr: "" }));
+    const store = new KeychainSecretStore(darwinOpts(execFile));
+    await store.delete(SECRET_ID_COUCH_PASSWORD);
+    const [, , opts] = (execFile as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(opts).toBeTruthy();
+    expect(typeof opts.timeout).toBe("number");
+    expect(opts.timeout).toBeGreaterThan(0);
+  });
+});

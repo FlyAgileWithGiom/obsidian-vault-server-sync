@@ -65,6 +65,24 @@ describe("SecretStorageSecretStore", () => {
     expect(store.isAvailable()).toBe(true);
   });
 
+  it("delete() removes the secret from app.secretStorage so get() returns null afterward", async () => {
+    const app = new App();
+    const store = new SecretStorageSecretStore(app);
+    await store.set(SECRET_ID_COUCH_PASSWORD, "s3cret");
+    expect(await store.get(SECRET_ID_COUCH_PASSWORD)).toBe("s3cret");
+
+    await store.delete(SECRET_ID_COUCH_PASSWORD);
+
+    expect(await store.get(SECRET_ID_COUCH_PASSWORD)).toBeNull();
+    expect(app.secretStorage.getSecret(SECRET_ID_COUCH_PASSWORD)).toBeNull();
+  });
+
+  it("delete() is a no-op and does not throw when secretStorage is absent (pre-1.11.4)", async () => {
+    const app = { vault: {} } as unknown as App;
+    const store = new SecretStorageSecretStore(app);
+    await expect(store.delete(SECRET_ID_COUCH_PASSWORD)).resolves.toBeUndefined();
+  });
+
   it("isAvailable() is false and get/set degrade gracefully when secretStorage is absent (pre-1.11.4)", async () => {
     // Simulate an older Obsidian runtime: no secretStorage on app.
     const app = { vault: {} } as unknown as App;
@@ -110,6 +128,9 @@ function fakeStore(initial: Record<string, string> = {}): SecretStore {
     },
     async set(id, value) {
       m.set(id, value);
+    },
+    async delete(id) {
+      m.delete(id);
     },
     isAvailable() {
       return true;
@@ -173,6 +194,9 @@ describe("resolveSecret precedence (env > store > legacy in-vault)", () => {
         return null;
       },
       async set() {
+        /* no-op */
+      },
+      async delete() {
         /* no-op */
       },
       isAvailable() {

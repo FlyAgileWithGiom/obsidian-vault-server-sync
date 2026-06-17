@@ -1064,6 +1064,53 @@ describe("VaultSyncPlugin — gateway creds resolver (plugin)", () => {
   });
 });
 
+describe("VaultSyncPlugin — logoutGateway", () => {
+  function secretStorage(plugin: VaultSyncPlugin): SecretStorage {
+    return (plugin as unknown as { app: { secretStorage: SecretStorage } }).app.secretStorage;
+  }
+
+  it("clears the stored client_id so isLoggedIntoGateway() returns false afterward", async () => {
+    const plugin = makePlugin();
+    plugin.settings = { ...DEFAULT_SETTINGS, gatewayUrl: "https://mcp.fly-agile.com" };
+    secretStorage(plugin).setSecret(SECRET_ID_GATEWAY_CLIENT_ID, "client_x");
+    secretStorage(plugin).setSecret(SECRET_ID_GATEWAY_REFRESH_TOKEN, "rt-1");
+
+    // Stub rebuildEngine to avoid real engine construction.
+    (plugin as unknown as { rebuildEngine: unknown }).rebuildEngine = vi.fn().mockResolvedValue(undefined);
+
+    expect(await plugin.isLoggedIntoGateway()).toBe(true);
+
+    await (plugin as unknown as { logoutGateway(): Promise<void> }).logoutGateway();
+
+    expect(secretStorage(plugin).getSecret(SECRET_ID_GATEWAY_CLIENT_ID)).toBeNull();
+    expect(secretStorage(plugin).getSecret(SECRET_ID_GATEWAY_REFRESH_TOKEN)).toBeNull();
+    expect(await plugin.isLoggedIntoGateway()).toBe(false);
+  });
+
+  it("clears the transient login state so startClerkLogin re-runs DCR", async () => {
+    const plugin = makePlugin();
+    (plugin as unknown as { transientLogin: { codeVerifier: string; state: string } | null })
+      .transientLogin = { codeVerifier: "v", state: "s" };
+    (plugin as unknown as { rebuildEngine: unknown }).rebuildEngine = vi.fn().mockResolvedValue(undefined);
+
+    await (plugin as unknown as { logoutGateway(): Promise<void> }).logoutGateway();
+
+    expect(
+      (plugin as unknown as { transientLogin: unknown }).transientLogin,
+    ).toBeNull();
+  });
+
+  it("calls rebuildEngine so the gateway resolver picks up the cleared state on the next sync", async () => {
+    const plugin = makePlugin();
+    const rebuildSpy = vi.fn().mockResolvedValue(undefined);
+    (plugin as unknown as { rebuildEngine: unknown }).rebuildEngine = rebuildSpy;
+
+    await (plugin as unknown as { logoutGateway(): Promise<void> }).logoutGateway();
+
+    expect(rebuildSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("VaultSyncPlugin — handleOAuthCallback completes login", () => {
   function secretStorage(plugin: VaultSyncPlugin): SecretStorage {
     return (plugin as unknown as { app: { secretStorage: SecretStorage } }).app.secretStorage;

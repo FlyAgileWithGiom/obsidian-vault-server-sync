@@ -18,6 +18,8 @@ export interface SecretStore {
   get(id: string): Promise<string | null>;
   /** Stores `value` under `id`. No-op if the store is unavailable. */
   set(id: string, value: string): Promise<void>;
+  /** Removes the secret for `id`. No-op if absent or the store is unavailable. Never throws. */
+  delete(id: string): Promise<void>;
   /** Whether the underlying backend is usable on this runtime. */
   isAvailable(): boolean;
 }
@@ -75,6 +77,7 @@ interface SecretStorageApi {
   setSecret(id: string, secret: string): void;
   getSecret(id: string): string | null;
   listSecrets(): string[];
+  deleteSecret?(id: string): void;
 }
 
 /**
@@ -118,6 +121,15 @@ export class SecretStorageSecretStore implements SecretStore {
       this.api.setSecret(id, value);
     } catch {
       // Best-effort: a failed write leaves the legacy in-vault value in place.
+    }
+  }
+
+  async delete(id: string): Promise<void> {
+    if (!this.api) return;
+    try {
+      this.api.deleteSecret?.(id);
+    } catch {
+      // Swallow all failures — a wedged store must never hang or crash the caller.
     }
   }
 }

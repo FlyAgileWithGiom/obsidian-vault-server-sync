@@ -106,6 +106,30 @@ class MockTextBuilder {
   }
 }
 
+// Captured addButton callbacks keyed by the setting's display name and button text.
+// Each entry is { buttonText, callback }.
+const capturedButtons: { name: string; buttonText: string; callback: () => unknown }[] = [];
+
+/** Button builder stub passed to addButton() callbacks; chainable, records onClick. */
+class MockButtonBuilder {
+  private _text = "";
+  private _onClick: (() => unknown) | null = null;
+  private _settingName: string;
+  constructor(settingName: string) {
+    this._settingName = settingName;
+  }
+  setButtonText(text: string): this {
+    this._text = text;
+    return this;
+  }
+  setDisabled(): this { return this; }
+  onClick(cb: () => unknown): this {
+    this._onClick = cb;
+    capturedButtons.push({ name: this._settingName, buttonText: this._text, callback: cb });
+    return this;
+  }
+}
+
 vi.mock("obsidian", async () => {
   const actual = await vi.importActual<typeof import("./__mocks__/obsidian")>(
     "./__mocks__/obsidian"
@@ -130,7 +154,11 @@ vi.mock("obsidian", async () => {
         if (cb) cb(new MockTextBuilder(this.name));
         return this;
       }
-      addButton(): this { return this; }
+      addButton(cb?: (btn: MockButtonBuilder) => unknown): this {
+        const btn = new MockButtonBuilder(this.name);
+        if (cb) cb(btn);
+        return this;
+      }
       addDropdown(): this { return this; }
     },
   };
@@ -564,5 +592,100 @@ describe("VaultSyncSettingTab — Clerk OAuth UI (#92)", () => {
     expect(capturedOnChange.get("Username")).toBeUndefined();
     expect(capturedOnChange.get("Password")).toBeUndefined();
     expect(capturedOnChange.get("Bootstrap token")).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Clerk OAuth UI — logout button (#87): shown only when signed in
+// ---------------------------------------------------------------------------
+
+describe("VaultSyncSettingTab — logout button (#87)", () => {
+  function makeLoggedInPlugin(): VaultSyncPlugin & {
+    logoutGateway: ReturnType<typeof vi.fn>;
+    isLoggedIntoGateway: ReturnType<typeof vi.fn>;
+  } {
+    const base = makePluginMock();
+    const plugin = base as unknown as VaultSyncPlugin & {
+      logoutGateway: ReturnType<typeof vi.fn>;
+      isLoggedIntoGateway: ReturnType<typeof vi.fn>;
+    };
+    plugin.logoutGateway = vi.fn().mockResolvedValue(undefined);
+    plugin.isLoggedIntoGateway = vi.fn().mockResolvedValue(true);
+    return plugin;
+  }
+
+  function makeLoggedOutPlugin(): VaultSyncPlugin & {
+    logoutGateway: ReturnType<typeof vi.fn>;
+    isLoggedIntoGateway: ReturnType<typeof vi.fn>;
+  } {
+    const base = makePluginMock();
+    const plugin = base as unknown as VaultSyncPlugin & {
+      logoutGateway: ReturnType<typeof vi.fn>;
+      isLoggedIntoGateway: ReturnType<typeof vi.fn>;
+    };
+    plugin.logoutGateway = vi.fn().mockResolvedValue(undefined);
+    plugin.isLoggedIntoGateway = vi.fn().mockResolvedValue(false);
+    return plugin;
+  }
+
+  beforeEach(() => {
+    capturedButtons.length = 0;
+  });
+
+  it("adds a sign-out button when isLoggedIntoGateway resolves true", async () => {
+    const plugin = makeLoggedInPlugin();
+    const tab = makeTab(plugin);
+    tab.display();
+
+    // isLoggedIntoGateway is async — wait for it to settle.
+    await plugin.isLoggedIntoGateway();
+    // Flush microtasks so the .then() callback runs.
+    await Promise.resolve();
+
+    const signOutButtons = capturedButtons.filter((b) =>
+      b.buttonText.toLowerCase().includes("sign out") ||
+      b.buttonText.toLowerCase().includes("log out"),
+    );
+    expect(signOutButtons.length).toBeGreaterThan(0);
+
+    tab.hide();
+  });
+
+  it("does NOT add a sign-out button when isLoggedIntoGateway resolves false", async () => {
+    const plugin = makeLoggedOutPlugin();
+    const tab = makeTab(plugin);
+    tab.display();
+
+    await plugin.isLoggedIntoGateway();
+    await Promise.resolve();
+
+    const signOutButtons = capturedButtons.filter((b) =>
+      b.buttonText.toLowerCase().includes("sign out") ||
+      b.buttonText.toLowerCase().includes("log out"),
+    );
+    expect(signOutButtons.length).toBe(0);
+
+    tab.hide();
+  });
+
+  it("calls logoutGateway when the sign-out button is clicked", async () => {
+    const plugin = makeLoggedInPlugin();
+    const tab = makeTab(plugin);
+    tab.display();
+
+    await plugin.isLoggedIntoGateway();
+    await Promise.resolve();
+
+    const signOutButton = capturedButtons.find((b) =>
+      b.buttonText.toLowerCase().includes("sign out") ||
+      b.buttonText.toLowerCase().includes("log out"),
+    );
+    expect(signOutButton).toBeDefined();
+
+    await signOutButton!.callback();
+
+    expect(plugin.logoutGateway).toHaveBeenCalledTimes(1);
+
+    tab.hide();
   });
 });

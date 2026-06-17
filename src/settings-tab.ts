@@ -104,12 +104,23 @@ export class VaultSyncSettingTab extends PluginSettingTab {
         })
       );
     // Resolve the logged-in status asynchronously so the description reflects the
-    // real state without blocking the settings render.
+    // real state without blocking the settings render. When signed in, also add a
+    // sign-out button that clears stored credentials (fixes redirect-URI mismatch).
     this.plugin
       .isLoggedIntoGateway()
-      .then((loggedIn) =>
-        loginSetting.setDesc(loggedIn ? "Signed in" : "Not signed in"),
-      )
+      .then((loggedIn) => {
+        loginSetting.setDesc(loggedIn ? "Signed in" : "Not signed in");
+        if (loggedIn) {
+          loginSetting.addButton((btn) =>
+            btn.setButtonText("Sign out").onClick(async () => {
+              btn.setButtonText("Signing out…");
+              btn.setDisabled(true);
+              await this.plugin.logoutGateway();
+              loginSetting.setDesc("Not signed in");
+            }),
+          );
+        }
+      })
       .catch(() => loginSetting.setDesc("Sign-in status unavailable"));
 
     new Setting(containerEl)

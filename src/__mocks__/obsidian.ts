@@ -202,6 +202,10 @@ export class SecretStorage {
   listSecrets(): string[] {
     return Array.from(this.store.keys());
   }
+
+  deleteSecret(id: string): void {
+    this.store.delete(id);
+  }
 }
 
 export class Plugin {

@@ -26,6 +26,9 @@ function fakeStore(initial: Record<string, string> = {}): SecretStore & {
     async set(id, value) {
       _data.set(id, value);
     },
+    async delete(id) {
+      _data.delete(id);
+    },
     isAvailable() {
       return true;
     },

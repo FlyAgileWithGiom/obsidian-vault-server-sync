@@ -108,4 +108,18 @@ export class KeychainSecretStore implements SecretStore {
       // Best-effort: a failed write leaves the legacy in-vault value in place.
     }
   }
+
+  async delete(id: string): Promise<void> {
+    if (!this.isAvailable()) return;
+    try {
+      await this.execFile(
+        "security",
+        ["delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", id],
+        { timeout: this.timeoutMs, killSignal: "SIGTERM" },
+      );
+    } catch {
+      // not-found / locked / denied / timeout — all swallowed. Delete is
+      // best-effort: a wedged keychain must never hang or crash the daemon.
+    }
+  }
 }

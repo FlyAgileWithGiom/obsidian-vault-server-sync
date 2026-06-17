@@ -398,6 +398,19 @@ export default class VaultSyncPlugin extends Plugin {
   }
 
   /**
+   * Clear the stored gateway credentials (client_id + refresh token) and rebuild the
+   * engine so the device is logged out. The next call to startClerkLogin will
+   * re-register via Dynamic Client Registration, picking up any redirect-URI changes.
+   */
+  async logoutGateway(): Promise<void> {
+    const store = this.getSecretStore();
+    await store.delete(SECRET_ID_GATEWAY_CLIENT_ID);
+    await store.delete(SECRET_ID_GATEWAY_REFRESH_TOKEN);
+    this.transientLogin = null;
+    await this.rebuildEngine();
+  }
+
+  /**
    * Rebuild the sync engine after a credential change (e.g. fresh login) so the new
    * gateway mode takes effect. Stops the current engine, reconstructs it, re-wires
    * the callbacks + vault events, and restarts sync when configured.
