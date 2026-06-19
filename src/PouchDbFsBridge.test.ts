@@ -1216,3 +1216,275 @@ describe("PouchDbFsBridge — single-file delete tombstone (no descendant sweep)
     errorSpy.mockRestore();
   });
 });
+
+// ==========================================================================
+// Level 3 echo suppression: self-originated rev tracking (FS -> DB -> FS loop)
+// ==========================================================================
+
+describe("PouchDbFsBridge — Level 3 echo suppression (self-originated revs)", () => {
+  let db: ReturnType<typeof makePouchMock>;
+  let vault: ReturnType<typeof makeVaultMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
+  let bridge: PouchDbFsBridge;
+
+  beforeEach(() => {
+    db = makePouchMock();
+    vault = makeVaultMock();
+    watcher = makeWatcherMock();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    bridge.start(watcher);
+  });
+
+  afterEach(() => {
+    bridge.stop();
+  });
+
+  it("suppresses stale self-echo: rapid successive writes do not revert to older content", async () => {
+    // Scenario: vault writes v1, then v2. The v1 echo arrives AFTER v2 is already
+    // the winning rev. Without Level 3, applyRemoteChange would write "v1" back to
+    // disk — reverting the file. With Level 3, the v1 echo is suppressed.
+    const path = "rapid.md";
+    vault._addText(path, "v1");
+
+    // First write: vault v1 -> PouchDB
+    watcher.emit({ type: "change", path });
+    await flushPromises();
+    const rev1 = db._docs.get(pathToDocId(path))?._rev;
+    expect(rev1).toBeDefined();
+
+    // Second write: vault v2 -> PouchDB (updates content and rev)
+    vault._addText(path, "v2");
+    watcher.emit({ type: "change", path });
+    await flushPromises();
+    const rev2 = db._docs.get(pathToDocId(path))?._rev;
+    expect(rev2).toBeDefined();
+    expect(rev2).not.toBe(rev1);
+
+    // Spy on vault writes to detect if the echo causes a revert
+    const modifySpy = vi.spyOn(vault, "modifyText");
+    const createSpy = vi.spyOn(vault, "createText");
+
+    // Simulate the stale v1 echo arriving via the changes feed (self-originated,
+    // superseded by v2). This is the exact scenario of BUG #88: rapid edits cause
+    // the earlier rev's echo to arrive and revert the file to old content.
+    const staleV1Doc = {
+      _id: pathToDocId(path),
+      _rev: rev1!,
+      content: "v1",
+      mtime: Date.now(),
+      deleted: false,
+    };
+    db._emitChange(staleV1Doc);
+    await flushPromises();
+    await flushPromises();
+
+    // Level 3 must suppress this: the vault must NOT be written with "v1" content
+    expect(modifySpy).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+    // The vault must still show "v2" (not reverted)
+    expect(vault._getText(path)).toBe("v2");
+  });
+
+  it("rapid successive variant: echo of rev1 suppressed even when rev2 has been written", async () => {
+    // Same as above, but we explicitly capture both revs to verify the suppression
+    // is based on the rev identity, not just content-equality (which Level 2 already checks).
+    // This test uses DIFFERENT content to ensure Level 2 (content equality) cannot save us.
+    const path = "rapid2.md";
+    vault._addText(path, "first version content");
+
+    watcher.emit({ type: "change", path });
+    await flushPromises();
+    const capturedRev1 = db._docs.get(pathToDocId(path))?._rev!;
+    expect(capturedRev1).toBeDefined();
+
+    vault._addText(path, "second version content");
+    watcher.emit({ type: "change", path });
+    await flushPromises();
+    const capturedRev2 = db._docs.get(pathToDocId(path))?._rev!;
+    expect(capturedRev2).not.toBe(capturedRev1);
+
+    // Simulate v2's content already on disk (as it would be after the bridge applied it)
+    // then feed back v1's stale echo — content is DIFFERENT from current ("first version")
+    // so Level 2 content equality cannot suppress it. Only Level 3 can.
+    vault._addText(path, "second version content"); // current disk state = v2
+
+    const modifySpy = vi.spyOn(vault, "modifyText");
+    const createSpy = vi.spyOn(vault, "createText");
+
+    db._emitChange({
+      _id: pathToDocId(path),
+      _rev: capturedRev1,
+      content: "first version content",
+      mtime: Date.now(),
+      deleted: false,
+    });
+    await flushPromises();
+    await flushPromises();
+
+    expect(modifySpy).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it("genuine external change (rev not written locally) still writes to vault", async () => {
+    // A change arriving from iOS / another device has a rev that was NOT produced by
+    // this bridge instance's writeTextToPouch. It MUST be applied to disk.
+    const path = "external.md";
+
+    // No local write — inject a change directly as if it came from a remote peer
+    const externalDoc = {
+      _id: pathToDocId(path),
+      _rev: "5-external",
+      content: "content from iOS",
+      mtime: Date.now(),
+      deleted: false,
+    };
+    // We must set the doc in the mock's store first so db.get() works inside applyRemoteChange
+    db._docs.set(pathToDocId(path), externalDoc);
+
+    const modifySpy = vi.spyOn(vault, "modifyText");
+    const createSpy = vi.spyOn(vault, "createText");
+
+    db._emitChange(externalDoc);
+    await flushPromises();
+    await flushPromises();
+
+    // The external change must have been applied — either createText or modifyText
+    const wasWritten = createSpy.mock.calls.length > 0 || modifySpy.mock.calls.length > 0;
+    expect(wasWritten).toBe(true);
+    expect(vault._getText(path)).toBe("content from iOS");
+  });
+
+  it("genuine second write after self-echo is not over-suppressed", async () => {
+    // After a local write (rev1 in selfOriginatedRevs), an EXTERNAL rev2 arrives.
+    // Level 3 must allow it: rev2 is NOT in selfOriginatedRevs.
+    const path = "not-over-suppressed.md";
+    vault._addText(path, "local content");
+
+    watcher.emit({ type: "change", path });
+    await flushPromises();
+    // rev1 now in selfOriginatedRevs
+
+    const modifySpy = vi.spyOn(vault, "modifyText");
+    const createSpy = vi.spyOn(vault, "createText");
+
+    // External change arrives with a NEW rev (not produced locally)
+    const externalRev = "99-external";
+    const externalDoc = {
+      _id: pathToDocId(path),
+      _rev: externalRev,
+      content: "content from another device",
+      mtime: Date.now(),
+      deleted: false,
+    };
+    db._docs.set(pathToDocId(path), externalDoc);
+
+    db._emitChange(externalDoc);
+    await flushPromises();
+    await flushPromises();
+
+    const wasWritten = createSpy.mock.calls.length > 0 || modifySpy.mock.calls.length > 0;
+    expect(wasWritten).toBe(true);
+    expect(vault._getText(path)).toBe("content from another device");
+  });
+});
+
+// Level 3 TTL eviction: self-originated revs are bounded (no unbounded growth)
+// ==========================================================================
+
+describe("PouchDbFsBridge — Level 3 TTL eviction (selfOriginatedRevs bounded)", () => {
+  let db: ReturnType<typeof makePouchMock>;
+  let vault: ReturnType<typeof makeVaultMock>;
+  let watcher: ReturnType<typeof makeWatcherMock>;
+  let bridge: PouchDbFsBridge;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    db = makePouchMock();
+    vault = makeVaultMock();
+    watcher = makeWatcherMock();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    bridge = new PouchDbFsBridge(vault, db as any);
+    bridge.start(watcher);
+  });
+
+  afterEach(() => {
+    bridge.stop();
+    vi.useRealTimers();
+  });
+
+  it("self-echo arriving within TTL is still suppressed", async () => {
+    // Write v1 locally -> rev1 enters selfOriginatedRevs with a 5s TTL.
+    // Immediately emit the stale echo (< 5s) -> must be suppressed.
+    const path = "ttl-within.md";
+    vault._addText(path, "v1");
+    watcher.emit({ type: "change", path });
+    await flushPromisesFakeTimers();
+
+    const rev1 = db._docs.get(pathToDocId(path))?._rev!;
+    expect(rev1).toBeDefined();
+
+    // Advance 100ms — well within the 5s TTL
+    await vi.advanceTimersByTimeAsync(100);
+
+    const modifySpy = vi.spyOn(vault, "modifyText");
+    const createSpy = vi.spyOn(vault, "createText");
+
+    db._emitChange({
+      _id: pathToDocId(path),
+      _rev: rev1,
+      content: "v1",
+      mtime: Date.now(),
+      deleted: false,
+    });
+    await flushPromisesFakeTimers();
+    await flushPromisesFakeTimers();
+
+    // Echo must be suppressed — no vault write
+    expect(modifySpy).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it("self-rev is evicted after TTL — echo arriving after TTL is allowed through", async () => {
+    // Write v1 locally -> rev1 enters selfOriginatedRevs.
+    // Advance past the 5s TTL -> rev1 is evicted.
+    // Emit the echo with rev1 -> must NOT be suppressed (eviction confirms set is bounded).
+    //
+    // NOTE: vault now holds different content ("v2") so Level 2 (content equality)
+    // cannot suppress this change — only Level 3 could, and after TTL it won't.
+    const path = "ttl-expired.md";
+    vault._addText(path, "v1");
+    watcher.emit({ type: "change", path });
+    await flushPromisesFakeTimers();
+
+    const rev1 = db._docs.get(pathToDocId(path))?._rev!;
+    expect(rev1).toBeDefined();
+
+    // Advance past the 5s TTL — rev1 should be evicted from selfOriginatedRevs
+    await vi.advanceTimersByTimeAsync(5100);
+
+    // Simulate the vault having moved on to v2 locally (Level 2 can't suppress now)
+    vault._addText(path, "v2");
+
+    const modifySpy = vi.spyOn(vault, "modifyText");
+    const createSpy = vi.spyOn(vault, "createText");
+
+    // Ensure the mock db has the doc so applyRemoteChange can proceed past db.get()
+    const echoDoc = {
+      _id: pathToDocId(path),
+      _rev: rev1,
+      content: "v1",
+      mtime: Date.now(),
+      deleted: false,
+    };
+    db._docs.set(pathToDocId(path), echoDoc);
+
+    db._emitChange(echoDoc);
+    await flushPromisesFakeTimers();
+    await flushPromisesFakeTimers();
+
+    // After TTL, the rev is no longer in selfOriginatedRevs — echo is allowed through
+    const wasWritten = createSpy.mock.calls.length > 0 || modifySpy.mock.calls.length > 0;
+    expect(wasWritten).toBe(true);
+  });
+});

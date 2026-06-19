@@ -45,6 +45,14 @@ interface PouchChangeRow {
 /** TTL for the appliedRevs sentinel (ms). Clears after this delay. */
 const APPLIED_REV_TTL_MS = 5000;
 
+/**
+ * TTL for self-originated rev entries (ms).
+ * Self-echoes arrive within the same event-loop iteration (< 1ms in practice);
+ * 5s is a conservative upper bound kept consistent with APPLIED_REV_TTL_MS.
+ * After this window, entries are pruned so the Set stays bounded on the 24/7 daemon.
+ */
+const SELF_ORIGINATED_REV_TTL_MS = 5000;
+
 export class PouchDbFsBridge {
   private watcher: VaultWatcher | null = null;
   /**
@@ -54,6 +62,22 @@ export class PouchDbFsBridge {
    * TTL cleared after APPLIED_REV_TTL_MS to avoid stale suppression of genuine edits.
    */
   private appliedRevs: Map<string, string> = new Map();
+  /**
+   * Level 3 echo-suppression: full PouchDB _rev strings that this bridge instance
+   * produced via writeTextToPouch / writeBinaryToPouch (FS → PouchDB direction).
+   *
+   * When the local PouchDB changes feed replays one of these self-originated revs
+   * back through applyRemoteChange, it is an echo — skip the vault write.
+   * This catches the rapid-edit race where rev1's echo arrives after rev2 is already
+   * the winning rev: Level 2 (content equality) misses it because the content differs
+   * (v1 ≠ v2), but Level 3 recognises the rev string as self-originated.
+   *
+   * Entries are evicted via TTL (SELF_ORIGINATED_REV_TTL_MS) to keep the Set bounded
+   * on the 24/7 daemon. Each rev is a unique, immutable PouchDB revision string; once
+   * a doc moves to a new rev, the old one can never be the winning rev again — so TTL
+   * expiry never causes a false negative after the echo window has passed.
+   */
+  private selfOriginatedRevs: Set<string> = new Set();
   /** Handle for the PouchDB changes listener, so it can be cancelled on stop. */
   private changesHandle: { cancel(): void } | null = null;
   /**
@@ -224,7 +248,10 @@ export class PouchDbFsBridge {
       ...(rev ? { _rev: rev } : {}),
     };
 
-    await this.db.put(doc as Parameters<typeof this.db.put>[0]);
+    const result = await this.db.put(doc as Parameters<typeof this.db.put>[0]);
+    // Level 3: record the rev we just wrote so applyRemoteChange can recognise
+    // the echo when the changes feed replays this revision.
+    this.addSelfOriginatedRev(result.rev);
   }
 
   private async writeBinaryToPouch(file: import("./types").VaultFile): Promise<void> {
@@ -256,7 +283,9 @@ export class PouchDbFsBridge {
     // pouchdb-browser also accepts, so normalising here keeps both adapters correct.
     const data = new Uint8Array(await this.vault.readBinary(file));
     const contentType = contentTypeForPath(file.path);
-    await this.db.putAttachment(docId, ATTACHMENT_NAME, newRev, data, contentType);
+    const attachResult = await this.db.putAttachment(docId, ATTACHMENT_NAME, newRev, data, contentType);
+    // Level 3: the putAttachment rev is what the changes feed will report — record it.
+    this.addSelfOriginatedRev(attachResult.rev);
   }
 
   private async markDeletedInPouch(docId: string): Promise<void> {
@@ -313,6 +342,13 @@ export class PouchDbFsBridge {
     const docId = doc._id;
     let docRev = doc._rev ?? "";
     let resolvedDoc = doc;
+
+    // Level 3 echo-suppression: if this exact rev was produced by this bridge
+    // instance (writeTextToPouch / writeBinaryToPouch), the changes feed is
+    // replaying our own write — skip the vault write.
+    // Catches the rapid-edit race: rev1 echo arrives after rev2 is winning;
+    // content differs so Level 2 misses it, but Level 3 recognises the rev string.
+    if (docRev && this.selfOriginatedRevs.has(docRev)) return;
 
     // Skip deleted docs — handle tombstone by deleting from vault
     if (doc._deleted || doc.deleted) {
@@ -455,6 +491,17 @@ export class PouchDbFsBridge {
         this.appliedRevs.delete(docId);
       }
     }, APPLIED_REV_TTL_MS);
+  }
+
+  /**
+   * Record a rev string as self-originated and schedule its eviction.
+   * Mirrors setAppliedRev to keep the Set bounded on the 24/7 daemon.
+   */
+  private addSelfOriginatedRev(rev: string): void {
+    this.selfOriginatedRevs.add(rev);
+    setTimeout(() => {
+      this.selfOriginatedRevs.delete(rev);
+    }, SELF_ORIGINATED_REV_TTL_MS);
   }
 
   private async ensureParentDirectory(filePath: string): Promise<void> {
