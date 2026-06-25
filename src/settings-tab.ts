@@ -1,4 +1,4 @@
-import { App, Modal, PluginSettingTab, Setting } from "obsidian";
+import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type VaultSyncPlugin from "./main";
 import type { SyncDiagnostics } from "./types";
 
@@ -72,8 +72,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
     containerEl.createEl("h3", { text: "Account" });
 
     new Setting(containerEl)
-      .setName("Gateway URL")
-      .setDesc("OAuth gateway (Obsidian connector) URL, e.g. https://mcp.fly-agile.com")
+      .setName("Serveur de notes")
+      .setDesc("Adresse du serveur de notes, ex. https://mcp.fly-agile.com")
       .addText((text) =>
         text
           .setPlaceholder("https://mcp.fly-agile.com")
@@ -94,7 +94,8 @@ export class VaultSyncSettingTab extends PluginSettingTab {
           try {
             await this.plugin.startClerkLogin();
             btn.setButtonText("Continue in browser");
-          } catch {
+          } catch (e) {
+            new Notice("Vault Sync login failed: " + ((e as Error)?.message ?? String(e)));
             btn.setButtonText("Error");
           }
           setTimeout(() => {

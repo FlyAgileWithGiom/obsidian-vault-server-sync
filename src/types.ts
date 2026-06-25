@@ -13,7 +13,7 @@ export interface VaultSyncSettings {
    * Coexists with couchDbUrl/couchDbUser/couchDbPassword during migration: devices
    * without gateway credentials fall back to the legacy URL automatically (Phase A).
    */
-  gatewayUrl?: string;
+  gatewayUrl: string;
   excludePatterns: string[];
 }
 
@@ -25,6 +25,7 @@ export const DEFAULT_SETTINGS: VaultSyncSettings = {
   couchDbName: "",
   couchDbUser: "",
   couchDbPassword: "",
+  gatewayUrl: "https://mcp.fly-agile.com",
   excludePatterns: [".trash/", ".obsidian/", ".vault-sync-state.json", VAULT_SYNC_CONFIG_FILE],
 };
 

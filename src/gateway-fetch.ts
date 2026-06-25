@@ -34,6 +34,19 @@ export interface TokenManagerOpts {
   gatewayUrl: string;
   clientId: string;
   store: SecretStore;
+  /**
+   * Optional fetch implementation for the /token endpoint.
+   *
+   * Defaults to globalThis.fetch. The Obsidian plugin injects makeObsidianFetch()
+   * here so that iOS CORS enforcement is bypassed for the token exchange (the
+   * gateway's /token endpoint returns no CORS headers). The headless daemon omits
+   * this field and continues using globalThis.fetch (Node's native fetch).
+   *
+   * PouchDB replication (makeGatewayFetch / db.sync) is NOT affected by this
+   * option — it always uses globalThis.fetch because streaming _changes responses
+   * require a real ReadableStream body that requestUrl() cannot provide.
+   */
+  fetch?: typeof globalThis.fetch;
 }
 
 /**
@@ -92,6 +105,7 @@ const TOKEN_EXPIRY_GRACE_MS = 30_000;
  */
 export function makeTokenManager(opts: TokenManagerOpts): TokenManager {
   const { gatewayUrl, clientId, store } = opts;
+  const fetchFn = opts.fetch ?? globalThis.fetch;
   const tokenUrl = `${gatewayUrl}/token`;
 
   // In-memory token state — never serialised or persisted.
@@ -123,7 +137,7 @@ export function makeTokenManager(opts: TokenManagerOpts): TokenManager {
       client_id: clientId,
     }).toString();
 
-    const resp = await fetch(tokenUrl, {
+    const resp = await fetchFn(tokenUrl, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,

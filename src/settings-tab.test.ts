@@ -574,8 +574,8 @@ describe("VaultSyncSettingTab — Clerk OAuth UI (#92)", () => {
     tab.hide();
   });
 
-  it("renders a Gateway URL field whose onChange persists via saveSettings", async () => {
-    const handler = capturedOnChange.get("Gateway URL");
+  it("renders a Serveur de notes field whose onChange persists via saveSettings", async () => {
+    const handler = capturedOnChange.get("Serveur de notes");
     expect(handler).toBeTypeOf("function");
 
     await handler!("https://mcp.fly-agile.com");

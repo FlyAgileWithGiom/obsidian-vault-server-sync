@@ -301,6 +301,55 @@ describe("TokenManager — single-flight mutex", () => {
 });
 
 // ---------------------------------------------------------------------------
+// TokenManager — injected fetch (plugin iOS CORS bypass)
+// ---------------------------------------------------------------------------
+//
+// When opts.fetch is provided, doTokenExchange() must use it instead of
+// globalThis.fetch. This is the seam that lets the plugin inject
+// makeObsidianFetch() to bypass iOS CORS on the /token endpoint.
+//
+// The test confirms: (a) the injected fetch IS called, (b) globalThis.fetch
+// is NOT called, and (c) the token manager still works end-to-end.
+
+describe("TokenManager — injected fetch", () => {
+  it("uses the injected fetch for doTokenExchange when opts.fetch is provided", async () => {
+    const store = fakeStore({ [SECRET_ID_GATEWAY_REFRESH_TOKEN]: "rt-seed" });
+    const injectedFetch = vi.fn(async (_url: string, _init?: RequestInit) =>
+      new Response(
+        JSON.stringify(tokenResponse({ access_token: "at-from-injected" })),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const globalFetchMock = vi.fn();
+    vi.stubGlobal("fetch", globalFetchMock);
+
+    const manager = makeTokenManager(
+      testManagerOpts(store, { fetch: injectedFetch as unknown as typeof fetch }),
+    );
+    const token = await manager.getValidToken();
+
+    expect(token).toBe("at-from-injected");
+    expect(injectedFetch).toHaveBeenCalledTimes(1);
+    // The global fetch must NOT have been called — only the injected one.
+    expect(globalFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to globalThis.fetch when opts.fetch is not provided", async () => {
+    const store = fakeStore({ [SECRET_ID_GATEWAY_REFRESH_TOKEN]: "rt-seed" });
+    const globalFetchMock = mockFetchReturning([
+      { status: 200, body: tokenResponse({ access_token: "at-from-global" }) },
+    ]);
+    vi.stubGlobal("fetch", globalFetchMock);
+
+    const manager = makeTokenManager(testManagerOpts(store));
+    const token = await manager.getValidToken();
+
+    expect(token).toBe("at-from-global");
+    expect(globalFetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // makeGatewayFetch — Bearer injection + 401 retry
 // ---------------------------------------------------------------------------
 

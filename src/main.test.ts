@@ -1126,15 +1126,15 @@ describe("VaultSyncPlugin — handleOAuthCallback completes login", () => {
       transientLogin: { codeVerifier: string; state: string } | null;
     }).transientLogin = { codeVerifier: "verifier-1", state: "state-1" };
 
-    // Stub the token exchange network call.
-    const fetchMock = vi.fn(async () =>
-      new Response(
-        JSON.stringify({ access_token: "at", refresh_token: "rt-new", token_type: "Bearer", expires_in: 86400 }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      ),
-    );
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    // handleOAuthCallback -> completePluginLogin -> exchangeCode now calls
+    // makeObsidianFetch(), which delegates to requestUrl() from the obsidian module.
+    // Stub requestUrl to return a valid token response.
+    const tokenBody = JSON.stringify({ access_token: "at", refresh_token: "rt-new", token_type: "Bearer", expires_in: 86400 });
+    const requestUrlSpy = vi.spyOn(obsidianMock, "requestUrl").mockResolvedValue({
+      status: 200,
+      json: JSON.parse(tokenBody) as unknown,
+      text: tokenBody,
+    });
 
     // Spy on engine rebuild.
     const rebuildSpy = vi.fn().mockResolvedValue(undefined);
@@ -1146,7 +1146,7 @@ describe("VaultSyncPlugin — handleOAuthCallback completes login", () => {
         handleOAuthCallback(params: Record<string, string>): Promise<void>;
       }).handleOAuthCallback({ action: OAUTH_PROTOCOL_ACTION, code: "auth-code", state: "state-1" });
     } finally {
-      globalThis.fetch = originalFetch;
+      requestUrlSpy.mockRestore();
     }
 
     expect(secretStorage(plugin).getSecret(SECRET_ID_GATEWAY_REFRESH_TOKEN)).toBe("rt-new");

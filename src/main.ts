@@ -19,6 +19,7 @@ import {
   ENV_GATEWAY_CLIENT_ID,
 } from "./secret-store";
 import { makeTokenManager, makeGatewayFetch } from "./gateway-fetch";
+import { makeObsidianFetch } from "./obsidian-fetch";
 import {
   startPluginLogin,
   completePluginLogin,
@@ -302,7 +303,7 @@ export default class VaultSyncPlugin extends Plugin {
       const refreshToken = await store.get(SECRET_ID_GATEWAY_REFRESH_TOKEN);
       if (!refreshToken) return null;
 
-      const tokenManager = makeTokenManager({ gatewayUrl, clientId, store });
+      const tokenManager = makeTokenManager({ gatewayUrl, clientId, store, fetch: makeObsidianFetch() });
       return makeGatewayFetch({ tokenManager });
     };
   }
@@ -346,6 +347,7 @@ export default class VaultSyncPlugin extends Plugin {
       openBrowser: (url: string) => {
         window.open(url);
       },
+      fetch: makeObsidianFetch(),
     });
   }
 
@@ -367,7 +369,7 @@ export default class VaultSyncPlugin extends Plugin {
         if (key !== "action") search.set(key, value);
       }
       await completePluginLogin(
-        { gatewayUrl, store: this.getSecretStore(), transient: this.getTransientLoginStore() },
+        { gatewayUrl, store: this.getSecretStore(), transient: this.getTransientLoginStore(), fetch: makeObsidianFetch() },
         search,
       );
       await this.rebuildEngine();
