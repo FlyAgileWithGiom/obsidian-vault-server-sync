@@ -1530,14 +1530,80 @@ describe("PouchDbSyncEngine — gateway mode (remoteFactory + gatewayCredsResolv
     engine.stop();
   });
 
-  it("testConnection replicate.from receives the remote HANDLE in gateway mode", async () => {
-    const gf = fakeFetch();
-    const { engine, db } = makeGatewayEngine({ docCount: 5, gatewayCredsResolverResult: gf });
-    await engine.testConnection();
+  it("testConnection probes the DB URL via a raw GET through the gateway fetch, returns true on 2xx", async () => {
+    // testConnection no longer goes through db.replicate.from (a PouchDB probe cannot
+    // distinguish a missing DB from a healthy one — see resolveProbeTarget()'s comment).
+    // It issues a raw GET via the resolved gateway fetch and checks the HTTP status itself.
+    const gatewayFetch = vi.fn(() =>
+      Promise.resolve({ ok: true, status: 200 } as unknown as Response),
+    );
+    const { engine } = makeGatewayEngine({
+      docCount: 5,
+      gatewayCredsResolverResult: gatewayFetch as unknown as typeof fetch,
+    });
 
-    const replicateArg = (db.replicate.from as ReturnType<typeof vi.fn>).mock.calls[0][0] as FakePouchRemote;
-    expect(typeof replicateArg).toBe("object");
-    expect(replicateArg._fetchInjected).toBe(true);
+    const result = await engine.testConnection();
+
+    expect(result).toBe(true);
+    expect(gatewayFetch).toHaveBeenCalledWith("https://gateway.test/couchdb/vault-test");
+  });
+
+  it("testConnection detects a missing DB (404 via gateway fetch): returns false and records lastError", async () => {
+    const gatewayFetch = vi.fn(() =>
+      Promise.resolve({ ok: false, status: 404, statusText: "Object Not Found" } as unknown as Response),
+    );
+    const { engine } = makeGatewayEngine({
+      docCount: 5,
+      gatewayCredsResolverResult: gatewayFetch as unknown as typeof fetch,
+    });
+
+    const result = await engine.testConnection();
+
+    expect(result).toBe(false);
+    expect(engine.getDiagnostics().lastError).toContain("404");
+  });
+
+  it("testConnection clears a stale lastError on a subsequent success", async () => {
+    // A failed probe records lastError; a later successful probe must clear it so
+    // the Diagnostics "Last error" line doesn't keep showing a resolved failure
+    // right after "Connected".
+    const gatewayFetch = vi.fn()
+      .mockResolvedValueOnce({ ok: false, status: 404, statusText: "Object Not Found" } as unknown as Response)
+      .mockResolvedValueOnce({ ok: true, status: 200 } as unknown as Response);
+    const { engine } = makeGatewayEngine({
+      docCount: 5,
+      gatewayCredsResolverResult: gatewayFetch as unknown as typeof fetch,
+    });
+
+    expect(await engine.testConnection()).toBe(false);
+    expect(engine.getDiagnostics().lastError).toContain("404");
+
+    expect(await engine.testConnection()).toBe(true);
+    expect(engine.getDiagnostics().lastError).toBeNull();
+  });
+
+  it("testConnection legacy mode: GETs couchDbUrl/couchDbName with a Basic-auth Authorization header", async () => {
+    // No gateway credentials available (resolver returns null) → legacy fallback.
+    // The probe must hit the raw DB URL with an Authorization header derived from
+    // settings.couchDbUser/couchDbPassword — never embedded in the URL itself.
+    const { engine } = makeGatewayEngine({ docCount: 5, gatewayCredsResolverResult: null });
+    const fetchSpy = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      Promise.resolve({ ok: true, status: 200 } as unknown as Response),
+    );
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fetchSpy as unknown as typeof fetch;
+    try {
+      const result = await engine.testConnection();
+
+      expect(result).toBe(true);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toBe("https://sync.example.com/vault-test");
+      const headers = new Headers(init?.headers);
+      expect(headers.get("Authorization")).toBe(`Basic ${btoa("alice:secret")}`);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it("gateway mode does not embed credentials in the URL (no user:pass@)", async () => {

@@ -480,19 +480,61 @@ export class PouchDbSyncEngine {
     }
   }
 
+  /**
+   * Resolve the plain HTTP GET target used by testConnection() to probe the DB.
+   *
+   * Mirrors buildRemote()'s mode decision (gateway vs legacy fallback, see buildRemote()
+   * above) so the probe exercises the same URL/auth path the real sync would use, but
+   * returns a raw `{ url, fetch }` pair instead of a PouchDB handle — see testConnection()
+   * for why a raw GET is required instead of a PouchDB-mediated probe.
+   */
+  private async resolveProbeTarget(): Promise<{ url: string; fetch: typeof fetch }> {
+    if (this.remoteFactory && this.gatewayCredsResolver && this.settings.gatewayUrl) {
+      const gatewayFetch = await this.gatewayCredsResolver();
+      if (gatewayFetch !== null) {
+        // Gateway mode: same proxy base as buildRemote(), probed with the
+        // Bearer-injecting fetch — no embedded credentials.
+        const url = `${this.settings.gatewayUrl}/couchdb/${this.settings.couchDbName}`;
+        return { url, fetch: gatewayFetch };
+      }
+    }
+    // Legacy fallback: raw CouchDB URL. Credentials are never embedded in the URL
+    // (fetch ignores URL userinfo) — Basic auth is added via header instead, only
+    // when both couchDbUser and couchDbPassword are configured.
+    const { couchDbUrl, couchDbName, couchDbUser, couchDbPassword } = this.settings;
+    const url = `${couchDbUrl.replace(/\/$/, "")}/${couchDbName}`;
+    if (couchDbUser && couchDbPassword) {
+      const authHeader = `Basic ${btoa(`${couchDbUser}:${couchDbPassword}`)}`;
+      const authedFetch: typeof fetch = (input, init) => {
+        const headers = new Headers(init?.headers);
+        headers.set("Authorization", authHeader);
+        return globalThis.fetch(input, { ...init, headers });
+      };
+      return { url, fetch: authedFetch };
+    }
+    return { url, fetch: globalThis.fetch };
+  }
+
   async testConnection(): Promise<boolean> {
     try {
-      const remote = await this.buildRemote();
-      // Attempt a lightweight replication probe: replicate a minimal batch from remote
-      await new Promise<void>((resolve, reject) => {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const handle = this.db.replicate.from(remote as any, { live: false });
-        const emitter = handle as unknown as PouchEmitter;
-        emitter.on("complete", () => resolve());
-        emitter.on("error", (e) => reject(e));
-        // Cancel after 5 seconds to avoid hanging
-        setTimeout(() => { handle.cancel(); resolve(); }, 5000);
-      });
+      // Raw HTTP GET + status check — deliberately NOT PouchDB .info(): verified dead
+      // end. With skip_setup:false, .info() auto-CREATES a missing database (masking
+      // exactly the "wrong DB name" case this probe exists to catch); with
+      // skip_setup:true it resolves a fake success without ever rejecting. Only a raw
+      // fetch GET whose status we assert ourselves distinguishes a real 2xx from a
+      // 404 (missing DB) or 401/403 (auth failure).
+      const { url, fetch: probeFetch } = await this.resolveProbeTarget();
+      const res = await probeFetch(url);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}${res.statusText ? " " + res.statusText : ""}`);
+      }
+      // A successful probe clears any stale error so the Diagnostics "Last error"
+      // line doesn't keep showing a resolved failure right after "Connected"
+      // (mirrors how live sync clears lastError on a successful change).
+      if (this.lastError !== null) {
+        this.lastError = null;
+        this.onDiagnosticsChange();
+      }
       return true;
     } catch (e) {
       // Record the real reason so the settings UI can surface it (Last error +
