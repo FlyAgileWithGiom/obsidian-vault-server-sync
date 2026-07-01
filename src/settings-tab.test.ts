@@ -574,8 +574,8 @@ describe("VaultSyncSettingTab — Clerk OAuth UI (#92)", () => {
     tab.hide();
   });
 
-  it("renders a Serveur de notes field whose onChange persists via saveSettings", async () => {
-    const handler = capturedOnChange.get("Serveur de notes");
+  it("renders a Notes server field whose onChange persists via saveSettings", async () => {
+    const handler = capturedOnChange.get("Notes server");
     expect(handler).toBeTypeOf("function");
 
     await handler!("https://mcp.fly-agile.com");
@@ -685,6 +685,48 @@ describe("VaultSyncSettingTab — logout button (#87)", () => {
     await signOutButton!.callback();
 
     expect(plugin.logoutGateway).toHaveBeenCalledTimes(1);
+
+    tab.hide();
+  });
+
+  // Bug fix: login and sign-out must be MUTUALLY EXCLUSIVE. The old code created
+  // the "Log in with Clerk" button unconditionally and merely *appended* a
+  // sign-out button when signed in, so both showed at once. The account control
+  // is now rendered from the resolved sign-in state: exactly one button.
+
+  it("does NOT show a 'Log in with Clerk' button when already signed in", async () => {
+    const plugin = makeLoggedInPlugin();
+    const tab = makeTab(plugin);
+    tab.display();
+
+    await plugin.isLoggedIntoGateway();
+    await Promise.resolve();
+
+    const loginButtons = capturedButtons.filter((b) =>
+      b.buttonText.toLowerCase().includes("log in"),
+    );
+    expect(loginButtons.length).toBe(0);
+
+    tab.hide();
+  });
+
+  it("shows a 'Log in with Clerk' button and NO sign-out button when signed out", async () => {
+    const plugin = makeLoggedOutPlugin();
+    const tab = makeTab(plugin);
+    tab.display();
+
+    await plugin.isLoggedIntoGateway();
+    await Promise.resolve();
+
+    const loginButtons = capturedButtons.filter((b) =>
+      b.buttonText.toLowerCase().includes("log in"),
+    );
+    const signOutButtons = capturedButtons.filter((b) =>
+      b.buttonText.toLowerCase().includes("sign out") ||
+      b.buttonText.toLowerCase().includes("log out"),
+    );
+    expect(loginButtons.length).toBe(1);
+    expect(signOutButtons.length).toBe(0);
 
     tab.hide();
   });
