@@ -494,7 +494,18 @@ export class PouchDbSyncEngine {
         setTimeout(() => { handle.cancel(); resolve(); }, 5000);
       });
       return true;
-    } catch {
+    } catch (e) {
+      // Record the real reason so the settings UI can surface it (Last error +
+      // Notice) instead of a bare "Failed" — the #1 reason "signed in" (a local
+      // token check) and "Test connection" (a real network probe) disagree is a
+      // misconfigured DB name or a 401/404 the user never gets to see.
+      //
+      // Deliberately does NOT go through setError(): a manual probe must not flip
+      // a healthy live sync's state to "error". Record lastError and notify the
+      // diagnostics listeners only.
+      const raw = (e as Error)?.message ?? String(e);
+      this.lastError = scrubCredentials(raw);
+      this.onDiagnosticsChange();
       return false;
     }
   }
